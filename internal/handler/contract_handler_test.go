@@ -1,0 +1,378 @@
+package handler_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/CoverOnes/workspace/internal/domain"
+	"github.com/CoverOnes/workspace/internal/events"
+	"github.com/CoverOnes/workspace/internal/handler"
+	"github.com/CoverOnes/workspace/internal/platform/middleware"
+	"github.com/CoverOnes/workspace/internal/service"
+	"github.com/CoverOnes/workspace/internal/store"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func init() {
+	gin.SetMode(gin.TestMode)
+}
+
+// --- stub stores for handler tests ---
+
+type stubContractStoreH struct {
+	contracts map[uuid.UUID]*domain.Contract
+}
+
+func newStubContractStoreH(contracts ...*domain.Contract) *stubContractStoreH {
+	m := &stubContractStoreH{contracts: make(map[uuid.UUID]*domain.Contract)}
+
+	for _, c := range contracts {
+		m.contracts[c.ID] = c
+	}
+
+	return m
+}
+
+func (s *stubContractStoreH) Create(_ context.Context, c *domain.Contract) error {
+	if _, exists := s.contracts[c.ID]; exists {
+		return domain.ErrConflict
+	}
+
+	s.contracts[c.ID] = c
+
+	return nil
+}
+
+func (s *stubContractStoreH) GetByID(_ context.Context, id uuid.UUID) (*domain.Contract, error) {
+	c, ok := s.contracts[id]
+	if !ok {
+		return nil, domain.ErrContractNotFound
+	}
+
+	return c, nil
+}
+
+func (s *stubContractStoreH) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*domain.Contract, error) {
+	return s.GetByID(ctx, id)
+}
+
+func (s *stubContractStoreH) ListByParty(_ context.Context, filter store.ContractFilter) ([]*domain.Contract, error) {
+	var result []*domain.Contract
+
+	for _, c := range s.contracts {
+		if c.ClientUserID == filter.PartyUserID || c.FreelancerUserID == filter.PartyUserID {
+			result = append(result, c)
+		}
+	}
+
+	return result, nil
+}
+
+func (s *stubContractStoreH) Update(_ context.Context, c *domain.Contract) error {
+	if _, ok := s.contracts[c.ID]; !ok {
+		return domain.ErrContractNotFound
+	}
+
+	s.contracts[c.ID] = c
+
+	return nil
+}
+
+type stubSigStoreH struct{}
+
+func (s *stubSigStoreH) Create(_ context.Context, _ *domain.Signature) error { return nil }
+
+func (s *stubSigStoreH) ListByContract(_ context.Context, _ uuid.UUID) ([]*domain.Signature, error) {
+	return nil, nil
+}
+
+func (s *stubSigStoreH) CountValidSignatures(_ context.Context, _ uuid.UUID, _ int, _ string) (int, error) {
+	return 0, nil
+}
+
+type stubTxH struct {
+	contracts store.ContractStore
+	sigs      store.SignatureStore
+}
+
+func (m *stubTxH) WithTx(ctx context.Context, fn func(ctx context.Context, c store.ContractStore, s store.SignatureStore) error) error {
+	return fn(ctx, m.contracts, m.sigs)
+}
+
+// buildContractRouter creates a test router with ContractService wired to stub stores.
+func buildContractRouter(cs *stubContractStoreH) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+
+	ss := &stubSigStoreH{}
+	tx := &stubTxH{contracts: cs, sigs: ss}
+	pub := events.NewNoopPublisher()
+
+	svc := service.NewContractService(cs, ss, tx, pub)
+	h := handler.NewContractHandler(svc)
+
+	r := gin.New()
+	r.Use(middleware.Recover())
+	r.Use(middleware.RequestID())
+	r.Use(middleware.SecurityHeaders())
+
+	api := r.Group("/v1")
+	api.Use(middleware.RequireValidIdentity())
+
+	api.POST("/contracts", middleware.RequireTier(2), h.Create)
+	api.GET("/contracts", middleware.RequireTier(1), h.List)
+	api.GET("/contracts/:id", middleware.RequireTier(1), h.GetByID)
+	api.PATCH("/contracts/:id", middleware.RequireTier(2), h.Patch)
+	api.POST("/contracts/:id/submit", middleware.RequireTier(2), h.Submit)
+	api.POST("/contracts/:id/complete", middleware.RequireTier(2), h.Complete)
+	api.POST("/contracts/:id/cancel", middleware.RequireTier(2), h.Cancel)
+
+	return r
+}
+
+func makeHandlerContract(clientID, freelancerID uuid.UUID, status domain.ContractStatus) *domain.Contract {
+	now := time.Now().UTC()
+	amount := decimal.NewFromInt(5000)
+	cid := uuid.New()
+	hash := domain.CanonicalContractDigest(cid.String(), "Test Contract", "Terms body", amount.StringFixed(2), "TWD", 1)
+
+	return &domain.Contract{
+		ID:               cid,
+		ListingID:        uuid.New(),
+		AcceptedBidID:    uuid.New(),
+		ClientUserID:     clientID,
+		FreelancerUserID: freelancerID,
+		Title:            "Test Contract",
+		Terms:            "Terms body",
+		Amount:           amount,
+		Currency:         "TWD",
+		ContentHash:      hash,
+		Version:          1,
+		Status:           status,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+}
+
+func TestContractHandler_Create(t *testing.T) {
+	t.Parallel()
+
+	clientID := uuid.New()
+	freelancerID := uuid.New()
+
+	tests := []struct {
+		name       string
+		callerID   string
+		tier       string
+		body       map[string]any
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:     "happy path: Tier2 creates contract",
+			callerID: clientID.String(),
+			tier:     "2",
+			body: map[string]any{
+				"listingId":        uuid.New().String(),
+				"acceptedBidId":    uuid.New().String(),
+				"freelancerUserId": freelancerID.String(),
+				"title":            "My Contract",
+				"terms":            "Agreed terms here.",
+				"amount":           "5000.00",
+				"currency":         "TWD",
+			},
+			wantStatus: http.StatusCreated,
+		},
+		{
+			name:       "missing X-User-Id returns 401",
+			callerID:   "",
+			tier:       "2",
+			body:       map[string]any{},
+			wantStatus: http.StatusUnauthorized,
+			wantCode:   "UNAUTHORIZED",
+		},
+		{
+			name:     "Tier 1 cannot create (requires Tier 2)",
+			callerID: clientID.String(),
+			tier:     "1",
+			body: map[string]any{
+				"listingId":        uuid.New().String(),
+				"acceptedBidId":    uuid.New().String(),
+				"freelancerUserId": freelancerID.String(),
+				"title":            "Contract",
+				"amount":           "1000.00",
+				"currency":         "TWD",
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   "KYC_TIER_REQUIRED",
+		},
+		{
+			name:     "invalid listingId returns 400",
+			callerID: clientID.String(),
+			tier:     "2",
+			body: map[string]any{
+				"listingId":        "not-a-uuid",
+				"acceptedBidId":    uuid.New().String(),
+				"freelancerUserId": freelancerID.String(),
+				"title":            "Title",
+				"amount":           "1000.00",
+				"currency":         "TWD",
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "VALIDATION_ERROR",
+		},
+		{
+			name:     "non-decimal amount returns 400",
+			callerID: clientID.String(),
+			tier:     "2",
+			body: map[string]any{
+				"listingId":        uuid.New().String(),
+				"acceptedBidId":    uuid.New().String(),
+				"freelancerUserId": freelancerID.String(),
+				"title":            "Title",
+				"amount":           "not-a-number",
+				"currency":         "TWD",
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "VALIDATION_ERROR",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cs := newStubContractStoreH()
+			r := buildContractRouter(cs)
+
+			body, _ := json.Marshal(tc.body)
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/contracts", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+
+			if tc.callerID != "" {
+				req.Header.Set("X-User-Id", tc.callerID)
+			}
+
+			if tc.tier != "" {
+				req.Header.Set("X-Kyc-Tier", tc.tier)
+			}
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			assert.Equal(t, tc.wantStatus, w.Code)
+
+			if tc.wantCode != "" {
+				var resp map[string]any
+				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+				errBody, ok := resp["error"].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, tc.wantCode, errBody["code"])
+			}
+		})
+	}
+}
+
+func TestContractHandler_GetByID_IDOR(t *testing.T) {
+	t.Parallel()
+
+	clientID := uuid.New()
+	freelancerID := uuid.New()
+	thirdPartyID := uuid.New()
+
+	contract := makeHandlerContract(clientID, freelancerID, domain.ContractStatusDraft)
+	cs := newStubContractStoreH(contract)
+	r := buildContractRouter(cs)
+
+	tests := []struct {
+		name       string
+		callerID   uuid.UUID
+		contractID string
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:       "client can get own contract",
+			callerID:   clientID,
+			contractID: contract.ID.String(),
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "freelancer can get contract",
+			callerID:   freelancerID,
+			contractID: contract.ID.String(),
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "non-party gets 404 (IDOR guard)",
+			callerID:   thirdPartyID,
+			contractID: contract.ID.String(),
+			wantStatus: http.StatusNotFound,
+			wantCode:   "NOT_FOUND",
+		},
+		{
+			name:       "invalid id returns 400",
+			callerID:   clientID,
+			contractID: "not-a-uuid",
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "VALIDATION_ERROR",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/contracts/"+tc.contractID, nil)
+			req.Header.Set("X-User-Id", tc.callerID.String())
+			req.Header.Set("X-Kyc-Tier", "1")
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			assert.Equal(t, tc.wantStatus, w.Code)
+
+			if tc.wantCode != "" {
+				var resp map[string]any
+				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+				errBody, ok := resp["error"].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, tc.wantCode, errBody["code"])
+			}
+		})
+	}
+}
+
+func TestContractHandler_Cancel_InvalidState(t *testing.T) {
+	t.Parallel()
+
+	clientID := uuid.New()
+	freelancerID := uuid.New()
+
+	contract := makeHandlerContract(clientID, freelancerID, domain.ContractStatusCompleted)
+	cs := newStubContractStoreH(contract)
+	r := buildContractRouter(cs)
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/contracts/"+contract.ID.String()+"/cancel", nil)
+	req.Header.Set("X-User-Id", clientID.String())
+	req.Header.Set("X-Kyc-Tier", "2")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusConflict, w.Code)
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	errBody, ok := resp["error"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "INVALID_STATE_TRANSITION", errBody["code"])
+}

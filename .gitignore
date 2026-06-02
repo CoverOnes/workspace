@@ -1,0 +1,27 @@
+# Binaries
+build/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Local environment and secrets
+.env
+.env.local
+local.yaml
+application-local.yml
+application-local.yaml
+*.pem
+*.key
+*.p12
+credentials.json
+
+# Go test cache
+*.test
+*.out
+
+# Editor files
+.idea/
+.vscode/
+*.swp
+*.swo

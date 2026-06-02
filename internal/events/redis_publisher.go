@@ -1,0 +1,38 @@
+package events
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/CoverOnes/workspace/internal/domain"
+	"github.com/redis/go-redis/v9"
+)
+
+const channelContractActivated = "workspace.contract_activated"
+
+// RedisPublisher publishes events to Redis pub/sub channels.
+type RedisPublisher struct {
+	rdb *redis.Client
+}
+
+// NewRedisPublisher returns a RedisPublisher backed by the given Redis client.
+func NewRedisPublisher(rdb *redis.Client) *RedisPublisher {
+	return &RedisPublisher{rdb: rdb}
+}
+
+// PublishContractActivated serializes the event and publishes it to Redis.
+// Transport failures are returned to the caller (caller should log and continue —
+// the contract row is the durable source of truth).
+func (p *RedisPublisher) PublishContractActivated(ctx context.Context, evt *domain.ContractActivatedEvent) error {
+	payload, err := json.Marshal(evt)
+	if err != nil {
+		return fmt.Errorf("marshal contract_activated event: %w", err)
+	}
+
+	if err := p.rdb.Publish(ctx, channelContractActivated, payload).Err(); err != nil {
+		return fmt.Errorf("redis publish %s: %w", channelContractActivated, err)
+	}
+
+	return nil
+}

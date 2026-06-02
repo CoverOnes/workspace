@@ -1,0 +1,14 @@
+.git
+.gitignore
+*.md
+*.pem
+*.key
+*.p12
+.env
+.env.*
+!.env.example
+local.yaml
+application-local.yml
+application-local.yaml
+*_test.go
+testdata/
