@@ -162,6 +162,12 @@ func TestLoad_PostgresSchema(t *testing.T) {
 			wantErr:   true,
 			errSubstr: "WORKSPACE_DB_SCHEMA",
 		},
+		{
+			name:      "schema with leading digit rejected (invalid PG identifier)",
+			schema:    "1workspace",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_DB_SCHEMA",
+		},
 	}
 
 	for _, tc := range tests {

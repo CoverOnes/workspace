@@ -12,7 +12,8 @@ import (
 
 // schemaNameRe validates that a Postgres schema name only contains safe characters
 // to prevent SQL injection when the name is interpolated into CREATE SCHEMA.
-var schemaNameRe = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
+// First character must be a letter or underscore (leading digits are invalid PG identifiers).
+var schemaNameRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
 // Config holds all configuration for the workspace service.
 type Config struct {
@@ -105,7 +106,7 @@ func (c *Config) validate() error {
 	}
 
 	if c.PostgresSchema != "" && !schemaNameRe.MatchString(c.PostgresSchema) {
-		errs = append(errs, "WORKSPACE_DB_SCHEMA must contain only [a-zA-Z0-9_] characters")
+		errs = append(errs, "WORKSPACE_DB_SCHEMA must start with a letter or underscore and contain only [a-zA-Z0-9_] characters")
 	}
 
 	if len(errs) > 0 {
