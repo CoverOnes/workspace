@@ -59,7 +59,7 @@ func NewPool(ctx context.Context, dsn, schema string, poolCfg PoolConfig) (*pgxp
 	}
 
 	minConns := poolCfg.MinConns
-	if minConns < 0 {
+	if minConns <= 0 {
 		minConns = defaultMinConns
 	}
 
