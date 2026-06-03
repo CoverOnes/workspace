@@ -80,7 +80,9 @@ func run() error {
 	ctx := context.Background()
 
 	// Postgres pool (CONVENTIONS §12).
-	pool, err := postgres.NewPool(ctx, cfg.PostgresDSN)
+	// cfg.PostgresSchema is "" by default (public schema); set WORKSPACE_DB_SCHEMA
+	// to isolate this service within a shared Aiven database.
+	pool, err := postgres.NewPool(ctx, cfg.PostgresDSN, cfg.PostgresSchema)
 	if err != nil {
 		return fmt.Errorf("connect postgres: %w", err)
 	}

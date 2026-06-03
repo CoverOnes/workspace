@@ -121,3 +121,62 @@ func TestIsDev(t *testing.T) {
 		})
 	}
 }
+
+func TestLoad_PostgresSchema(t *testing.T) {
+	tests := []struct {
+		name      string
+		schema    string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:    "empty schema allowed (public default)",
+			schema:  "",
+			wantErr: false,
+		},
+		{
+			name:    "valid alphanumeric schema",
+			schema:  "workspace",
+			wantErr: false,
+		},
+		{
+			name:    "valid schema with underscore",
+			schema:  "dev_test_schema",
+			wantErr: false,
+		},
+		{
+			name:      "schema with hyphen rejected",
+			schema:    "my-schema",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_DB_SCHEMA",
+		},
+		{
+			name:      "schema with dot rejected",
+			schema:    "public.contracts",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_DB_SCHEMA",
+		},
+		{
+			name:      "schema with semicolon rejected (SQL injection attempt)",
+			schema:    "workspace;DROP TABLE contracts",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_DB_SCHEMA",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setValidEnv(t)
+			t.Setenv("WORKSPACE_DB_SCHEMA", tc.schema)
+
+			cfg, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tc.schema, cfg.PostgresSchema)
+			}
+		})
+	}
+}

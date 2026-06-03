@@ -69,7 +69,7 @@ func runMain(m *testing.M) int {
 		return 1
 	}
 
-	sharedPool, err = postgres.NewPool(ctx, dsn)
+	sharedPool, err = postgres.NewPool(ctx, dsn, "") // empty schema = public (test default)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create pool: %v\n", err)
 
@@ -89,7 +89,7 @@ func runMain(m *testing.M) int {
 
 // applyMigrations runs all embedded *.up.sql files against the test database.
 func applyMigrations(ctx context.Context, dsn string) error {
-	pool, err := postgres.NewPool(ctx, dsn)
+	pool, err := postgres.NewPool(ctx, dsn, "") // empty schema = public (test default)
 	if err != nil {
 		return fmt.Errorf("create migration pool: %w", err)
 	}
@@ -580,4 +580,99 @@ func TestTxManager_Integration(t *testing.T) {
 		require.NoError(t, err)
 		assert.Len(t, sigs, 2)
 	})
+}
+
+// TestPool_SchemaIsolation_Integration verifies that when NewPool is called with a
+// non-empty schema name, migrations land in that schema (not public) and all queries
+// resolve against it via search_path.
+func TestPool_SchemaIsolation_Integration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	const testSchema = "dev_test_schema"
+
+	ctx := context.Background()
+
+	// Spin up a dedicated container so this test is fully isolated from sharedPool.
+	ctr, err := tcpostgres.Run(
+		ctx,
+		"postgres:17-alpine",
+		tcpostgres.WithDatabase("testdb"),
+		tcpostgres.WithUsername("testuser"),
+		tcpostgres.WithPassword("testpass"),
+		tcpostgres.BasicWaitStrategies(),
+	)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		if termErr := ctr.Terminate(ctx); termErr != nil {
+			t.Logf("terminate container: %v", termErr)
+		}
+	})
+
+	dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
+	require.NoError(t, err)
+
+	// Build pool with the custom schema — this should CREATE SCHEMA IF NOT EXISTS
+	// and set search_path on every connection.
+	pool, err := postgres.NewPool(ctx, dsn, testSchema)
+	require.NoError(t, err)
+
+	t.Cleanup(pool.Close)
+
+	// Apply migrations via the same pool so they land inside testSchema.
+	var upFiles []string
+
+	walkErr := fs.WalkDir(migrations.FS, ".", func(path string, d fs.DirEntry, walkEntryErr error) error {
+		if walkEntryErr != nil {
+			return walkEntryErr
+		}
+
+		if !d.IsDir() && strings.HasSuffix(path, ".up.sql") {
+			upFiles = append(upFiles, path)
+		}
+
+		return nil
+	})
+	require.NoError(t, walkErr, "walk embedded migrations FS")
+	require.NotEmpty(t, upFiles, "no *.up.sql files found")
+
+	sort.Strings(upFiles)
+
+	for _, file := range upFiles {
+		data, readErr := migrations.FS.ReadFile(file)
+		require.NoError(t, readErr, "read migration file %s", file)
+
+		_, execErr := pool.Exec(ctx, string(data))
+		require.NoError(t, execErr, "apply migration %s inside schema %s", file, testSchema)
+	}
+
+	// Assert the main workspace table (contracts) exists in the custom schema,
+	// not in public, using information_schema.tables.
+	var tableSchema string
+
+	row := pool.QueryRow(
+		ctx,
+		`SELECT table_schema FROM information_schema.tables
+		 WHERE table_name = 'contracts' AND table_schema = $1`,
+		testSchema,
+	)
+
+	err = row.Scan(&tableSchema)
+	require.NoError(t, err, "contracts table must exist in schema %q", testSchema)
+	assert.Equal(t, testSchema, tableSchema, "contracts must be in schema %q, not public", testSchema)
+
+	// Also verify that public schema does NOT contain the contracts table
+	// (confirming isolation — migrations did not fall through to public).
+	var publicCount int
+
+	countRow := pool.QueryRow(
+		ctx,
+		`SELECT COUNT(*) FROM information_schema.tables
+		 WHERE table_name = 'contracts' AND table_schema = 'public'`,
+	)
+
+	require.NoError(t, countRow.Scan(&publicCount))
+	assert.Equal(t, 0, publicCount, "contracts must NOT exist in public schema when schema=%q", testSchema)
 }
