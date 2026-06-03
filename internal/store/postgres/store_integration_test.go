@@ -290,6 +290,66 @@ func TestSignatureStore_Integration(t *testing.T) {
 		assert.Equal(t, domain.SignerRoleClient, sigs[0].SignerRole)
 	})
 
+	// Regression: signer_ip is Postgres inet (OID 869). pgx v5 binary mode cannot
+	// scan inet directly into *string, so ListByContract returned 500 once any row
+	// had a signer_ip. The store now casts signer_ip::text. This covers both a
+	// non-NULL inet value and a NULL value through the same list call.
+	t.Run("list signatures with signer_ip (inet) does not error and round-trips IP", func(t *testing.T) {
+		cIP := makeTestContract(clientID, freelancerID)
+		require.NoError(t, contractStore.Create(ctx, cIP))
+
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		ipv4 := "203.0.113.42"
+		// Postgres inet::text renders a host-only address in CIDR form (host => /32).
+		// This is the literal value the store returns after the inet->text cast.
+		const ipv4Text = "203.0.113.42/32"
+
+		sigWithIP := &domain.Signature{
+			ID:                uuid.New(),
+			ContractID:        cIP.ID,
+			SignerUserID:      clientID,
+			SignerRole:        domain.SignerRoleClient,
+			ContractVersion:   1,
+			SignedContentHash: cIP.ContentHash,
+			SignerIP:          &ipv4, // non-NULL inet — the exact value that triggered the 500.
+			SignedAt:          now,
+			CreatedAt:         now,
+		}
+		sigNullIP := &domain.Signature{
+			ID:                uuid.New(),
+			ContractID:        cIP.ID,
+			SignerUserID:      freelancerID,
+			SignerRole:        domain.SignerRoleFreelancer,
+			ContractVersion:   1,
+			SignedContentHash: cIP.ContentHash,
+			SignerIP:          nil, // NULL inet must still scan into *string.
+			SignedAt:          now,
+			CreatedAt:         now,
+		}
+
+		require.NoError(t, sigStore.Create(ctx, sigWithIP))
+		require.NoError(t, sigStore.Create(ctx, sigNullIP))
+
+		// This is the call that previously 500'd ("cannot scan inet (OID 869) ...").
+		sigs, err := sigStore.ListByContract(ctx, cIP.ID)
+		require.NoError(t, err)
+		require.Len(t, sigs, 2)
+
+		byID := make(map[uuid.UUID]*domain.Signature, len(sigs))
+		for _, s := range sigs {
+			byID[s.ID] = s
+		}
+
+		gotWithIP := byID[sigWithIP.ID]
+		require.NotNil(t, gotWithIP)
+		require.NotNil(t, gotWithIP.SignerIP, "non-NULL signer_ip must round-trip as *string")
+		assert.Equal(t, ipv4Text, *gotWithIP.SignerIP)
+
+		gotNullIP := byID[sigNullIP.ID]
+		require.NotNil(t, gotNullIP)
+		assert.Nil(t, gotNullIP.SignerIP, "NULL signer_ip must scan as nil *string, not error")
+	})
+
 	t.Run("count valid signatures: dual-sign", func(t *testing.T) {
 		c2 := makeTestContract(clientID, freelancerID)
 		require.NoError(t, contractStore.Create(ctx, c2))

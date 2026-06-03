@@ -83,9 +83,11 @@ VALUES
 }
 
 func listSignaturesByContract(ctx context.Context, q querier, contractID uuid.UUID) ([]*domain.Signature, error) {
+	// signer_ip is Postgres inet (OID 869); pgx v5 binary mode cannot scan inet
+	// directly into *string. Cast to text so it scans cleanly (NULL stays NULL).
 	const query = `
 SELECT id, contract_id, signer_user_id, signer_role, contract_version,
-       signed_content_hash, signer_ip, user_agent, signed_at, created_at
+       signed_content_hash, signer_ip::text, user_agent, signed_at, created_at
 FROM contract_signatures
 WHERE contract_id = $1
 ORDER BY signed_at DESC
