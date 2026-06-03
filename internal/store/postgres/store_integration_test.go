@@ -69,7 +69,7 @@ func runMain(m *testing.M) int {
 		return 1
 	}
 
-	sharedPool, err = postgres.NewPool(ctx, dsn, "") // empty schema = public (test default)
+	sharedPool, err = postgres.NewPool(ctx, dsn, "", postgres.PoolConfig{}) // empty schema = public (test default)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create pool: %v\n", err)
 
@@ -89,7 +89,7 @@ func runMain(m *testing.M) int {
 
 // applyMigrations runs all embedded *.up.sql files against the test database.
 func applyMigrations(ctx context.Context, dsn string) error {
-	pool, err := postgres.NewPool(ctx, dsn, "") // empty schema = public (test default)
+	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolConfig{}) // empty schema = public (test default)
 	if err != nil {
 		return fmt.Errorf("create migration pool: %w", err)
 	}
@@ -616,7 +616,7 @@ func TestPool_SchemaIsolation_Integration(t *testing.T) {
 
 	// Build pool with the custom schema — this should CREATE SCHEMA IF NOT EXISTS
 	// and set search_path on every connection.
-	pool, err := postgres.NewPool(ctx, dsn, testSchema)
+	pool, err := postgres.NewPool(ctx, dsn, testSchema, postgres.PoolConfig{})
 	require.NoError(t, err)
 
 	t.Cleanup(pool.Close)
@@ -675,4 +675,99 @@ func TestPool_SchemaIsolation_Integration(t *testing.T) {
 
 	require.NoError(t, countRow.Scan(&publicCount))
 	assert.Equal(t, 0, publicCount, "contracts must NOT exist in public schema when schema=%q", testSchema)
+}
+
+// TestPool_ReservedWordSchema_Integration verifies that schema names that are
+// PostgreSQL reserved words (e.g. "user") work correctly when using
+// pgx.Identifier.Sanitize() quoting.  Without quoting, PG returns error 42601
+// (syntax error) on both CREATE SCHEMA and SET search_path statements.
+func TestPool_ReservedWordSchema_Integration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	// "user" is a PG reserved word — it passes [a-zA-Z_][a-zA-Z0-9_]* validation
+	// but fails at runtime without identifier quoting.
+	const reservedSchema = "user"
+
+	ctx := context.Background()
+
+	ctr, err := tcpostgres.Run(
+		ctx,
+		"postgres:17-alpine",
+		tcpostgres.WithDatabase("testdb"),
+		tcpostgres.WithUsername("testuser"),
+		tcpostgres.WithPassword("testpass"),
+		tcpostgres.BasicWaitStrategies(),
+	)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		if termErr := ctr.Terminate(ctx); termErr != nil {
+			t.Logf("terminate container: %v", termErr)
+		}
+	})
+
+	dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
+	require.NoError(t, err)
+
+	// NewPool must succeed: CREATE SCHEMA IF NOT EXISTS "user" and
+	// SET search_path = "user", public must both work without syntax error.
+	pool, err := postgres.NewPool(ctx, dsn, reservedSchema, postgres.PoolConfig{MaxConns: 2, MinConns: 1})
+	require.NoError(t, err, "NewPool with reserved-word schema %q must not return error 42601", reservedSchema)
+
+	t.Cleanup(pool.Close)
+
+	// Apply migrations so the contracts table is created inside the "user" schema.
+	var upFiles []string
+
+	walkErr := fs.WalkDir(migrations.FS, ".", func(path string, d fs.DirEntry, walkEntryErr error) error {
+		if walkEntryErr != nil {
+			return walkEntryErr
+		}
+
+		if !d.IsDir() && strings.HasSuffix(path, ".up.sql") {
+			upFiles = append(upFiles, path)
+		}
+
+		return nil
+	})
+	require.NoError(t, walkErr, "walk embedded migrations FS")
+	require.NotEmpty(t, upFiles, "no *.up.sql files found")
+
+	sort.Strings(upFiles)
+
+	for _, file := range upFiles {
+		data, readErr := migrations.FS.ReadFile(file)
+		require.NoError(t, readErr, "read migration file %s", file)
+
+		_, execErr := pool.Exec(ctx, string(data))
+		require.NoError(t, execErr, "apply migration %s inside reserved-word schema %q", file, reservedSchema)
+	}
+
+	// Assert contracts table exists in the "user" schema (not public).
+	var tableSchema string
+
+	row := pool.QueryRow(
+		ctx,
+		`SELECT table_schema FROM information_schema.tables
+		 WHERE table_name = 'contracts' AND table_schema = $1`,
+		reservedSchema,
+	)
+
+	err = row.Scan(&tableSchema)
+	require.NoError(t, err, "contracts table must exist in reserved-word schema %q", reservedSchema)
+	assert.Equal(t, reservedSchema, tableSchema, "contracts must be in schema %q, not public", reservedSchema)
+
+	// Confirm public schema has no contracts (isolation check).
+	var publicCount int
+
+	countRow := pool.QueryRow(
+		ctx,
+		`SELECT COUNT(*) FROM information_schema.tables
+		 WHERE table_name = 'contracts' AND table_schema = 'public'`,
+	)
+
+	require.NoError(t, countRow.Scan(&publicCount))
+	assert.Equal(t, 0, publicCount, "contracts must NOT exist in public when schema=%q", reservedSchema)
 }
