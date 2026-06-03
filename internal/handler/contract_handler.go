@@ -13,6 +13,13 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// NOTE (M-2 fix): The public POST /v1/contracts endpoint and its handler method
+// Create() have been removed. Contract creation is now exclusively triggered by
+// the marketplace service via POST /internal/v1/contracts after AcceptBid succeeds.
+// Clients can no longer supply freelancerUserId, amount, currency, listingId, or
+// acceptedBidId — these values come from the authoritative marketplace award record.
+// See InternalContractHandler.Create in internal_contract_handler.go.
+
 const maxBodyBytes = 1 << 20 // 1 MB
 
 // ContractHandler handles contract CRUD and lifecycle endpoints.
@@ -23,80 +30,6 @@ type ContractHandler struct {
 // NewContractHandler returns a ContractHandler.
 func NewContractHandler(svc *service.ContractService) *ContractHandler {
 	return &ContractHandler{svc: svc}
-}
-
-// CreateContractRequest is the POST /v1/contracts request body.
-type CreateContractRequest struct {
-	ListingID        string `json:"listingId"`
-	AcceptedBidID    string `json:"acceptedBidId"`
-	FreelancerUserID string `json:"freelancerUserId"`
-	Title            string `json:"title"`
-	Terms            string `json:"terms"`
-	Amount           string `json:"amount"` // numeric as string to preserve precision
-	Currency         string `json:"currency"`
-}
-
-// Create handles POST /v1/contracts.
-func (h *ContractHandler) Create(c *gin.Context) {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
-
-	identity, ok := middleware.IdentityFromCtx(c)
-	if !ok {
-		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
-		return
-	}
-
-	var req CreateContractRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
-		return
-	}
-
-	listingID, err := uuid.Parse(req.ListingID)
-	if err != nil {
-		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid listingId")
-		return
-	}
-
-	acceptedBidID, err := uuid.Parse(req.AcceptedBidID)
-	if err != nil {
-		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid acceptedBidId")
-		return
-	}
-
-	freelancerUserID, err := uuid.Parse(req.FreelancerUserID)
-	if err != nil {
-		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid freelancerUserId")
-		return
-	}
-
-	amount, err := decimal.NewFromString(req.Amount)
-	if err != nil {
-		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "amount must be a valid decimal")
-		return
-	}
-
-	currency := req.Currency
-	if currency == "" {
-		currency = "TWD"
-	}
-
-	contract, err := h.svc.CreateContract(c.Request.Context(), &service.CreateContractInput{
-		ClientUserID:     identity.UserID, // from header only, never body
-		ListingID:        listingID,
-		AcceptedBidID:    acceptedBidID,
-		FreelancerUserID: freelancerUserID,
-		Title:            req.Title,
-		Terms:            req.Terms,
-		Amount:           amount,
-		Currency:         currency,
-	})
-	if err != nil {
-		httpx.Err(c, err)
-		return
-	}
-
-	httpx.Created(c, contract)
 }
 
 // List handles GET /v1/contracts.

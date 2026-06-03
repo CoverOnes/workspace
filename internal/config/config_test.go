@@ -9,12 +9,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// validServiceToken is a 32-character token satisfying the minimum-entropy requirement.
+const validServiceToken = "00000000-0000-0000-0000-000000000000"
+
 func setValidEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("WORKSPACE_POSTGRES_DSN", "postgres://u:p@localhost:5432/db")
 	t.Setenv("WORKSPACE_PORT", "8082")
 	t.Setenv("WORKSPACE_LOG_LEVEL", "INFO")
 	t.Setenv("WORKSPACE_ENV", "development")
+	t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
 }
 
 func TestLoad_MissingDSN(t *testing.T) {
@@ -72,6 +76,7 @@ func TestLoad_Success_ParsedValues(t *testing.T) {
 	t.Setenv("WORKSPACE_LOG_LEVEL", "DEBUG")
 	t.Setenv("WORKSPACE_ENV", "production")
 	t.Setenv("WORKSPACE_REDIS_URL", "redis://localhost:6379")
+	t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
 
 	cfg, err := config.Load()
 	require.NoError(t, err)
@@ -84,6 +89,7 @@ func TestLoad_Success_ParsedValues(t *testing.T) {
 
 func TestLoad_Defaults_Applied(t *testing.T) {
 	t.Setenv("WORKSPACE_POSTGRES_DSN", "postgres://u:p@localhost:5432/db")
+	t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
 	// Clear optional fields so defaults apply.
 	t.Setenv("WORKSPACE_PORT", "")
 	t.Setenv("WORKSPACE_LOG_LEVEL", "")
@@ -114,10 +120,53 @@ func TestIsDev(t *testing.T) {
 			t.Setenv("WORKSPACE_PORT", "8082")
 			t.Setenv("WORKSPACE_LOG_LEVEL", "INFO")
 			t.Setenv("WORKSPACE_ENV", tc.env)
+			t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
 
 			cfg, err := config.Load()
 			require.NoError(t, err)
 			assert.Equal(t, tc.isDev, cfg.IsDev(), "IsDev() for env=%s", tc.env)
+		})
+	}
+}
+
+func TestLoad_ContractServiceToken(t *testing.T) {
+	tests := []struct {
+		name      string
+		token     string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:    "valid 36-char UUID token",
+			token:   validServiceToken,
+			wantErr: false,
+		},
+		{
+			name:      "token too short (31 chars)",
+			token:     "1234567890123456789012345678901",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_CONTRACT_SERVICE_TOKEN",
+		},
+		{
+			name:      "empty token rejected",
+			token:     "",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_CONTRACT_SERVICE_TOKEN",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setValidEnv(t)
+			t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", tc.token)
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err)
+			}
 		})
 	}
 }

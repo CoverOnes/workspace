@@ -49,6 +49,12 @@ type Config struct {
 	// AutoMigrate, when true, runs embedded *.up.sql migrations at boot.
 	// Intended for local development and CI only; production should use 'task migrate'.
 	AutoMigrate bool `mapstructure:"auto_migrate"`
+
+	// ContractServiceToken is the shared secret that marketplace must supply in the
+	// X-Service-Token header when calling the internal contract-create endpoint.
+	// Required; must be at least 32 characters to enforce adequate entropy.
+	// Env: WORKSPACE_CONTRACT_SERVICE_TOKEN
+	ContractServiceToken string `mapstructure:"contract_service_token"`
 }
 
 // Load reads configuration from environment variables (prefix WORKSPACE_).
@@ -60,15 +66,16 @@ func Load() (*Config, error) {
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	bindings := map[string]string{
-		"port":            "WORKSPACE_PORT",
-		"postgres_dsn":    "WORKSPACE_POSTGRES_DSN",
-		"postgres_schema": "WORKSPACE_DB_SCHEMA",
-		"redis_url":       "WORKSPACE_REDIS_URL",
-		"log_level":       "WORKSPACE_LOG_LEVEL",
-		"env":             "WORKSPACE_ENV",
-		"auto_migrate":    "WORKSPACE_AUTO_MIGRATE",
-		"db_max_conns":    "WORKSPACE_DB_MAX_CONNS",
-		"db_min_conns":    "WORKSPACE_DB_MIN_CONNS",
+		"port":                   "WORKSPACE_PORT",
+		"postgres_dsn":           "WORKSPACE_POSTGRES_DSN",
+		"postgres_schema":        "WORKSPACE_DB_SCHEMA",
+		"redis_url":              "WORKSPACE_REDIS_URL",
+		"log_level":              "WORKSPACE_LOG_LEVEL",
+		"env":                    "WORKSPACE_ENV",
+		"auto_migrate":           "WORKSPACE_AUTO_MIGRATE",
+		"db_max_conns":           "WORKSPACE_DB_MAX_CONNS",
+		"db_min_conns":           "WORKSPACE_DB_MIN_CONNS",
+		"contract_service_token": "WORKSPACE_CONTRACT_SERVICE_TOKEN",
 	}
 
 	for key, envKey := range bindings {
@@ -127,6 +134,10 @@ func (c *Config) validate() error {
 
 	if c.DBMinConns < 0 || c.DBMinConns > 65535 {
 		errs = append(errs, "WORKSPACE_DB_MIN_CONNS must be 0-65535 (0 = use default of 2)")
+	}
+
+	if len(c.ContractServiceToken) < 32 {
+		errs = append(errs, "WORKSPACE_CONTRACT_SERVICE_TOKEN must be at least 32 characters")
 	}
 
 	if len(errs) > 0 {
