@@ -149,7 +149,10 @@ func makeTestContract(clientID, freelancerID uuid.UUID) *domain.Contract {
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	amount := decimal.NewFromInt(5000)
 	cid := uuid.New()
-	hash := domain.CanonicalContractDigest(cid.String(), "Test Contract", "Terms body", amount.StringFixed(2), "TWD", 1)
+	hash := domain.CanonicalContractDigest(
+		cid.String(), clientID.String(), freelancerID.String(),
+		"Test Contract", "Terms body", amount.StringFixed(2), "TWD", 1,
+	)
 
 	return &domain.Contract{
 		ID:               cid,
@@ -414,6 +417,61 @@ func TestSignatureStore_Integration(t *testing.T) {
 		}
 		err := sigStore.Create(ctx, sig2)
 		require.ErrorIs(t, err, domain.ErrAlreadySigned)
+	})
+
+	// Migration 000005 adds UNIQUE(contract_id, signer_role, contract_version).
+	// This backstops dual-sign integrity: even two DISTINCT users cannot both
+	// occupy the SAME role for the same contract version, so CountValidSignatures
+	// (which counts DISTINCT signer_role) can never be inflated to 2 by a single
+	// role. A second row with the same role+version is rejected as a 23505 (which
+	// the store surfaces as ErrAlreadySigned).
+	t.Run("two distinct users cannot both sign as the same role/version (role-version unique index)", func(t *testing.T) {
+		c4 := makeTestContract(clientID, freelancerID)
+		require.NoError(t, contractStore.Create(ctx, c4))
+
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		clientSig := &domain.Signature{
+			ID:                uuid.New(),
+			ContractID:        c4.ID,
+			SignerUserID:      clientID,
+			SignerRole:        domain.SignerRoleClient,
+			ContractVersion:   1,
+			SignedContentHash: c4.ContentHash,
+			SignedAt:          now,
+			CreatedAt:         now,
+		}
+		require.NoError(t, sigStore.Create(ctx, clientSig))
+
+		// A DIFFERENT user attempts to also sign as CLIENT for the same version.
+		// (signer_user_id differs, so the older signer_user_id-based index does NOT
+		// catch this — only the new role-version index does.)
+		impostorClientSig := &domain.Signature{
+			ID:                uuid.New(),
+			ContractID:        c4.ID,
+			SignerUserID:      uuid.New(), // distinct user
+			SignerRole:        domain.SignerRoleClient,
+			ContractVersion:   1,
+			SignedContentHash: c4.ContentHash,
+			SignedAt:          time.Now().UTC(),
+			CreatedAt:         time.Now().UTC(),
+		}
+		err := sigStore.Create(ctx, impostorClientSig)
+		require.ErrorIs(t, err, domain.ErrAlreadySigned,
+			"a second CLIENT signature for the same version must be rejected by the role-version unique index")
+
+		// Sanity: a FREELANCER signature for the same version is still allowed.
+		freelancerSig := &domain.Signature{
+			ID:                uuid.New(),
+			ContractID:        c4.ID,
+			SignerUserID:      freelancerID,
+			SignerRole:        domain.SignerRoleFreelancer,
+			ContractVersion:   1,
+			SignedContentHash: c4.ContentHash,
+			SignedAt:          time.Now().UTC(),
+			CreatedAt:         time.Now().UTC(),
+		}
+		require.NoError(t, sigStore.Create(ctx, freelancerSig),
+			"the opposite role must still be insertable for the same version")
 	})
 }
 

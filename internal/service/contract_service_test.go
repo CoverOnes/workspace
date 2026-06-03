@@ -127,7 +127,10 @@ func makeContract(clientID, freelancerID uuid.UUID, status domain.ContractStatus
 	now := time.Now().UTC()
 	amount := decimal.NewFromInt(1000)
 	cid := uuid.New()
-	hash := domain.CanonicalContractDigest(cid.String(), "Title", "Terms", amount.StringFixed(2), "TWD", 1)
+	hash := domain.CanonicalContractDigest(
+		cid.String(), clientID.String(), freelancerID.String(),
+		"Title", "Terms", amount.StringFixed(2), "TWD", 1,
+	)
 
 	return &domain.Contract{
 		ID:               cid,

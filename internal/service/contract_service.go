@@ -118,7 +118,8 @@ func (s *ContractService) CreateContract(ctx context.Context, in *CreateContract
 	contractID := uuid.New()
 	amountStr := in.Amount.StringFixed(2)
 	contentHash := domain.CanonicalContractDigest(
-		contractID.String(), in.Title, in.Terms, amountStr, in.Currency, 1,
+		contractID.String(), in.ClientUserID.String(), in.FreelancerUserID.String(),
+		in.Title, in.Terms, amountStr, in.Currency, 1,
 	)
 
 	now := time.Now().UTC()
@@ -205,7 +206,8 @@ func (s *ContractService) PatchContract(ctx context.Context, in PatchContractInp
 			c.Version++
 			c.Status = domain.ContractStatusDraft // reset to DRAFT, prior sigs invalidated by version bump
 			c.ContentHash = domain.CanonicalContractDigest(
-				c.ID.String(), c.Title, c.Terms, c.Amount.StringFixed(2), c.Currency, c.Version,
+				c.ID.String(), c.ClientUserID.String(), c.FreelancerUserID.String(),
+				c.Title, c.Terms, c.Amount.StringFixed(2), c.Currency, c.Version,
 			)
 		}
 

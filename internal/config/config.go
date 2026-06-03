@@ -136,8 +136,8 @@ func (c *Config) validate() error {
 		errs = append(errs, "WORKSPACE_DB_MIN_CONNS must be 0-65535 (0 = use default of 2)")
 	}
 
-	if len(c.ContractServiceToken) < 32 {
-		errs = append(errs, "WORKSPACE_CONTRACT_SERVICE_TOKEN must be at least 32 characters")
+	if tokenErr := c.validateServiceToken(); tokenErr != "" {
+		errs = append(errs, tokenErr)
 	}
 
 	if len(errs) > 0 {
@@ -145,6 +145,31 @@ func (c *Config) validate() error {
 	}
 
 	return nil
+}
+
+// validateServiceToken validates WORKSPACE_CONTRACT_SERVICE_TOKEN and returns an
+// error message (empty string = valid).
+//
+// The internal S2S contract-create endpoint cannot start without this token.
+// In non-development environments it is REQUIRED and must have adequate entropy
+// (>= 32 chars). In development we allow it to be unset so the service can boot
+// for local UI work that does not exercise the internal endpoint — but if it is
+// set, it must still meet the length floor (catches typos / truncated secrets).
+func (c *Config) validateServiceToken() string {
+	const minServiceTokenLen = 32
+
+	switch {
+	case c.IsDev() && c.ContractServiceToken == "":
+		return "" // allowed: dev boot without the S2S token
+	case c.ContractServiceToken == "":
+		return "WORKSPACE_CONTRACT_SERVICE_TOKEN is required in non-development environments " +
+			"(set it to a random secret of at least 32 characters; the internal contract-create " +
+			"endpoint cannot start without it)"
+	case len(c.ContractServiceToken) < minServiceTokenLen:
+		return "WORKSPACE_CONTRACT_SERVICE_TOKEN must be at least 32 characters"
+	default:
+		return ""
+	}
 }
 
 // IsDev reports whether the service is running in development mode.

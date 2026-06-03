@@ -132,32 +132,63 @@ func TestIsDev(t *testing.T) {
 func TestLoad_ContractServiceToken(t *testing.T) {
 	tests := []struct {
 		name      string
+		env       string
 		token     string
 		wantErr   bool
 		errSubstr string
 	}{
 		{
-			name:    "valid 36-char UUID token",
+			name:    "valid 36-char UUID token in development",
+			env:     "development",
 			token:   validServiceToken,
 			wantErr: false,
 		},
 		{
-			name:      "token too short (31 chars)",
-			token:     "1234567890123456789012345678901",
-			wantErr:   true,
-			errSubstr: "WORKSPACE_CONTRACT_SERVICE_TOKEN",
+			name:    "valid token in production",
+			env:     "production",
+			token:   validServiceToken,
+			wantErr: false,
 		},
 		{
-			name:      "empty token rejected",
+			name:    "empty token allowed in development (service may boot for local UI work)",
+			env:     "development",
+			token:   "",
+			wantErr: false,
+		},
+		{
+			name:      "empty token rejected in production (S2S endpoint cannot start)",
+			env:       "production",
 			token:     "",
 			wantErr:   true,
-			errSubstr: "WORKSPACE_CONTRACT_SERVICE_TOKEN",
+			errSubstr: "WORKSPACE_CONTRACT_SERVICE_TOKEN is required in non-development",
+		},
+		{
+			name:      "empty token rejected in test env",
+			env:       "test",
+			token:     "",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_CONTRACT_SERVICE_TOKEN is required in non-development",
+		},
+		{
+			name:      "token too short (31 chars) rejected in development",
+			env:       "development",
+			token:     "1234567890123456789012345678901",
+			wantErr:   true,
+			errSubstr: "must be at least 32 characters",
+		},
+		{
+			name:      "token too short rejected in production",
+			env:       "production",
+			token:     "1234567890123456789012345678901",
+			wantErr:   true,
+			errSubstr: "must be at least 32 characters",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			setValidEnv(t)
+			t.Setenv("WORKSPACE_ENV", tc.env)
 			t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", tc.token)
 
 			_, err := config.Load()

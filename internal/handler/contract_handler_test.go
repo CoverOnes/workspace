@@ -151,7 +151,10 @@ func makeHandlerContract(clientID, freelancerID uuid.UUID, status domain.Contrac
 	now := time.Now().UTC()
 	amount := decimal.NewFromInt(5000)
 	cid := uuid.New()
-	hash := domain.CanonicalContractDigest(cid.String(), "Test Contract", "Terms body", amount.StringFixed(2), "TWD", 1)
+	hash := domain.CanonicalContractDigest(
+		cid.String(), clientID.String(), freelancerID.String(),
+		"Test Contract", "Terms body", amount.StringFixed(2), "TWD", 1,
+	)
 
 	return &domain.Contract{
 		ID:               cid,

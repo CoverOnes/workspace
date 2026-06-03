@@ -54,16 +54,18 @@ WHERE id = $1 AND deleted_at IS NULL
 	return scanWorklog(s.q.QueryRow(ctx, query, id))
 }
 
-// ListByContract returns all worklogs for a contract (live rows, newest logged_at first).
+// ListByContract returns the most recent worklogs for a contract (live rows,
+// newest logged_at first), capped at listByContractLimit rows.
 func (s *WorklogStore) ListByContract(ctx context.Context, contractID uuid.UUID) ([]*domain.Worklog, error) {
 	const query = `
 SELECT id, contract_id, user_id, description, minutes, logged_at, deleted_at, created_at
 FROM worklogs
 WHERE contract_id = $1 AND deleted_at IS NULL
 ORDER BY logged_at DESC
+LIMIT $2
 `
 
-	rows, err := s.q.Query(ctx, query, contractID)
+	rows, err := s.q.Query(ctx, query, contractID, listByContractLimit)
 	if err != nil {
 		return nil, fmt.Errorf("list worklogs: %w", err)
 	}
