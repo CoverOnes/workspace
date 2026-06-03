@@ -29,6 +29,14 @@ type Config struct {
 	// Only alphanumeric characters and underscores are allowed ([a-zA-Z0-9_]+).
 	PostgresSchema string `mapstructure:"postgres_schema"`
 
+	// DBMaxConns is the maximum number of connections in the pgxpool (default: 10).
+	// Set WORKSPACE_DB_MAX_CONNS to reduce when sharing a small Aiven plan.
+	DBMaxConns int `mapstructure:"db_max_conns"`
+
+	// DBMinConns is the minimum number of idle connections kept alive (default: 2).
+	// Set WORKSPACE_DB_MIN_CONNS to 0 for environments with very limited quota.
+	DBMinConns int `mapstructure:"db_min_conns"`
+
 	// Redis (optional — nil Redis = event publish noop + in-process rate limiter)
 	RedisURL string `mapstructure:"redis_url"`
 
@@ -59,6 +67,8 @@ func Load() (*Config, error) {
 		"log_level":       "WORKSPACE_LOG_LEVEL",
 		"env":             "WORKSPACE_ENV",
 		"auto_migrate":    "WORKSPACE_AUTO_MIGRATE",
+		"db_max_conns":    "WORKSPACE_DB_MAX_CONNS",
+		"db_min_conns":    "WORKSPACE_DB_MIN_CONNS",
 	}
 
 	for key, envKey := range bindings {
@@ -70,6 +80,8 @@ func Load() (*Config, error) {
 	v.SetDefault("port", 8082)
 	v.SetDefault("log_level", "INFO")
 	v.SetDefault("env", "development")
+	v.SetDefault("db_max_conns", 10)
+	v.SetDefault("db_min_conns", 2)
 
 	var cfg Config
 
@@ -107,6 +119,14 @@ func (c *Config) validate() error {
 
 	if c.PostgresSchema != "" && !schemaNameRe.MatchString(c.PostgresSchema) {
 		errs = append(errs, "WORKSPACE_DB_SCHEMA must start with a letter or underscore and contain only [a-zA-Z0-9_] characters")
+	}
+
+	if c.DBMaxConns < 0 || c.DBMaxConns > 65535 {
+		errs = append(errs, "WORKSPACE_DB_MAX_CONNS must be 0-65535 (0 = use default of 10)")
+	}
+
+	if c.DBMinConns < 0 || c.DBMinConns > 65535 {
+		errs = append(errs, "WORKSPACE_DB_MIN_CONNS must be 0-65535 (0 = use default of 2)")
 	}
 
 	if len(errs) > 0 {
