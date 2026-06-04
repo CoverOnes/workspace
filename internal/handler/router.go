@@ -20,6 +20,9 @@ type RouterConfig struct {
 	WorklogSvc   *service.WorklogService
 	Pool         *pgxpool.Pool
 	Redis        *redis.Client // may be nil in dev
+	// ContractServiceToken is the pre-shared secret that the marketplace service
+	// must supply in X-Service-Token to reach the internal contract-create endpoint.
+	ContractServiceToken string
 }
 
 // NewRouter builds and returns the configured Gin engine.
@@ -51,6 +54,13 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	ipRL := middleware.NewIPRateLimiter(cfg.Redis, 120, time.Minute)
 	r.Use(ipRL.Handler())
 
+	// Internal service-to-service routes — protected by shared service token.
+	// MUST NOT be exposed by the API gateway (only reachable from within the cluster).
+	internalContractH := NewInternalContractHandler(cfg.ContractSvc)
+	internal := r.Group("/internal/v1")
+	internal.Use(middleware.RequireServiceToken(cfg.ContractServiceToken))
+	internal.POST("/contracts", internalContractH.Create)
+
 	// All API routes require a valid identity (gateway-injected X-User-Id).
 	contractH := NewContractHandler(cfg.ContractSvc)
 	signatureH := NewSignatureHandler(cfg.ContractSvc, cfg.SignatureSvc)
@@ -61,7 +71,10 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	api.Use(middleware.RequireValidIdentity())
 
 	// Contracts — Tier>=1 for reads, Tier>=2 for writes.
-	api.POST("/contracts", middleware.RequireTier(2), contractH.Create)
+	// NOTE: POST /v1/contracts is intentionally removed (M-2 fix). Contracts are
+	// created exclusively via the internal S2S endpoint POST /internal/v1/contracts,
+	// which is called by marketplace after AcceptBid. Clients cannot self-create
+	// contracts with arbitrary freelancer/amount values (CWE-915 / CWE-639).
 	api.GET("/contracts", middleware.RequireTier(1), contractH.List)
 	api.GET("/contracts/:id", middleware.RequireTier(1), contractH.GetByID)
 	api.PATCH("/contracts/:id", middleware.RequireTier(2), contractH.Patch)

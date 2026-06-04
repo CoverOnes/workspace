@@ -25,12 +25,20 @@ type querier interface {
 
 // ContractStore is a pool-backed contract store.
 type ContractStore struct {
-	q querier
+	q    querier
+	pool *pgxpool.Pool
 }
 
 // NewContractStore returns a ContractStore backed by pool.
 func NewContractStore(pool *pgxpool.Pool) *ContractStore {
-	return &ContractStore{q: pool}
+	return &ContractStore{q: pool, pool: pool}
+}
+
+// Pool returns the underlying connection pool. It lets callers (notably
+// integration tests) construct sibling stores (signature store, tx manager)
+// from the same pool without threading a separate *pgxpool.Pool pointer.
+func (s *ContractStore) Pool() *pgxpool.Pool {
+	return s.pool
 }
 
 // txContractStore is a transaction-scoped ContractStore.

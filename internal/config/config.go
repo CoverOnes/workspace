@@ -43,12 +43,21 @@ type Config struct {
 	// Log level: DEBUG, INFO, WARN, ERROR
 	LogLevel string `mapstructure:"log_level"`
 
-	// Environment: development | production
+	// Environment: development | production | test
+	// Defaults to "production" (fail-safe): an unset WORKSPACE_ENV is treated as
+	// prod so the S2S service token is REQUIRED. Dev machines MUST set
+	// WORKSPACE_ENV=development explicitly.
 	Env string `mapstructure:"env"`
 
 	// AutoMigrate, when true, runs embedded *.up.sql migrations at boot.
 	// Intended for local development and CI only; production should use 'task migrate'.
 	AutoMigrate bool `mapstructure:"auto_migrate"`
+
+	// ContractServiceToken is the shared secret that marketplace must supply in the
+	// X-Service-Token header when calling the internal contract-create endpoint.
+	// Required; must be at least 32 characters to enforce adequate entropy.
+	// Env: WORKSPACE_CONTRACT_SERVICE_TOKEN
+	ContractServiceToken string `mapstructure:"contract_service_token"`
 }
 
 // Load reads configuration from environment variables (prefix WORKSPACE_).
@@ -60,15 +69,16 @@ func Load() (*Config, error) {
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	bindings := map[string]string{
-		"port":            "WORKSPACE_PORT",
-		"postgres_dsn":    "WORKSPACE_POSTGRES_DSN",
-		"postgres_schema": "WORKSPACE_DB_SCHEMA",
-		"redis_url":       "WORKSPACE_REDIS_URL",
-		"log_level":       "WORKSPACE_LOG_LEVEL",
-		"env":             "WORKSPACE_ENV",
-		"auto_migrate":    "WORKSPACE_AUTO_MIGRATE",
-		"db_max_conns":    "WORKSPACE_DB_MAX_CONNS",
-		"db_min_conns":    "WORKSPACE_DB_MIN_CONNS",
+		"port":                   "WORKSPACE_PORT",
+		"postgres_dsn":           "WORKSPACE_POSTGRES_DSN",
+		"postgres_schema":        "WORKSPACE_DB_SCHEMA",
+		"redis_url":              "WORKSPACE_REDIS_URL",
+		"log_level":              "WORKSPACE_LOG_LEVEL",
+		"env":                    "WORKSPACE_ENV",
+		"auto_migrate":           "WORKSPACE_AUTO_MIGRATE",
+		"db_max_conns":           "WORKSPACE_DB_MAX_CONNS",
+		"db_min_conns":           "WORKSPACE_DB_MIN_CONNS",
+		"contract_service_token": "WORKSPACE_CONTRACT_SERVICE_TOKEN",
 	}
 
 	for key, envKey := range bindings {
@@ -79,7 +89,15 @@ func Load() (*Config, error) {
 
 	v.SetDefault("port", 8082)
 	v.SetDefault("log_level", "INFO")
-	v.SetDefault("env", "development")
+	// Fail-safe default: an unset WORKSPACE_ENV is treated as production, which
+	// makes validateServiceToken() REQUIRE a real WORKSPACE_CONTRACT_SERVICE_TOKEN.
+	// If this defaulted to "development", a prod deploy that forgot to set
+	// WORKSPACE_ENV would silently boot IsDev()=true, allow an EMPTY service token,
+	// and then RequireServiceToken("") would reject every supplied header — making
+	// /internal/v1/contracts unreachable while the operator falsely believes a
+	// token gate is active. Dev machines / dev-stack set WORKSPACE_ENV=development
+	// explicitly.
+	v.SetDefault("env", "production")
 	v.SetDefault("db_max_conns", 10)
 	v.SetDefault("db_min_conns", 2)
 
@@ -129,11 +147,40 @@ func (c *Config) validate() error {
 		errs = append(errs, "WORKSPACE_DB_MIN_CONNS must be 0-65535 (0 = use default of 2)")
 	}
 
+	if tokenErr := c.validateServiceToken(); tokenErr != "" {
+		errs = append(errs, tokenErr)
+	}
+
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
 	}
 
 	return nil
+}
+
+// validateServiceToken validates WORKSPACE_CONTRACT_SERVICE_TOKEN and returns an
+// error message (empty string = valid).
+//
+// The internal S2S contract-create endpoint cannot start without this token.
+// In non-development environments it is REQUIRED and must have adequate entropy
+// (>= 32 chars). In development we allow it to be unset so the service can boot
+// for local UI work that does not exercise the internal endpoint — but if it is
+// set, it must still meet the length floor (catches typos / truncated secrets).
+func (c *Config) validateServiceToken() string {
+	const minServiceTokenLen = 32
+
+	switch {
+	case c.IsDev() && c.ContractServiceToken == "":
+		return "" // allowed: dev boot without the S2S token
+	case c.ContractServiceToken == "":
+		return "WORKSPACE_CONTRACT_SERVICE_TOKEN is required in non-development environments " +
+			"(set it to a random secret of at least 32 characters; the internal contract-create " +
+			"endpoint cannot start without it)"
+	case len(c.ContractServiceToken) < minServiceTokenLen:
+		return "WORKSPACE_CONTRACT_SERVICE_TOKEN must be at least 32 characters"
+	default:
+		return ""
+	}
 }
 
 // IsDev reports whether the service is running in development mode.

@@ -108,7 +108,10 @@ func (m *stubTxH) WithTx(ctx context.Context, fn func(ctx context.Context, c sto
 	return fn(ctx, m.contracts, m.sigs)
 }
 
+const testServiceToken = "test-service-token-at-least-32-chars!!"
+
 // buildContractRouter creates a test router with ContractService wired to stub stores.
+// The public POST /v1/contracts is intentionally NOT registered (M-2 fix).
 func buildContractRouter(cs *stubContractStoreH) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 
@@ -118,16 +121,22 @@ func buildContractRouter(cs *stubContractStoreH) *gin.Engine {
 
 	svc := service.NewContractService(cs, ss, tx, pub)
 	h := handler.NewContractHandler(svc)
+	internalH := handler.NewInternalContractHandler(svc)
 
 	r := gin.New()
 	r.Use(middleware.Recover())
 	r.Use(middleware.RequestID())
 	r.Use(middleware.SecurityHeaders())
 
+	// Internal S2S endpoint (M-2 fix): protected by service token, NOT by user identity.
+	internal := r.Group("/internal/v1")
+	internal.Use(middleware.RequireServiceToken(testServiceToken))
+	internal.POST("/contracts", internalH.Create)
+
 	api := r.Group("/v1")
 	api.Use(middleware.RequireValidIdentity())
 
-	api.POST("/contracts", middleware.RequireTier(2), h.Create)
+	// NOTE: POST /v1/contracts is NOT registered here (removed as part of M-2 fix).
 	api.GET("/contracts", middleware.RequireTier(1), h.List)
 	api.GET("/contracts/:id", middleware.RequireTier(1), h.GetByID)
 	api.PATCH("/contracts/:id", middleware.RequireTier(2), h.Patch)
@@ -142,7 +151,10 @@ func makeHandlerContract(clientID, freelancerID uuid.UUID, status domain.Contrac
 	now := time.Now().UTC()
 	amount := decimal.NewFromInt(5000)
 	cid := uuid.New()
-	hash := domain.CanonicalContractDigest(cid.String(), "Test Contract", "Terms body", amount.StringFixed(2), "TWD", 1)
+	hash := domain.CanonicalContractDigest(
+		cid.String(), clientID.String(), freelancerID.String(),
+		"Test Contract", "Terms body", amount.StringFixed(2), "TWD", 1,
+	)
 
 	return &domain.Contract{
 		ID:               cid,
@@ -162,83 +174,116 @@ func makeHandlerContract(clientID, freelancerID uuid.UUID, status domain.Contrac
 	}
 }
 
-func TestContractHandler_Create(t *testing.T) {
+// TestPublicContractCreate_Removed verifies that POST /v1/contracts no longer
+// exists — this is the core M-2 vulnerability closure. Any client attempting to
+// self-create a contract with arbitrary freelancer/amount values must receive 404.
+func TestPublicContractCreate_Removed(t *testing.T) {
 	t.Parallel()
 
-	clientID := uuid.New()
+	cs := newStubContractStoreH()
+	r := buildContractRouter(cs)
+
+	body, _ := json.Marshal(map[string]any{
+		"listingId":        uuid.New().String(),
+		"acceptedBidId":    uuid.New().String(),
+		"freelancerUserId": uuid.New().String(), // attacker-controlled
+		"title":            "Malicious Contract",
+		"amount":           "0.01", // attacker-controlled amount
+		"currency":         "TWD",
+	})
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/contracts", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-Id", uuid.New().String())
+	req.Header.Set("X-Kyc-Tier", "2")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	// Must be 404 — endpoint was removed. Previously this returned 201 Created,
+	// allowing the caller to bind any freelancer/amount (CWE-915 / CWE-639).
+	assert.Equal(t, http.StatusNotFound, w.Code, "public contract-create must return 404 after M-2 fix")
+}
+
+// TestInternalContractCreate verifies the S2S endpoint correctly creates contracts
+// and enforces the service-token gate.
+func TestInternalContractCreate(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
 	freelancerID := uuid.New()
 
 	tests := []struct {
 		name       string
-		callerID   string
-		tier       string
+		token      string
 		body       map[string]any
 		wantStatus int
 		wantCode   string
 	}{
 		{
-			name:     "happy path: Tier2 creates contract",
-			callerID: clientID.String(),
-			tier:     "2",
+			name:  "valid service token and payload creates contract",
+			token: testServiceToken,
 			body: map[string]any{
 				"listingId":        uuid.New().String(),
-				"acceptedBidId":    uuid.New().String(),
+				"awardBidId":       uuid.New().String(),
+				"clientUserId":     ownerID.String(),
 				"freelancerUserId": freelancerID.String(),
-				"title":            "My Contract",
-				"terms":            "Agreed terms here.",
 				"amount":           "5000.00",
 				"currency":         "TWD",
 			},
 			wantStatus: http.StatusCreated,
 		},
 		{
-			name:       "missing X-User-Id returns 401",
-			callerID:   "",
-			tier:       "2",
-			body:       map[string]any{},
+			name:       "missing service token returns 401",
+			token:      "",
+			body:       map[string]any{"listingId": uuid.New().String()},
 			wantStatus: http.StatusUnauthorized,
 			wantCode:   "UNAUTHORIZED",
 		},
 		{
-			name:     "Tier 1 cannot create (requires Tier 2)",
-			callerID: clientID.String(),
-			tier:     "1",
-			body: map[string]any{
-				"listingId":        uuid.New().String(),
-				"acceptedBidId":    uuid.New().String(),
-				"freelancerUserId": freelancerID.String(),
-				"title":            "Contract",
-				"amount":           "1000.00",
-				"currency":         "TWD",
-			},
+			name:       "wrong service token returns 403",
+			token:      "wrong-token",
+			body:       map[string]any{"listingId": uuid.New().String()},
 			wantStatus: http.StatusForbidden,
-			wantCode:   "KYC_TIER_REQUIRED",
+			wantCode:   "FORBIDDEN",
 		},
 		{
-			name:     "invalid listingId returns 400",
-			callerID: clientID.String(),
-			tier:     "2",
+			name:  "invalid clientUserId UUID returns 400",
+			token: testServiceToken,
 			body: map[string]any{
-				"listingId":        "not-a-uuid",
-				"acceptedBidId":    uuid.New().String(),
+				"listingId":        uuid.New().String(),
+				"awardBidId":       uuid.New().String(),
+				"clientUserId":     "not-a-uuid",
 				"freelancerUserId": freelancerID.String(),
-				"title":            "Title",
-				"amount":           "1000.00",
+				"amount":           "5000.00",
 				"currency":         "TWD",
 			},
 			wantStatus: http.StatusBadRequest,
 			wantCode:   "VALIDATION_ERROR",
 		},
 		{
-			name:     "non-decimal amount returns 400",
-			callerID: clientID.String(),
-			tier:     "2",
+			name:  "non-decimal amount returns 400",
+			token: testServiceToken,
 			body: map[string]any{
 				"listingId":        uuid.New().String(),
-				"acceptedBidId":    uuid.New().String(),
+				"awardBidId":       uuid.New().String(),
+				"clientUserId":     ownerID.String(),
 				"freelancerUserId": freelancerID.String(),
-				"title":            "Title",
 				"amount":           "not-a-number",
+				"currency":         "TWD",
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "VALIDATION_ERROR",
+		},
+		{
+			name:  "client == freelancer returns 400 (same-party contract rejected)",
+			token: testServiceToken,
+			body: map[string]any{
+				"listingId":        uuid.New().String(),
+				"awardBidId":       uuid.New().String(),
+				"clientUserId":     ownerID.String(),
+				"freelancerUserId": ownerID.String(), // same person
+				"amount":           "1000.00",
 				"currency":         "TWD",
 			},
 			wantStatus: http.StatusBadRequest,
@@ -254,15 +299,11 @@ func TestContractHandler_Create(t *testing.T) {
 			r := buildContractRouter(cs)
 
 			body, _ := json.Marshal(tc.body)
-			req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/contracts", bytes.NewReader(body))
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/internal/v1/contracts", bytes.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
 
-			if tc.callerID != "" {
-				req.Header.Set("X-User-Id", tc.callerID)
-			}
-
-			if tc.tier != "" {
-				req.Header.Set("X-Kyc-Tier", tc.tier)
+			if tc.token != "" {
+				req.Header.Set("X-Service-Token", tc.token)
 			}
 
 			w := httptest.NewRecorder()

@@ -91,9 +91,10 @@ SELECT id, contract_id, signer_user_id, signer_role, contract_version,
 FROM contract_signatures
 WHERE contract_id = $1
 ORDER BY signed_at DESC
+LIMIT $2
 `
 
-	rows, err := q.Query(ctx, query, contractID)
+	rows, err := q.Query(ctx, query, contractID, listByContractLimit)
 	if err != nil {
 		return nil, fmt.Errorf("list signatures: %w", err)
 	}

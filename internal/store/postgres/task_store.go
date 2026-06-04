@@ -54,16 +54,23 @@ WHERE id = $1 AND deleted_at IS NULL
 	return scanTask(s.q.QueryRow(ctx, query, id))
 }
 
-// ListByContract returns all tasks for a contract (live rows, newest first).
+// listByContractLimit caps the number of child rows returned for a single
+// contract to prevent unbounded result sets (data-flooding DoS). A contract's
+// task board / worklog timeline / signature list is not expected to exceed this.
+const listByContractLimit = 200
+
+// ListByContract returns the most recent tasks for a contract (live rows,
+// newest first), capped at listByContractLimit rows.
 func (s *TaskStore) ListByContract(ctx context.Context, contractID uuid.UUID) ([]*domain.Task, error) {
 	const query = `
 SELECT id, contract_id, title, status, assignee_user_id, deleted_at, created_at, updated_at
 FROM tasks
 WHERE contract_id = $1 AND deleted_at IS NULL
 ORDER BY created_at DESC
+LIMIT $2
 `
 
-	rows, err := s.q.Query(ctx, query, contractID)
+	rows, err := s.q.Query(ctx, query, contractID, listByContractLimit)
 	if err != nil {
 		return nil, fmt.Errorf("list tasks: %w", err)
 	}

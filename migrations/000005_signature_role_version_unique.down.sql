@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS contract_signatures_role_version_unique;

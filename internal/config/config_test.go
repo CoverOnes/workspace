@@ -9,12 +9,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// validServiceToken is a 32-character token satisfying the minimum-entropy requirement.
+const validServiceToken = "00000000-0000-0000-0000-000000000000"
+
 func setValidEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("WORKSPACE_POSTGRES_DSN", "postgres://u:p@localhost:5432/db")
 	t.Setenv("WORKSPACE_PORT", "8082")
 	t.Setenv("WORKSPACE_LOG_LEVEL", "INFO")
 	t.Setenv("WORKSPACE_ENV", "development")
+	t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
 }
 
 func TestLoad_MissingDSN(t *testing.T) {
@@ -72,6 +76,7 @@ func TestLoad_Success_ParsedValues(t *testing.T) {
 	t.Setenv("WORKSPACE_LOG_LEVEL", "DEBUG")
 	t.Setenv("WORKSPACE_ENV", "production")
 	t.Setenv("WORKSPACE_REDIS_URL", "redis://localhost:6379")
+	t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
 
 	cfg, err := config.Load()
 	require.NoError(t, err)
@@ -84,17 +89,50 @@ func TestLoad_Success_ParsedValues(t *testing.T) {
 
 func TestLoad_Defaults_Applied(t *testing.T) {
 	t.Setenv("WORKSPACE_POSTGRES_DSN", "postgres://u:p@localhost:5432/db")
+	t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
 	// Clear optional fields so defaults apply.
 	t.Setenv("WORKSPACE_PORT", "")
 	t.Setenv("WORKSPACE_LOG_LEVEL", "")
 	t.Setenv("WORKSPACE_ENV", "")
 
-	// Default port 8082, log_level INFO, env development should be applied.
+	// Default port 8082, log_level INFO, env production (fail-safe) should be applied.
 	cfg, err := config.Load()
 	require.NoError(t, err)
 	assert.Equal(t, 8082, cfg.Port)
 	assert.Equal(t, strings.ToUpper("INFO"), strings.ToUpper(cfg.LogLevel))
-	assert.Equal(t, "development", cfg.Env)
+	assert.Equal(t, "production", cfg.Env)
+}
+
+// TestLoad_DefaultEnv_IsFailSafeProduction is load-bearing: it directly pins the
+// fail-safe default. An unset WORKSPACE_ENV MUST resolve to production (IsDev()==false)
+// so that an empty WORKSPACE_CONTRACT_SERVICE_TOKEN is REJECTED at boot. Reverting
+// the default in config.go back to "development" makes both sub-assertions fail,
+// which is exactly what we want this test to catch.
+func TestLoad_DefaultEnv_IsFailSafeProduction(t *testing.T) {
+	t.Run("unset env defaults to production, not dev", func(t *testing.T) {
+		t.Setenv("WORKSPACE_POSTGRES_DSN", "postgres://u:p@localhost:5432/db")
+		t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
+		t.Setenv("WORKSPACE_PORT", "")
+		t.Setenv("WORKSPACE_LOG_LEVEL", "")
+		t.Setenv("WORKSPACE_ENV", "")
+
+		cfg, err := config.Load()
+		require.NoError(t, err)
+		assert.Equal(t, "production", cfg.Env, "unset WORKSPACE_ENV must default to production")
+		assert.False(t, cfg.IsDev(), "unset WORKSPACE_ENV must NOT be treated as development")
+	})
+
+	t.Run("unset env + empty service token is rejected at boot", func(t *testing.T) {
+		t.Setenv("WORKSPACE_POSTGRES_DSN", "postgres://u:p@localhost:5432/db")
+		t.Setenv("WORKSPACE_PORT", "")
+		t.Setenv("WORKSPACE_LOG_LEVEL", "")
+		t.Setenv("WORKSPACE_ENV", "")
+		t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", "")
+
+		_, err := config.Load()
+		require.Error(t, err, "unset env (=production) with empty service token must fail validation")
+		assert.Contains(t, err.Error(), "WORKSPACE_CONTRACT_SERVICE_TOKEN is required in non-development")
+	})
 }
 
 func TestIsDev(t *testing.T) {
@@ -114,10 +152,84 @@ func TestIsDev(t *testing.T) {
 			t.Setenv("WORKSPACE_PORT", "8082")
 			t.Setenv("WORKSPACE_LOG_LEVEL", "INFO")
 			t.Setenv("WORKSPACE_ENV", tc.env)
+			t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
 
 			cfg, err := config.Load()
 			require.NoError(t, err)
 			assert.Equal(t, tc.isDev, cfg.IsDev(), "IsDev() for env=%s", tc.env)
+		})
+	}
+}
+
+func TestLoad_ContractServiceToken(t *testing.T) {
+	tests := []struct {
+		name      string
+		env       string
+		token     string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:    "valid 36-char UUID token in development",
+			env:     "development",
+			token:   validServiceToken,
+			wantErr: false,
+		},
+		{
+			name:    "valid token in production",
+			env:     "production",
+			token:   validServiceToken,
+			wantErr: false,
+		},
+		{
+			name:    "empty token allowed in development (service may boot for local UI work)",
+			env:     "development",
+			token:   "",
+			wantErr: false,
+		},
+		{
+			name:      "empty token rejected in production (S2S endpoint cannot start)",
+			env:       "production",
+			token:     "",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_CONTRACT_SERVICE_TOKEN is required in non-development",
+		},
+		{
+			name:      "empty token rejected in test env",
+			env:       "test",
+			token:     "",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_CONTRACT_SERVICE_TOKEN is required in non-development",
+		},
+		{
+			name:      "token too short (31 chars) rejected in development",
+			env:       "development",
+			token:     "1234567890123456789012345678901",
+			wantErr:   true,
+			errSubstr: "must be at least 32 characters",
+		},
+		{
+			name:      "token too short rejected in production",
+			env:       "production",
+			token:     "1234567890123456789012345678901",
+			wantErr:   true,
+			errSubstr: "must be at least 32 characters",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setValidEnv(t)
+			t.Setenv("WORKSPACE_ENV", tc.env)
+			t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", tc.token)
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err)
+			}
 		})
 	}
 }

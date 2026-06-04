@@ -37,15 +37,60 @@ func NewContractService(
 }
 
 // CreateContractInput carries validated input for creating a contract.
+// All fields carrying deal-identity (ListingID, AcceptedBidID, FreelancerUserID,
+// Amount, Currency) MUST originate from a trusted service-to-service call —
+// never from the public API body. The public contract-create endpoint has been
+// removed (M-2 fix). Use CreateContractFromAward for the internal S2S path.
 type CreateContractInput struct {
-	ClientUserID     uuid.UUID // set from X-User-Id header (creator MUST be listing owner)
-	ListingID        uuid.UUID
-	AcceptedBidID    uuid.UUID
-	FreelancerUserID uuid.UUID
+	ClientUserID     uuid.UUID // ownerUserId from the marketplace award record
+	ListingID        uuid.UUID // authoritative from marketplace award
+	AcceptedBidID    uuid.UUID // authoritative from marketplace award (bid_id)
+	FreelancerUserID uuid.UUID // authoritative from marketplace award (bidder_user_id)
 	Title            string
 	Terms            string
+	Amount           decimal.Decimal // authoritative from marketplace award
+	Currency         string          // authoritative from marketplace award
+}
+
+// CreateContractFromAwardInput carries the marketplace-authoritative fields
+// needed to create a DRAFT contract from a bid_accepted event. Clients cannot
+// supply these values — they are provided exclusively by the marketplace
+// service via server-to-server call after AcceptBid succeeds.
+type CreateContractFromAwardInput struct {
+	// Marketplace-authoritative deal identity — never from client body.
+	ListingID        uuid.UUID
+	AwardBidID       uuid.UUID // corresponds to accepted_bid_id in contracts table
+	ClientUserID     uuid.UUID // listing owner = contract client
+	FreelancerUserID uuid.UUID // bid winner = contract freelancer
 	Amount           decimal.Decimal
 	Currency         string
+
+	// Optional title/terms supplied by marketplace (may be empty; editable later).
+	Title string
+	Terms string
+}
+
+// CreateContractFromAward creates a DRAFT contract from marketplace-authoritative
+// award data. This is the ONLY code path for contract creation — the previous
+// public POST /v1/contracts endpoint has been removed to close CWE-915/CWE-639.
+func (s *ContractService) CreateContractFromAward(ctx context.Context, in *CreateContractFromAwardInput) (*domain.Contract, error) {
+	// Title defaults to empty string if marketplace does not supply it; client
+	// can fill it in via PATCH before submitting.
+	title := in.Title
+	if title == "" {
+		title = "Contract"
+	}
+
+	return s.CreateContract(ctx, &CreateContractInput{
+		ClientUserID:     in.ClientUserID,
+		ListingID:        in.ListingID,
+		AcceptedBidID:    in.AwardBidID,
+		FreelancerUserID: in.FreelancerUserID,
+		Title:            title,
+		Terms:            in.Terms,
+		Amount:           in.Amount,
+		Currency:         in.Currency,
+	})
 }
 
 // CreateContract creates a DRAFT contract from an awarded deal.
@@ -73,7 +118,8 @@ func (s *ContractService) CreateContract(ctx context.Context, in *CreateContract
 	contractID := uuid.New()
 	amountStr := in.Amount.StringFixed(2)
 	contentHash := domain.CanonicalContractDigest(
-		contractID.String(), in.Title, in.Terms, amountStr, in.Currency, 1,
+		contractID.String(), in.ClientUserID.String(), in.FreelancerUserID.String(),
+		in.Title, in.Terms, amountStr, in.Currency, 1,
 	)
 
 	now := time.Now().UTC()
@@ -160,7 +206,8 @@ func (s *ContractService) PatchContract(ctx context.Context, in PatchContractInp
 			c.Version++
 			c.Status = domain.ContractStatusDraft // reset to DRAFT, prior sigs invalidated by version bump
 			c.ContentHash = domain.CanonicalContractDigest(
-				c.ID.String(), c.Title, c.Terms, c.Amount.StringFixed(2), c.Currency, c.Version,
+				c.ID.String(), c.ClientUserID.String(), c.FreelancerUserID.String(),
+				c.Title, c.Terms, c.Amount.StringFixed(2), c.Currency, c.Version,
 			)
 		}
 

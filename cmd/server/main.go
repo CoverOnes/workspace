@@ -151,12 +151,13 @@ func run() error {
 
 	// Router.
 	r := handler.NewRouter(handler.RouterConfig{
-		ContractSvc:  contractSvc,
-		SignatureSvc: signatureSvc,
-		TaskSvc:      taskSvc,
-		WorklogSvc:   worklogSvc,
-		Pool:         pool,
-		Redis:        redisClient,
+		ContractSvc:          contractSvc,
+		SignatureSvc:         signatureSvc,
+		TaskSvc:              taskSvc,
+		WorklogSvc:           worklogSvc,
+		Pool:                 pool,
+		Redis:                redisClient,
+		ContractServiceToken: cfg.ContractServiceToken,
 	})
 
 	srv := &http.Server{
