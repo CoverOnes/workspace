@@ -19,7 +19,7 @@ type MultipartyRosterEntry struct {
 
 // CanonicalMultipartyDigest produces a deterministic, version-pinned SHA-256
 // over the SORTED roster of parties + their share_bps + the contract version +
-// the tender ID.
+// the tender ID + the currency.
 //
 // Canonicalization rules:
 //   - Roster is sorted ascending by VendorUserID string representation before hashing.
@@ -27,14 +27,17 @@ type MultipartyRosterEntry struct {
 //     inserted (determinism invariant).
 //   - Each party entry is length-prefixed: "<len>:<vendor_user_id>:<share_bps>".
 //   - The full canonical string is:
-//     "<len>:<tender_id>|<version>|N:<entry0>;<entry1>;...;<entryN-1>"
+//     "<len>:<tender_id>|<version>|<len>:<currency>|N:<entry0>;<entry1>;...;<entryN-1>"
 //     where N is the number of parties and each entry is the length-prefixed form.
-//   - Any change to TenderID, Version, roster membership, or share_bps produces
+//   - Any change to TenderID, Version, Currency, roster membership, or share_bps produces
 //     a different digest.
+//   - currency is included so a party's signature commits to the payment currency.
+//     Once at least one party exists, currency is immutable (enforced in service layer).
+//     An empty currency string is serialized as "0:" and produces a distinct value.
 //
 // This function is the ONLY authoritative source of the content_hash for
 // multi-party contracts. A signer MUST sign THIS digest, not raw terms text.
-func CanonicalMultipartyDigest(tenderID uuid.UUID, version int, roster []MultipartyRosterEntry) string {
+func CanonicalMultipartyDigest(tenderID uuid.UUID, version int, currency string, roster []MultipartyRosterEntry) string {
 	// Sort by VendorUserID to achieve determinism regardless of insert order.
 	sorted := make([]MultipartyRosterEntry, len(roster))
 	copy(sorted, roster)
@@ -53,7 +56,7 @@ func CanonicalMultipartyDigest(tenderID uuid.UUID, version int, roster []Multipa
 	}
 
 	// Compose canonical string.
-	// Format: "<len(tenderStr)>:<tenderStr>|<version>|<N>:<entry0>;<entry1>;..."
+	// Format: "<len(tenderStr)>:<tenderStr>|<version>|<len(currency)>:<currency>|<N>:<entry0>;<entry1>;..."
 	var entriesPart string
 	for i, e := range entries {
 		if i > 0 {
@@ -64,9 +67,10 @@ func CanonicalMultipartyDigest(tenderID uuid.UUID, version int, roster []Multipa
 	}
 
 	canonical := fmt.Sprintf(
-		"%d:%s|%d:%d|%d:%s",
+		"%d:%s|%d:%d|%d:%s|%d:%s",
 		len(tenderStr), tenderStr,
 		intLen(version), version,
+		len(currency), currency,
 		len(entriesPart), entriesPart,
 	)
 

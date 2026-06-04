@@ -79,6 +79,10 @@ type MultipartyPartyStore interface {
 	// AddParty inserts a new ACTIVE party row.
 	// Returns ErrConflict (23505) if the vendor already has an ACTIVE row for this contract.
 	AddParty(ctx context.Context, p *domain.MultipartyContractParty) error
+	// GetActivePartyByVendor returns the ACTIVE party row for (contractID, vendorUserID).
+	// Returns ErrNotParty if no ACTIVE row exists (the vendor is not a current member).
+	// Used by signTx to enforce party-membership authz before creating a signature.
+	GetActivePartyByVendor(ctx context.Context, contractID, vendorUserID uuid.UUID) (*domain.MultipartyContractParty, error)
 	// ListActiveByContract returns all ACTIVE parties for a contract.
 	ListActiveByContract(ctx context.Context, contractID uuid.UUID) ([]*domain.MultipartyContractParty, error)
 	// SumActiveBps returns the sum of share_bps for all ACTIVE parties of a contract.

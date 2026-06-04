@@ -422,8 +422,8 @@ func TestMultiparty_NPartySign_QuorumActivation(t *testing.T) {
 	assert.Equal(t, domain.MultipartyContractStatusActive, afterC.Status,
 		"after 3/3 signatures contract must be ACTIVE")
 
-	// GetDetail confirms signed_count == total_parties == 3.
-	detail, err := env.mpSvc.GetDetail(ctx, contract.ID)
+	// GetDetail confirms signed_count == total_parties == 3 (caller = vendorA, an ACTIVE party).
+	detail, err := env.mpSvc.GetDetail(ctx, contract.ID, vendorA)
 	require.NoError(t, err)
 	assert.Equal(t, 3, detail.SignedCount)
 	assert.Equal(t, 3, detail.TotalParties)
@@ -596,13 +596,158 @@ func TestMultiparty_ConcurrentSign_TOCTOU(t *testing.T) {
 	// Wait a moment for the second goroutine's DB state to be fully committed.
 	time.Sleep(10 * time.Millisecond)
 
-	// Final authoritative DB read must show ACTIVE.
-	detail, err := env.mpSvc.GetDetail(ctx, contract.ID)
+	// Final authoritative DB read must show ACTIVE (caller = vendorA, an ACTIVE party).
+	detail, err := env.mpSvc.GetDetail(ctx, contract.ID, vendorA)
 	require.NoError(t, err)
 	assert.Equal(t, domain.MultipartyContractStatusActive, detail.Contract.Status,
 		"contract must be ACTIVE after both parties signed")
 	assert.Equal(t, 2, detail.SignedCount, "exactly 2 signatures must be recorded")
 	assert.Equal(t, 2, detail.TotalParties)
+}
+
+// TestMultiparty_Sign_NonParty_Rejected proves C-1: a non-party authenticated user
+// cannot sign a PENDING_SIGNATURES contract even if they supply the correct hash.
+// The contract must NOT transition to ACTIVE.
+func TestMultiparty_Sign_NonParty_Rejected(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping multiparty integration test in short mode")
+	}
+
+	ctx := context.Background()
+	env := startMultipartyTestDB(t, ctx)
+
+	tenderID := uuid.New()
+	vendorA := uuid.New()
+	nonParty := uuid.New() // authenticated Tier-2 user who is NOT a party
+
+	// Create contract with vendorA as the sole party (10000 bps).
+	contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+		TenderID:     tenderID,
+		VendorUserID: vendorA,
+		ShareBps:     10000,
+	})
+	require.NoError(t, err)
+
+	// Submit for signatures (vendorA must sign).
+	submitted, err := env.mpSvc.SubmitForSignatures(ctx, contract.ID)
+	require.NoError(t, err)
+	assert.Equal(t, domain.MultipartyContractStatusPendingSignatures, submitted.Status)
+
+	// non-party signs with the correct hash and version — MUST be rejected.
+	_, signErr := env.mpSvc.Sign(ctx, service.SignInput{
+		ContractID:        contract.ID,
+		SignerUserID:      nonParty,
+		SignedContentHash: submitted.ContentHash,
+		Version:           1,
+	})
+	require.ErrorIs(t, signErr, domain.ErrNotParty,
+		"a non-party user signing must return ErrNotParty")
+
+	// Contract must NOT have been activated — still PENDING_SIGNATURES.
+	detail, err := env.mpSvc.GetDetail(ctx, contract.ID, vendorA)
+	require.NoError(t, err)
+	assert.Equal(t, domain.MultipartyContractStatusPendingSignatures, detail.Contract.Status,
+		"non-party sign attempt must NOT activate the contract")
+	assert.Equal(t, 0, detail.SignedCount,
+		"no signatures must be recorded after non-party sign attempt")
+}
+
+// TestMultiparty_GetDetail_NonParty_Rejected proves M-3: a non-party Tier-1 user
+// cannot read a multi-party contract's full roster and digest.
+func TestMultiparty_GetDetail_NonParty_Rejected(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping multiparty integration test in short mode")
+	}
+
+	ctx := context.Background()
+	env := startMultipartyTestDB(t, ctx)
+
+	tenderID := uuid.New()
+	vendorA := uuid.New()
+	nonParty := uuid.New() // authenticated Tier-1 user who is NOT a party
+
+	// Create contract and submit it so a hash exists.
+	contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+		TenderID:     tenderID,
+		VendorUserID: vendorA,
+		ShareBps:     10000,
+	})
+	require.NoError(t, err)
+
+	_, err = env.mpSvc.SubmitForSignatures(ctx, contract.ID)
+	require.NoError(t, err)
+
+	// Non-party calls GetDetail — MUST be rejected.
+	_, detailErr := env.mpSvc.GetDetail(ctx, contract.ID, nonParty)
+	require.ErrorIs(t, detailErr, domain.ErrNotParty,
+		"a non-party user reading GetDetail must return ErrNotParty (mapped to 404)")
+
+	// Active party CAN read GetDetail successfully.
+	detail, err := env.mpSvc.GetDetail(ctx, contract.ID, vendorA)
+	require.NoError(t, err, "an ACTIVE party must be able to read contract detail")
+	assert.Equal(t, contract.ID, detail.Contract.ID)
+	assert.Equal(t, 1, detail.TotalParties)
+}
+
+// TestMultiparty_FrozenPartyCount_QuorumNotManipulable proves M-2: the quorum
+// check uses the frozen party_count (set at SubmitForSignatures), not a live COUNT(*).
+// Scenario: 2 parties submit → 1 party exits after submit → quorum must still
+// require 2 signatures (frozen count), not 1 (live count).
+//
+// NOTE: party exit (EXITED status transition) is not yet implemented as a service
+// method, so we simulate it by directly updating the DB row to bypass the service layer.
+// This is acceptable in integration tests where we need to exercise the quorum boundary.
+func TestMultiparty_FrozenPartyCount_QuorumNotManipulable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping multiparty integration test in short mode")
+	}
+
+	ctx := context.Background()
+	env := startMultipartyTestDB(t, ctx)
+
+	tenderID := uuid.New()
+	vendorA := uuid.New()
+	vendorB := uuid.New()
+
+	contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+		TenderID:     tenderID,
+		VendorUserID: vendorA,
+		ShareBps:     5000,
+	})
+	require.NoError(t, err)
+
+	_, _, err = env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+		TenderID:     tenderID,
+		VendorUserID: vendorB,
+		ShareBps:     5000,
+	})
+	require.NoError(t, err)
+
+	// Submit: party_count is frozen at 2.
+	submitted, err := env.mpSvc.SubmitForSignatures(ctx, contract.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 2, submitted.PartyCount, "party_count must be frozen at 2 after submit")
+
+	// Simulate vendorB "exiting" by directly marking the party row EXITED.
+	// (Phase-4 exit flow is not yet implemented; we test the quorum invariant directly.)
+	_, execErr := env.contractStore.Pool().Exec(ctx,
+		`UPDATE multi_party_contract_parties SET status = 'EXITED', updated_at = now()
+		 WHERE contract_id = $1 AND vendor_user_id = $2 AND status = 'ACTIVE'`,
+		contract.ID, vendorB,
+	)
+	require.NoError(t, execErr, "direct DB update to simulate party exit")
+
+	// vendorA signs — only 1 signature, but party_count is frozen at 2.
+	// Contract MUST remain PENDING_SIGNATURES (1 < 2 frozen).
+	afterA, signErr := env.mpSvc.Sign(ctx, service.SignInput{
+		ContractID:        contract.ID,
+		SignerUserID:      vendorA,
+		SignedContentHash: submitted.ContentHash,
+		Version:           1,
+	})
+	require.NoError(t, signErr)
+	assert.Equal(t, domain.MultipartyContractStatusPendingSignatures, afterA.Status,
+		"with frozen party_count=2, signing once must NOT activate the contract")
 }
 
 // TestMultiparty_DualSignRegression proves the 1:1 dual-sign aggregate still works
@@ -697,7 +842,8 @@ func TestMultiparty_GetDetail(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	detail, err := env.mpSvc.GetDetail(ctx, contract.ID)
+	// GetDetail as vendorA (an ACTIVE party) — should succeed.
+	detail, err := env.mpSvc.GetDetail(ctx, contract.ID, vendorA)
 	require.NoError(t, err)
 
 	assert.Equal(t, contract.ID, detail.Contract.ID)

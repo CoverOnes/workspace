@@ -9,6 +9,10 @@ CREATE TABLE multi_party_contracts (
                              CHECK (status IN ('DRAFT','PENDING_SIGNATURES','ACTIVE','COMPLETED','CANCELLED')),
     content_hash text        NOT NULL DEFAULT '',
     version      int         NOT NULL DEFAULT 1 CHECK (version >= 1),
+    -- party_count is frozen at SubmitForSignatures time (= count of ACTIVE parties when submit
+    -- is called). The quorum check in signTx uses this frozen value, NOT a live COUNT(*), so
+    -- that a roster shrink after submit cannot manipulate the quorum threshold.
+    party_count  int         NOT NULL DEFAULT 0 CHECK (party_count >= 0),
     currency     char(3),
     created_at   timestamptz NOT NULL DEFAULT now(),
     updated_at   timestamptz NOT NULL DEFAULT now(),

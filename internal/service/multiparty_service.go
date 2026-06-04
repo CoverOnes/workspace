@@ -218,8 +218,18 @@ func (s *MultipartyContractService) submitForSignaturesTx(
 		}
 	}
 
-	c.ContentHash = domain.CanonicalMultipartyDigest(c.TenderID, c.Version, roster)
+	// Freeze currency for digest: use empty string if not set (still immutable once parties exist).
+	currency := ""
+	if c.Currency != nil {
+		currency = *c.Currency
+	}
+
+	c.ContentHash = domain.CanonicalMultipartyDigest(c.TenderID, c.Version, currency, roster)
 	c.Status = domain.MultipartyContractStatusPendingSignatures
+
+	// Freeze the party count at submit time (M-2 fix: quorum uses this frozen value,
+	// not a live COUNT(*), so roster shrink after submit cannot lower the threshold).
+	c.PartyCount = len(activeParties)
 
 	if updateErr := txContracts.Update(ctx, c); updateErr != nil {
 		return fmt.Errorf("update contract to PENDING_SIGNATURES: %w", updateErr)
@@ -303,6 +313,13 @@ func (s *MultipartyContractService) signTx(
 		return domain.ErrHashMismatch
 	}
 
+	// C-1 authz: verify the signer is an ACTIVE party BEFORE creating the signature row.
+	// The UNIQUE index prevents duplicate signatures but does NOT enforce party membership —
+	// any authenticated user could otherwise sign any contract they know the hash of.
+	if _, err := txParties.GetActivePartyByVendor(ctx, c.ID, in.SignerUserID); err != nil {
+		return err // ErrNotParty → 404 via httpx.Err
+	}
+
 	now := time.Now().UTC()
 	sig := &domain.MultipartyContractSignature{
 		ID:                uuid.New(),
@@ -318,19 +335,16 @@ func (s *MultipartyContractService) signTx(
 		return createErr
 	}
 
-	// Quorum check: count signatures for this version AND count ACTIVE parties —
-	// both counts are inside the same tx under the FOR UPDATE lock.
+	// Quorum check: count signatures for this version and compare against the
+	// FROZEN party_count (set at SubmitForSignatures time). Using the frozen count
+	// closes the Phase-4 footgun where a roster shrink after submit could lower the
+	// live COUNT(*) and trigger premature activation (M-2 fix).
 	sigCount, err := txSigs.CountSignaturesForVersion(ctx, c.ID, c.Version)
 	if err != nil {
 		return fmt.Errorf("count signatures: %w", err)
 	}
 
-	partyCount, err := txParties.CountActiveParties(ctx, c.ID)
-	if err != nil {
-		return fmt.Errorf("count active parties: %w", err)
-	}
-
-	if partyCount > 0 && sigCount >= partyCount {
+	if c.PartyCount > 0 && sigCount == c.PartyCount {
 		if err := s.activateInTx(ctx, txContracts, c); err != nil {
 			return err
 		}
@@ -398,10 +412,28 @@ type ContractDetail struct {
 
 // GetDetail returns the full contract detail: contract + roster + per-version
 // signature progress (signed_count / total_active_parties / version_content_hash).
-func (s *MultipartyContractService) GetDetail(ctx context.Context, contractID uuid.UUID) (*ContractDetail, error) {
+//
+// Access is scoped to ACTIVE parties of the contract. A non-party caller receives
+// ErrNotParty (mapped to 404 to prevent resource-existence enumeration), mirroring
+// the assertParty pattern used by the 1:1 dual-sign aggregate.
+//
+// NOTE: the tender OWNER is not a party per the owner-as-party locked decision
+// (see service-level comment and SubmitForSignatures). Owner-read access would need
+// a separate owner-only endpoint or a broader identity check not in scope for this PR.
+// TODO: if owner-read is required, add GetDetailByOwner that accepts the tenderID and
+// validates ownership against marketplace claims, then grant a read-only view without
+// share_bps details.
+func (s *MultipartyContractService) GetDetail(ctx context.Context, contractID, callerUserID uuid.UUID) (*ContractDetail, error) {
 	c, err := s.contracts.GetByID(ctx, contractID)
 	if err != nil {
 		return nil, err
+	}
+
+	// M-3 authz: verify the caller is an ACTIVE party before returning the full roster
+	// (which includes share_bps and content_hash). A non-party user who knows the
+	// contract ID can otherwise read the full digest needed to exploit C-1.
+	if _, authzErr := s.parties.GetActivePartyByVendor(ctx, contractID, callerUserID); authzErr != nil {
+		return nil, authzErr // ErrNotParty → 404
 	}
 
 	parties, err := s.parties.ListActiveByContract(ctx, contractID)

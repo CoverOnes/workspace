@@ -86,14 +86,14 @@ func (s *MultipartyContractStore) Update(ctx context.Context, c *domain.Multipar
 func createMultipartyContract(ctx context.Context, q querier, c *domain.MultipartyContract) error {
 	const query = `
 INSERT INTO multi_party_contracts
-    (id, tender_id, status, content_hash, version, currency, created_at, updated_at, deleted_at)
+    (id, tender_id, status, content_hash, version, party_count, currency, created_at, updated_at, deleted_at)
 VALUES
-    ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 `
 
 	_, err := q.Exec(
 		ctx, query,
-		c.ID, c.TenderID, string(c.Status), c.ContentHash, c.Version, c.Currency,
+		c.ID, c.TenderID, string(c.Status), c.ContentHash, c.Version, c.PartyCount, c.Currency,
 		c.CreatedAt, c.UpdatedAt, c.DeletedAt,
 	)
 	if err != nil {
@@ -110,7 +110,7 @@ VALUES
 
 func getMultipartyContractByID(ctx context.Context, q querier, id uuid.UUID) (*domain.MultipartyContract, error) {
 	const query = `
-SELECT id, tender_id, status, content_hash, version, currency, created_at, updated_at, deleted_at
+SELECT id, tender_id, status, content_hash, version, party_count, currency, created_at, updated_at, deleted_at
 FROM multi_party_contracts
 WHERE id = $1 AND deleted_at IS NULL
 `
@@ -120,7 +120,7 @@ WHERE id = $1 AND deleted_at IS NULL
 
 func getMultipartyContractByTenderID(ctx context.Context, q querier, tenderID uuid.UUID) (*domain.MultipartyContract, error) {
 	const query = `
-SELECT id, tender_id, status, content_hash, version, currency, created_at, updated_at, deleted_at
+SELECT id, tender_id, status, content_hash, version, party_count, currency, created_at, updated_at, deleted_at
 FROM multi_party_contracts
 WHERE tender_id = $1 AND deleted_at IS NULL
 LIMIT 1
@@ -131,7 +131,7 @@ LIMIT 1
 
 func getMultipartyContractByIDForUpdate(ctx context.Context, q querier, id uuid.UUID) (*domain.MultipartyContract, error) {
 	const query = `
-SELECT id, tender_id, status, content_hash, version, currency, created_at, updated_at, deleted_at
+SELECT id, tender_id, status, content_hash, version, party_count, currency, created_at, updated_at, deleted_at
 FROM multi_party_contracts
 WHERE id = $1 AND deleted_at IS NULL
 FOR UPDATE
@@ -143,11 +143,11 @@ FOR UPDATE
 func updateMultipartyContract(ctx context.Context, q querier, c *domain.MultipartyContract) error {
 	const query = `
 UPDATE multi_party_contracts
-SET status = $2, content_hash = $3, version = $4, currency = $5, updated_at = $6
+SET status = $2, content_hash = $3, version = $4, party_count = $5, currency = $6, updated_at = $7
 WHERE id = $1 AND deleted_at IS NULL
 `
 
-	tag, err := q.Exec(ctx, query, c.ID, string(c.Status), c.ContentHash, c.Version, c.Currency, time.Now().UTC())
+	tag, err := q.Exec(ctx, query, c.ID, string(c.Status), c.ContentHash, c.Version, c.PartyCount, c.Currency, time.Now().UTC())
 	if err != nil {
 		return fmt.Errorf("update multi_party_contract: %w", err)
 	}
@@ -166,7 +166,7 @@ func scanMultipartyContract(row rowScanner) (*domain.MultipartyContract, error) 
 	)
 
 	err := row.Scan(
-		&c.ID, &c.TenderID, &status, &c.ContentHash, &c.Version, &c.Currency,
+		&c.ID, &c.TenderID, &status, &c.ContentHash, &c.Version, &c.PartyCount, &c.Currency,
 		&c.CreatedAt, &c.UpdatedAt, &c.DeletedAt,
 	)
 	if err != nil {
@@ -203,6 +203,12 @@ func (s *txMultipartyPartyStore) AddParty(ctx context.Context, p *domain.Multipa
 	return addMultipartyParty(ctx, s.tx, p)
 }
 
+func (s *txMultipartyPartyStore) GetActivePartyByVendor(
+	ctx context.Context, contractID, vendorUserID uuid.UUID,
+) (*domain.MultipartyContractParty, error) {
+	return getActiveMultipartyPartyByVendor(ctx, s.tx, contractID, vendorUserID)
+}
+
 func (s *txMultipartyPartyStore) ListActiveByContract(
 	ctx context.Context,
 	contractID uuid.UUID,
@@ -223,6 +229,13 @@ func (s *MultipartyPartyStore) AddParty(ctx context.Context, p *domain.Multipart
 	return addMultipartyParty(ctx, s.q, p)
 }
 
+// GetActivePartyByVendor returns the ACTIVE party row for (contractID, vendorUserID).
+func (s *MultipartyPartyStore) GetActivePartyByVendor(
+	ctx context.Context, contractID, vendorUserID uuid.UUID,
+) (*domain.MultipartyContractParty, error) {
+	return getActiveMultipartyPartyByVendor(ctx, s.q, contractID, vendorUserID)
+}
+
 // ListActiveByContract returns all ACTIVE parties for a contract.
 func (s *MultipartyPartyStore) ListActiveByContract(ctx context.Context, contractID uuid.UUID) ([]*domain.MultipartyContractParty, error) {
 	return listActiveMultipartyParties(ctx, s.q, contractID)
@@ -239,6 +252,37 @@ func (s *MultipartyPartyStore) CountActiveParties(ctx context.Context, contractI
 }
 
 // --- helpers ---
+
+func getActiveMultipartyPartyByVendor(
+	ctx context.Context, q querier, contractID, vendorUserID uuid.UUID,
+) (*domain.MultipartyContractParty, error) {
+	const query = `
+SELECT id, contract_id, vendor_user_id, role_id, share_bps, status, created_at, updated_at
+FROM multi_party_contract_parties
+WHERE contract_id = $1 AND vendor_user_id = $2 AND status = 'ACTIVE'
+`
+
+	var (
+		p      domain.MultipartyContractParty
+		status string
+	)
+
+	err := q.QueryRow(ctx, query, contractID, vendorUserID).Scan(
+		&p.ID, &p.ContractID, &p.VendorUserID, &p.RoleID, &p.ShareBps, &status,
+		&p.CreatedAt, &p.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrNotParty
+		}
+
+		return nil, fmt.Errorf("get active multi_party_contract_party: %w", err)
+	}
+
+	p.Status = domain.MultipartyPartyStatus(status)
+
+	return &p, nil
+}
 
 func addMultipartyParty(ctx context.Context, q querier, p *domain.MultipartyContractParty) error {
 	const query = `

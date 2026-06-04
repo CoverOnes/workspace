@@ -26,8 +26,10 @@ func TestCanonicalMultipartyDigest_Determinism(t *testing.T) {
 		{VendorUserID: vendorC, ShareBps: 2000},
 	}
 
+	const currency = "TWD"
+
 	// Reference digest computed with the canonical order.
-	ref := domain.CanonicalMultipartyDigest(tenderID, 1, roster)
+	ref := domain.CanonicalMultipartyDigest(tenderID, 1, currency, roster)
 
 	require.NotEmpty(t, ref, "digest must be non-empty")
 	assert.Len(t, ref, 64, "SHA-256 hex digest must be 64 chars")
@@ -57,7 +59,7 @@ func TestCanonicalMultipartyDigest_Determinism(t *testing.T) {
 		}
 
 		for i, perm := range permutations {
-			got := domain.CanonicalMultipartyDigest(tenderID, 1, perm)
+			got := domain.CanonicalMultipartyDigest(tenderID, 1, currency, perm)
 			assert.Equal(t, ref, got, "permutation %d must produce the same digest as the canonical order", i)
 		}
 	})
@@ -68,7 +70,7 @@ func TestCanonicalMultipartyDigest_Determinism(t *testing.T) {
 			{VendorUserID: vendorB, ShareBps: 3000},
 			{VendorUserID: vendorC, ShareBps: 2000},
 		}
-		assert.NotEqual(t, ref, domain.CanonicalMultipartyDigest(tenderID, 1, modified),
+		assert.NotEqual(t, ref, domain.CanonicalMultipartyDigest(tenderID, 1, currency, modified),
 			"changed share_bps must produce a different digest")
 	})
 
@@ -77,7 +79,7 @@ func TestCanonicalMultipartyDigest_Determinism(t *testing.T) {
 			{VendorUserID: vendorA, ShareBps: 7000},
 			{VendorUserID: vendorB, ShareBps: 3000},
 		}
-		assert.NotEqual(t, ref, domain.CanonicalMultipartyDigest(tenderID, 1, twoParty),
+		assert.NotEqual(t, ref, domain.CanonicalMultipartyDigest(tenderID, 1, currency, twoParty),
 			"removing a party must produce a different digest")
 	})
 
@@ -86,24 +88,34 @@ func TestCanonicalMultipartyDigest_Determinism(t *testing.T) {
 		fourParty := make([]domain.MultipartyRosterEntry, len(roster)+1)
 		copy(fourParty, roster)
 		fourParty[len(roster)] = domain.MultipartyRosterEntry{VendorUserID: vendorD, ShareBps: 0}
-		assert.NotEqual(t, ref, domain.CanonicalMultipartyDigest(tenderID, 1, fourParty),
+		assert.NotEqual(t, ref, domain.CanonicalMultipartyDigest(tenderID, 1, currency, fourParty),
 			"adding a party must produce a different digest")
 	})
 
 	t.Run("version bump changes the digest", func(t *testing.T) {
-		assert.NotEqual(t, ref, domain.CanonicalMultipartyDigest(tenderID, 2, roster),
+		assert.NotEqual(t, ref, domain.CanonicalMultipartyDigest(tenderID, 2, currency, roster),
 			"version change must produce a different digest")
 	})
 
 	t.Run("different tenderID changes the digest", func(t *testing.T) {
 		otherTender := uuid.New()
-		assert.NotEqual(t, ref, domain.CanonicalMultipartyDigest(otherTender, 1, roster),
+		assert.NotEqual(t, ref, domain.CanonicalMultipartyDigest(otherTender, 1, currency, roster),
 			"different tenderID must produce a different digest")
 	})
 
+	t.Run("different currency changes the digest", func(t *testing.T) {
+		assert.NotEqual(t, ref, domain.CanonicalMultipartyDigest(tenderID, 1, "USD", roster),
+			"different currency must produce a different digest")
+	})
+
+	t.Run("empty currency is distinct from non-empty currency", func(t *testing.T) {
+		assert.NotEqual(t, ref, domain.CanonicalMultipartyDigest(tenderID, 1, "", roster),
+			"empty currency must produce a different digest from TWD")
+	})
+
 	t.Run("empty roster is handled deterministically", func(t *testing.T) {
-		d1 := domain.CanonicalMultipartyDigest(tenderID, 1, nil)
-		d2 := domain.CanonicalMultipartyDigest(tenderID, 1, []domain.MultipartyRosterEntry{})
+		d1 := domain.CanonicalMultipartyDigest(tenderID, 1, currency, nil)
+		d2 := domain.CanonicalMultipartyDigest(tenderID, 1, currency, []domain.MultipartyRosterEntry{})
 		assert.Equal(t, d1, d2, "nil and empty slice must produce identical digest")
 		assert.NotEqual(t, ref, d1, "empty roster must differ from non-empty roster")
 	})
@@ -115,7 +127,7 @@ func TestCanonicalMultipartyDigest_Determinism(t *testing.T) {
 			{VendorUserID: vendorB, ShareBps: 5000}, // B gets A's share
 			{VendorUserID: vendorC, ShareBps: 2000},
 		}
-		assert.NotEqual(t, ref, domain.CanonicalMultipartyDigest(tenderID, 1, swapped),
+		assert.NotEqual(t, ref, domain.CanonicalMultipartyDigest(tenderID, 1, currency, swapped),
 			"swapping shares between vendors must change the digest even though the total is the same")
 	})
 }

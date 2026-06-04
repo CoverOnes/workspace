@@ -168,6 +168,7 @@ func (h *MultipartyHandler) Sign(c *gin.Context) {
 
 // GetDetail handles GET /v1/multiparty-contracts/:id.
 // Returns contract + roster + per-version signature progress.
+// Access is scoped to ACTIVE parties of the contract (non-party → 404).
 func (h *MultipartyHandler) GetDetail(c *gin.Context) {
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -175,7 +176,15 @@ func (h *MultipartyHandler) GetDetail(c *gin.Context) {
 		return
 	}
 
-	detail, err := h.svc.GetDetail(c.Request.Context(), id)
+	rawUID := c.GetHeader("X-User-Id")
+
+	callerUserID, parseErr := uuid.Parse(rawUID)
+	if parseErr != nil {
+		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+		return
+	}
+
+	detail, err := h.svc.GetDetail(c.Request.Context(), id, callerUserID)
 	if err != nil {
 		httpx.Err(c, err)
 		return

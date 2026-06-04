@@ -59,8 +59,13 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	ipRL := middleware.NewIPRateLimiter(cfg.Redis, 120, time.Minute)
 	r.Use(ipRL.Handler())
 
-	// Internal service-to-service routes — protected by shared service token.
-	// MUST NOT be exposed by the API gateway (only reachable from within the cluster).
+	// Internal service-to-service routes — protected by a shared pre-shared service token
+	// via RequireServiceToken (constant-time compare; fails-fast on empty token in non-dev).
+	// §24.1 gateway-signature is for gateway→downstream USER requests only and does NOT
+	// apply to this S2S path. The security controls here are:
+	//   1. RequireServiceToken: HMAC-safe constant-time comparison of X-Service-Token.
+	//   2. Network isolation: the /internal/* prefix MUST NOT be routed by the API gateway
+	//      — only reachable from within the cluster (sidecar / VPC internal traffic).
 	internalContractH := NewInternalContractHandler(cfg.ContractSvc)
 	internal := r.Group("/internal/v1")
 	internal.Use(middleware.RequireServiceToken(cfg.ContractServiceToken))
