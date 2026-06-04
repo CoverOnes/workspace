@@ -129,6 +129,7 @@ func buildM2Router(contractStore *postgres.ContractStore) *gin.Engine {
 	api.GET("/contracts", middleware.RequireTier(1), contractH.List)
 	api.GET("/contracts/:id", middleware.RequireTier(1), contractH.GetByID)
 	api.PATCH("/contracts/:id", middleware.RequireTier(2), contractH.Patch)
+	api.POST("/contracts/:id/submit-for-signature", middleware.RequireTier(2), contractH.Submit)
 	api.POST("/contracts/:id/submit", middleware.RequireTier(2), contractH.Submit)
 	api.POST("/contracts/:id/sign", middleware.RequireTier(2), signatureH.Sign)
 	api.GET("/contracts/:id/signatures", middleware.RequireTier(1), signatureH.ListSignatures)
@@ -439,6 +440,153 @@ func TestM2_DualSignReachesActive(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, domain.ContractStatusActive, stored.Status, "stored contract must be ACTIVE")
 	require.NotNil(t, stored.ActivatedAt, "activated_at must be set on activation")
+}
+
+// TestInc2_FullLifecycleViaSubmitForSignature drives the complete contract
+// lifecycle the demo needs against a real Postgres backend, using the canonical
+// web-app route POST /v1/contracts/:id/submit-for-signature:
+//
+//	S2S create (DRAFT)
+//	  -> client submit-for-signature (DRAFT -> PENDING_SIGNATURE)
+//	  -> client signs            (stays PENDING_SIGNATURE; one role)
+//	  -> freelancer signs        (DISTINCT signer_role count == 2 -> SIGNED -> ACTIVE)
+//
+// It also asserts the IDOR guards: a non-party (neither client nor freelancer)
+// receives 404 on BOTH submit-for-signature and sign — never a 403 that would
+// leak resource existence.
+func TestInc2_FullLifecycleViaSubmitForSignature(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	clientID := uuid.New()
+	freelancerID := uuid.New()
+	strangerID := uuid.New() // neither client nor freelancer
+
+	cs := startM2TestDB(t)
+	r := buildM2Router(cs)
+
+	// 1. S2S create -> DRAFT.
+	contractID, contentHash := s2sCreateContract(t, r, clientID, freelancerID, "8800.00")
+
+	stored, err := cs.GetByID(ctx, contractID)
+	require.NoError(t, err)
+	require.Equal(t, domain.ContractStatusDraft, stored.Status, "freshly created contract must be DRAFT")
+
+	submitPath := "/v1/contracts/" + contractID.String() + "/submit-for-signature"
+	signPath := "/v1/contracts/" + contractID.String() + "/sign"
+	signBody := fmt.Sprintf(`{"signedContentHash":%q}`, contentHash)
+
+	// 2a. Non-party cannot submit-for-signature: must get 404 (IDOR-safe), and the
+	//     contract must remain DRAFT.
+	strangerSubmitW := doParty(t, r, strangerID, submitPath, "")
+	require.Equal(t, http.StatusNotFound, strangerSubmitW.Code,
+		"non-party submit-for-signature must return 404; body: %s", strangerSubmitW.Body.String())
+
+	stillDraft, err := cs.GetByID(ctx, contractID)
+	require.NoError(t, err)
+	require.Equal(t, domain.ContractStatusDraft, stillDraft.Status,
+		"a rejected non-party submit must not change contract status")
+
+	// 2b. The freelancer is a party but NOT the client; submit is client-only, so
+	//     even a legitimate party that is not the client gets 404.
+	freelancerSubmitW := doParty(t, r, freelancerID, submitPath, "")
+	require.Equal(t, http.StatusNotFound, freelancerSubmitW.Code,
+		"freelancer (non-client party) submit-for-signature must return 404; body: %s", freelancerSubmitW.Body.String())
+
+	// 2c. Signing is not allowed while DRAFT (must be PENDING_SIGNATURE first).
+	earlySignW := doParty(t, r, clientID, signPath, signBody)
+	require.Equal(t, http.StatusConflict, earlySignW.Code,
+		"signing a DRAFT contract must be rejected (INVALID_STATE_TRANSITION); body: %s", earlySignW.Body.String())
+
+	// 3. Client submits -> PENDING_SIGNATURE.
+	submitW := doParty(t, r, clientID, submitPath, "")
+	require.Equal(t, http.StatusOK, submitW.Code,
+		"client submit-for-signature must succeed; body: %s", submitW.Body.String())
+
+	var afterSubmit map[string]any
+	require.NoError(t, json.Unmarshal(submitW.Body.Bytes(), &afterSubmit))
+	submitData, _ := afterSubmit["data"].(map[string]any)
+	require.Equal(t, string(domain.ContractStatusPendingSignature), fmt.Sprintf("%v", submitData["status"]),
+		"after submit-for-signature the contract must be PENDING_SIGNATURE")
+
+	// 3b. A non-party still cannot sign once PENDING_SIGNATURE: must get 404.
+	strangerSignW := doParty(t, r, strangerID, signPath, signBody)
+	require.Equal(t, http.StatusNotFound, strangerSignW.Code,
+		"non-party sign must return 404; body: %s", strangerSignW.Body.String())
+
+	// 4. Client signs first -> still PENDING_SIGNATURE (only one DISTINCT role).
+	clientSignW := doParty(t, r, clientID, signPath, signBody)
+	require.Equal(t, http.StatusOK, clientSignW.Code,
+		"client sign must succeed; body: %s", clientSignW.Body.String())
+
+	var afterClient map[string]any
+	require.NoError(t, json.Unmarshal(clientSignW.Body.Bytes(), &afterClient))
+	clientData, _ := afterClient["data"].(map[string]any)
+	require.Equal(t, string(domain.ContractStatusPendingSignature), fmt.Sprintf("%v", clientData["status"]),
+		"after one signature the contract must still be PENDING_SIGNATURE")
+
+	// 5. Freelancer signs second -> DISTINCT signer_role count == 2 -> SIGNED -> ACTIVE.
+	freelancerSignW := doParty(t, r, freelancerID, signPath, signBody)
+	require.Equal(t, http.StatusOK, freelancerSignW.Code,
+		"freelancer sign must succeed; body: %s", freelancerSignW.Body.String())
+
+	var afterFreelancer map[string]any
+	require.NoError(t, json.Unmarshal(freelancerSignW.Body.Bytes(), &afterFreelancer))
+	freelancerData, _ := afterFreelancer["data"].(map[string]any)
+	require.Equal(t, string(domain.ContractStatusActive), fmt.Sprintf("%v", freelancerData["status"]),
+		"after both DISTINCT roles sign the contract must be ACTIVE")
+
+	// 6. Authoritative DB confirmation: ACTIVE with activated_at set.
+	final, err := cs.GetByID(ctx, contractID)
+	require.NoError(t, err)
+	assert.Equal(t, domain.ContractStatusActive, final.Status, "stored contract must be ACTIVE")
+	require.NotNil(t, final.ActivatedAt, "activated_at must be set on activation")
+}
+
+// TestInc2_SubmitAndSignAliasRoutesAgree proves the canonical
+// /submit-for-signature route and the legacy /submit alias drive the identical
+// DRAFT -> PENDING_SIGNATURE transition, so the web-app may use either.
+func TestInc2_SubmitAndSignAliasRoutesAgree(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	tests := []struct {
+		name string
+		path func(id string) string
+	}{
+		{
+			name: "canonical submit-for-signature route",
+			path: func(id string) string { return "/v1/contracts/" + id + "/submit-for-signature" },
+		},
+		{
+			name: "legacy submit alias route",
+			path: func(id string) string { return "/v1/contracts/" + id + "/submit" },
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			clientID := uuid.New()
+			freelancerID := uuid.New()
+
+			cs := startM2TestDB(t)
+			r := buildM2Router(cs)
+
+			contractID, _ := s2sCreateContract(t, r, clientID, freelancerID, "1234.00")
+
+			w := doParty(t, r, clientID, tc.path(contractID.String()), "")
+			require.Equal(t, http.StatusOK, w.Code, "submit via %s must succeed; body: %s", tc.name, w.Body.String())
+
+			got, err := cs.GetByID(context.Background(), contractID)
+			require.NoError(t, err)
+			assert.Equal(t, domain.ContractStatusPendingSignature, got.Status,
+				"both routes must transition DRAFT -> PENDING_SIGNATURE")
+		})
+	}
 }
 
 // TestM2_ContentHashBindsParties proves the content_hash is cryptographically bound

@@ -152,7 +152,10 @@ func (h *ContractHandler) Patch(c *gin.Context) {
 	httpx.OK(c, contract)
 }
 
-// Submit handles POST /v1/contracts/:id/submit.
+// Submit handles POST /v1/contracts/:id/submit-for-signature (canonical) and its
+// backward-compatible alias POST /v1/contracts/:id/submit. It transitions the
+// contract DRAFT -> PENDING_SIGNATURE. Only the contract's client may submit;
+// non-parties receive 404 (IDOR-safe, same pattern as sign).
 func (h *ContractHandler) Submit(c *gin.Context) {
 	identity, ok := middleware.IdentityFromCtx(c)
 	if !ok {

@@ -140,6 +140,7 @@ func buildContractRouter(cs *stubContractStoreH) *gin.Engine {
 	api.GET("/contracts", middleware.RequireTier(1), h.List)
 	api.GET("/contracts/:id", middleware.RequireTier(1), h.GetByID)
 	api.PATCH("/contracts/:id", middleware.RequireTier(2), h.Patch)
+	api.POST("/contracts/:id/submit-for-signature", middleware.RequireTier(2), h.Submit)
 	api.POST("/contracts/:id/submit", middleware.RequireTier(2), h.Submit)
 	api.POST("/contracts/:id/complete", middleware.RequireTier(2), h.Complete)
 	api.POST("/contracts/:id/cancel", middleware.RequireTier(2), h.Cancel)
