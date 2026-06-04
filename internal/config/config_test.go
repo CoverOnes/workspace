@@ -12,6 +12,9 @@ import (
 // validServiceToken is a 32-character token satisfying the minimum-entropy requirement.
 const validServiceToken = "00000000-0000-0000-0000-000000000000"
 
+// testHMACSecret is a 32-char placeholder HMAC secret used in tests only — not a real secret.
+const testHMACSecret = "0123456789abcdef0123456789abcdef"
+
 func setValidEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("WORKSPACE_POSTGRES_DSN", "postgres://u:p@localhost:5432/db")
@@ -63,7 +66,8 @@ func TestLoad_InvalidLogLevel(t *testing.T) {
 
 func TestLoad_InvalidEnv(t *testing.T) {
 	setValidEnv(t)
-	t.Setenv("WORKSPACE_ENV", "staging")
+	// "prod" is not a valid env value (must be one of development|staging|production|test).
+	t.Setenv("WORKSPACE_ENV", "prod")
 
 	_, err := config.Load()
 	require.Error(t, err, "Load() must fail for unknown env value")
@@ -77,6 +81,7 @@ func TestLoad_Success_ParsedValues(t *testing.T) {
 	t.Setenv("WORKSPACE_ENV", "production")
 	t.Setenv("WORKSPACE_REDIS_URL", "redis://localhost:6379")
 	t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
+	t.Setenv("WORKSPACE_GATEWAY_HMAC_SECRET", testHMACSecret)
 
 	cfg, err := config.Load()
 	require.NoError(t, err)
@@ -90,6 +95,8 @@ func TestLoad_Success_ParsedValues(t *testing.T) {
 func TestLoad_Defaults_Applied(t *testing.T) {
 	t.Setenv("WORKSPACE_POSTGRES_DSN", "postgres://u:p@localhost:5432/db")
 	t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
+	// Default env = production requires a gateway HMAC secret.
+	t.Setenv("WORKSPACE_GATEWAY_HMAC_SECRET", testHMACSecret)
 	// Clear optional fields so defaults apply.
 	t.Setenv("WORKSPACE_PORT", "")
 	t.Setenv("WORKSPACE_LOG_LEVEL", "")
@@ -112,6 +119,8 @@ func TestLoad_DefaultEnv_IsFailSafeProduction(t *testing.T) {
 	t.Run("unset env defaults to production, not dev", func(t *testing.T) {
 		t.Setenv("WORKSPACE_POSTGRES_DSN", "postgres://u:p@localhost:5432/db")
 		t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
+		// Default env = production requires a gateway HMAC secret.
+		t.Setenv("WORKSPACE_GATEWAY_HMAC_SECRET", testHMACSecret)
 		t.Setenv("WORKSPACE_PORT", "")
 		t.Setenv("WORKSPACE_LOG_LEVEL", "")
 		t.Setenv("WORKSPACE_ENV", "")
@@ -153,6 +162,8 @@ func TestIsDev(t *testing.T) {
 			t.Setenv("WORKSPACE_LOG_LEVEL", "INFO")
 			t.Setenv("WORKSPACE_ENV", tc.env)
 			t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
+			// Non-dev envs require a gateway HMAC secret (§24.1 fail-closed).
+			t.Setenv("WORKSPACE_GATEWAY_HMAC_SECRET", testHMACSecret)
 
 			cfg, err := config.Load()
 			require.NoError(t, err)
@@ -222,6 +233,9 @@ func TestLoad_ContractServiceToken(t *testing.T) {
 			setValidEnv(t)
 			t.Setenv("WORKSPACE_ENV", tc.env)
 			t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", tc.token)
+			// Non-dev envs require a gateway HMAC secret (§24.1 fail-closed).
+			// Set it unconditionally so only the service token is the variable under test.
+			t.Setenv("WORKSPACE_GATEWAY_HMAC_SECRET", testHMACSecret)
 
 			_, err := config.Load()
 			if tc.wantErr {
@@ -294,6 +308,90 @@ func TestLoad_PostgresSchema(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 				assert.Equal(t, tc.schema, cfg.PostgresSchema)
+			}
+		})
+	}
+}
+
+func TestLoad_GatewayHMAC(t *testing.T) {
+	tests := []struct {
+		name      string
+		env       string
+		secret    string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			// §24.1: dev may omit the secret (verification disabled, gateway also skips in dev).
+			name:    "dev with empty secret is allowed",
+			env:     "development",
+			secret:  "",
+			wantErr: false,
+		},
+		{
+			// §24.1: non-dev MUST have a ≥32-char secret.
+			name:      "production without gateway secret fails (fail-closed)",
+			env:       "production",
+			secret:    "",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_GATEWAY_HMAC_SECRET must be at least 32 characters in non-dev",
+		},
+		{
+			name:      "staging without gateway secret fails (fail-closed)",
+			env:       "staging",
+			secret:    "",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_GATEWAY_HMAC_SECRET must be at least 32 characters in non-dev",
+		},
+		{
+			// Even in dev a too-short secret is an error (catches typos).
+			name:      "dev with too-short secret is rejected",
+			env:       "development",
+			secret:    "tooshort",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_GATEWAY_HMAC_SECRET, when set, must be at least 32 characters",
+		},
+		{
+			name:      "production with too-short secret is rejected",
+			env:       "production",
+			secret:    "tooshort",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_GATEWAY_HMAC_SECRET must be at least 32 characters in non-dev",
+		},
+		{
+			name:    "production with valid 32-char secret passes",
+			env:     "production",
+			secret:  testHMACSecret,
+			wantErr: false,
+		},
+		{
+			name:    "staging with valid 32-char secret passes",
+			env:     "staging",
+			secret:  testHMACSecret,
+			wantErr: false,
+		},
+		{
+			name:    "dev with valid 32-char secret passes",
+			env:     "development",
+			secret:  testHMACSecret,
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setValidEnv(t)
+			t.Setenv("WORKSPACE_ENV", tc.env)
+			t.Setenv("WORKSPACE_GATEWAY_HMAC_SECRET", tc.secret)
+			// Non-dev envs need the contract service token satisfied as well.
+			t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err)
 			}
 		})
 	}

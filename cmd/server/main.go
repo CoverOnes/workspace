@@ -150,7 +150,7 @@ func run() error {
 	worklogSvc := service.NewWorklogService(contractStore, worklogStore)
 
 	// Router.
-	r := handler.NewRouter(handler.RouterConfig{
+	r := handler.NewRouter(&handler.RouterConfig{
 		ContractSvc:          contractSvc,
 		SignatureSvc:         signatureSvc,
 		TaskSvc:              taskSvc,
@@ -158,6 +158,7 @@ func run() error {
 		Pool:                 pool,
 		Redis:                redisClient,
 		ContractServiceToken: cfg.ContractServiceToken,
+		GatewayHMACSecret:    cfg.GatewayHMACSecret,
 	})
 
 	srv := &http.Server{
