@@ -12,6 +12,7 @@ import (
 const (
 	channelContractActivated           = "workspace.contract_activated"
 	channelMultipartyContractActivated = "workspace.contract_activated"
+	channelContractCompleted           = "workspace.contract_completed"
 )
 
 // RedisPublisher publishes events to Redis pub/sub channels.
@@ -51,6 +52,23 @@ func (p *RedisPublisher) PublishMultipartyContractActivated(ctx context.Context,
 
 	if err := p.rdb.Publish(ctx, channelMultipartyContractActivated, payload).Err(); err != nil {
 		return fmt.Errorf("redis publish %s: %w", channelMultipartyContractActivated, err)
+	}
+
+	return nil
+}
+
+// PublishMultipartyContractCompleted serializes the event and publishes it to Redis
+// on the §14 workspace.contract_completed channel.
+// Transport failures are returned to the caller (caller should log and continue —
+// the milestone row is the durable source of truth; publish is best-effort).
+func (p *RedisPublisher) PublishMultipartyContractCompleted(ctx context.Context, evt *domain.MultipartyContractCompletedEvent) error {
+	payload, err := json.Marshal(evt)
+	if err != nil {
+		return fmt.Errorf("marshal contract_completed event: %w", err)
+	}
+
+	if err := p.rdb.Publish(ctx, channelContractCompleted, payload).Err(); err != nil {
+		return fmt.Errorf("redis publish %s: %w", channelContractCompleted, err)
 	}
 
 	return nil

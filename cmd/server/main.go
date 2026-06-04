@@ -148,6 +148,7 @@ func run() error {
 	multipartyPartyStore := postgres.NewMultipartyPartyStore(pool)
 	multipartySignatureStore := postgres.NewMultipartySignatureStore(pool)
 	multipartyTxManager := postgres.NewMultipartyTxManager(pool)
+	milestoneStore := postgres.NewMilestoneStore(pool)
 
 	// Service layer.
 	contractSvc := service.NewContractService(contractStore, signatureStore, txManager, publisher)
@@ -161,6 +162,7 @@ func run() error {
 		multipartyTxManager,
 		publisher,
 	)
+	milestoneSvc := service.NewMilestoneService(multipartyContractStore, milestoneStore, publisher)
 
 	// Router.
 	r := handler.NewRouter(&handler.RouterConfig{
@@ -169,6 +171,8 @@ func run() error {
 		TaskSvc:               taskSvc,
 		WorklogSvc:            worklogSvc,
 		MultipartyContractSvc: multipartyContractSvc,
+		MilestoneSvc:          milestoneSvc,
+		MultipartyPartyStore:  multipartyPartyStore,
 		Pool:                  pool,
 		Redis:                 redisClient,
 		ContractServiceToken:  cfg.ContractServiceToken,

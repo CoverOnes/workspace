@@ -29,6 +29,10 @@ type CreateOrAddPartyRequest struct {
 	RoleID       *string `json:"roleId,omitempty"`
 	ShareBps     int     `json:"shareBps"`
 	Currency     *string `json:"currency,omitempty"`
+	// PosterUserID is the tender owner; stored on first contract creation so that
+	// milestone management can be gated to the poster only. Optional for backward
+	// compatibility with existing marketplace callers.
+	PosterUserID *string `json:"posterUserId,omitempty"`
 }
 
 // CreateOrAddParty handles POST /internal/v1/multiparty-contracts.
@@ -68,12 +72,25 @@ func (h *MultipartyHandler) CreateOrAddParty(c *gin.Context) {
 		roleID = &parsed
 	}
 
+	var posterUserID *uuid.UUID
+
+	if req.PosterUserID != nil {
+		parsed, parseErr := uuid.Parse(*req.PosterUserID)
+		if parseErr != nil {
+			httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid posterUserId")
+			return
+		}
+
+		posterUserID = &parsed
+	}
+
 	in := &service.CreateOrAddPartyInput{
 		TenderID:     tenderID,
 		VendorUserID: vendorUserID,
 		RoleID:       roleID,
 		ShareBps:     req.ShareBps,
 		Currency:     req.Currency,
+		PosterUserID: posterUserID,
 	}
 
 	contract, party, err := h.svc.CreateOrAddParty(c.Request.Context(), in)

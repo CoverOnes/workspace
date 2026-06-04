@@ -24,4 +24,9 @@ var (
 	ErrMultipartyContractNotFound = errors.New("multi-party contract not found")
 	ErrShareSumNotFull            = errors.New("sum of active party share_bps must equal 10000")
 	ErrStaleVersion               = errors.New("signature version does not match current contract version")
+
+	// Milestone sentinel errors.
+	ErrMilestoneNotFound    = errors.New("milestone not found")
+	ErrMilestoneAlreadyDone = errors.New("milestone is already completed")
+	ErrNotContractOwner     = errors.New("caller is not the owner of this contract")
 )

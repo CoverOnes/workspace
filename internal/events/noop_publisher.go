@@ -23,3 +23,8 @@ func (p *NoopPublisher) PublishContractActivated(_ context.Context, _ *domain.Co
 func (p *NoopPublisher) PublishMultipartyContractActivated(_ context.Context, _ *domain.MultipartyContractActivatedEvent) error {
 	return nil
 }
+
+// PublishMultipartyContractCompleted is a no-op.
+func (p *NoopPublisher) PublishMultipartyContractCompleted(_ context.Context, _ *domain.MultipartyContractCompletedEvent) error {
+	return nil
+}

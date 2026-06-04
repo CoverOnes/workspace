@@ -7,6 +7,7 @@ import (
 	"github.com/CoverOnes/workspace/internal/platform/health"
 	"github.com/CoverOnes/workspace/internal/platform/middleware"
 	"github.com/CoverOnes/workspace/internal/service"
+	"github.com/CoverOnes/workspace/internal/store"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -19,8 +20,12 @@ type RouterConfig struct {
 	TaskSvc               *service.TaskService
 	WorklogSvc            *service.WorklogService
 	MultipartyContractSvc *service.MultipartyContractService
-	Pool                  *pgxpool.Pool
-	Redis                 *redis.Client // may be nil in dev
+	MilestoneSvc          *service.MilestoneService
+	// MultipartyPartyStore is needed by the S2S roster endpoint (InternalPartiesHandler).
+	// It is injected directly because the roster read does not require service-layer logic.
+	MultipartyPartyStore store.MultipartyPartyStore
+	Pool                 *pgxpool.Pool
+	Redis                *redis.Client // may be nil in dev
 	// ContractServiceToken is the pre-shared secret that the marketplace service
 	// must supply in X-Service-Token to reach the internal contract-create endpoint.
 	ContractServiceToken string
@@ -72,17 +77,36 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	internal.POST("/contracts", internalContractH.Create)
 
 	// Multi-party S2S: create-or-add-party (marketplace calls this when a collaborator is APPROVED).
+	// S2S roster: GET /internal/v1/contracts/:id/parties — payment calls this at settlement-plan creation.
 	if cfg.MultipartyContractSvc != nil {
 		multipartyH := NewMultipartyHandler(cfg.MultipartyContractSvc)
 		internal.POST("/multiparty-contracts", multipartyH.CreateOrAddParty)
+	}
 
-		// Multi-party public API routes — authenticated users.
+	// S2S roster endpoint — always registered when MultipartyPartyStore is available.
+	// Returns the frozen ACTIVE-party [{vendorUserId, shareBps}] for payment.
+	if cfg.MultipartyPartyStore != nil {
+		internalPartiesH := NewInternalPartiesHandler(cfg.MultipartyPartyStore)
+		internal.GET("/contracts/:id/parties", internalPartiesH.GetParties)
+	}
+
+	// Multi-party public API routes — authenticated users.
+	if cfg.MultipartyContractSvc != nil {
+		multipartyH := NewMultipartyHandler(cfg.MultipartyContractSvc)
 		mpAPI := r.Group("/v1/multiparty-contracts")
 		mpAPI.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret))
 		mpAPI.Use(middleware.RequireValidIdentity())
 		mpAPI.GET("/:id", middleware.RequireTier(1), multipartyH.GetDetail)
 		mpAPI.POST("/:id/submit-for-signature", middleware.RequireTier(2), multipartyH.SubmitForSignatures)
 		mpAPI.POST("/:id/sign", middleware.RequireTier(2), multipartyH.Sign)
+
+		// Milestone endpoints — owner-only (Tier>=2, poster IDOR guard in service layer).
+		if cfg.MilestoneSvc != nil {
+			milestoneH := NewMilestoneHandler(cfg.MilestoneSvc)
+			mpAPI.POST("/:id/milestones", middleware.RequireTier(2), milestoneH.AddMilestone)
+			mpAPI.GET("/:id/milestones", middleware.RequireTier(1), milestoneH.ListMilestones)
+			mpAPI.POST("/:id/milestones/:mid/complete", middleware.RequireTier(2), milestoneH.CompleteMilestone)
+		}
 	}
 
 	// All API routes require a valid identity (gateway-injected X-User-Id).

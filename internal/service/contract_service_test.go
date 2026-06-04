@@ -125,6 +125,10 @@ func (p *fakePublisher) PublishMultipartyContractActivated(_ context.Context, _ 
 	return nil
 }
 
+func (p *fakePublisher) PublishMultipartyContractCompleted(_ context.Context, _ *domain.MultipartyContractCompletedEvent) error {
+	return nil
+}
+
 // --- helpers ---
 
 func makeContract(clientID, freelancerID uuid.UUID, status domain.ContractStatus) *domain.Contract {

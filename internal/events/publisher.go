@@ -20,4 +20,9 @@ type Publisher interface {
 	// for the multi-party N-vendor contract aggregate (§14 dotted-lowercase channel).
 	// Best-effort: same semantics as PublishContractActivated.
 	PublishMultipartyContractActivated(ctx context.Context, evt *domain.MultipartyContractActivatedEvent) error
+
+	// PublishMultipartyContractCompleted sends the workspace.contract_completed event
+	// when a multiparty contract milestone is marked COMPLETED.
+	// Best-effort: callers MUST NOT roll back the milestone completion on publish failure.
+	PublishMultipartyContractCompleted(ctx context.Context, evt *domain.MultipartyContractCompletedEvent) error
 }
