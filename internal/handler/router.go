@@ -78,6 +78,10 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	api.GET("/contracts", middleware.RequireTier(1), contractH.List)
 	api.GET("/contracts/:id", middleware.RequireTier(1), contractH.GetByID)
 	api.PATCH("/contracts/:id", middleware.RequireTier(2), contractH.Patch)
+	// DRAFT -> PENDING_SIGNATURE (client-only). submit-for-signature is the
+	// canonical route the web-app calls for the "送出簽署 / Submit for signature"
+	// action; /submit is kept as a backward-compatible alias to the same handler.
+	api.POST("/contracts/:id/submit-for-signature", middleware.RequireTier(2), contractH.Submit)
 	api.POST("/contracts/:id/submit", middleware.RequireTier(2), contractH.Submit)
 	api.POST("/contracts/:id/sign", middleware.RequireTier(2), signatureH.Sign)
 	api.GET("/contracts/:id/signatures", middleware.RequireTier(1), signatureH.ListSignatures)
