@@ -18,3 +18,8 @@ func NewNoopPublisher() *NoopPublisher {
 func (p *NoopPublisher) PublishContractActivated(_ context.Context, _ *domain.ContractActivatedEvent) error {
 	return nil
 }
+
+// PublishMultipartyContractActivated is a no-op.
+func (p *NoopPublisher) PublishMultipartyContractActivated(_ context.Context, _ *domain.MultipartyContractActivatedEvent) error {
+	return nil
+}

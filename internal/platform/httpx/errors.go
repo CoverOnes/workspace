@@ -52,6 +52,7 @@ func ErrCode(c *gin.Context, status int, code, message string, details ...any) {
 func translate(err error) (code string, status int, message string, details any) {
 	switch {
 	case errors.Is(err, domain.ErrContractNotFound),
+		errors.Is(err, domain.ErrMultipartyContractNotFound),
 		errors.Is(err, domain.ErrNotFound),
 		errors.Is(err, domain.ErrNotParty):
 		// Non-party access returns 404, not 403, to prevent resource-existence enumeration.
@@ -74,6 +75,12 @@ func translate(err error) (code string, status int, message string, details any)
 
 	case errors.Is(err, domain.ErrAlreadySigned):
 		return "ALREADY_SIGNED", http.StatusConflict, "party has already signed this contract version", nil
+
+	case errors.Is(err, domain.ErrShareSumNotFull):
+		return "SHARE_SUM_INVALID", http.StatusUnprocessableEntity, "sum of active party share_bps must equal 10000", nil
+
+	case errors.Is(err, domain.ErrStaleVersion):
+		return "STALE_VERSION", http.StatusConflict, "signature version does not match current contract version", nil
 
 	case errors.Is(err, domain.ErrConflict):
 		return "CONFLICT", http.StatusConflict, "conflict detected", nil

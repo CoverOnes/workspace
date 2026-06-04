@@ -14,12 +14,13 @@ import (
 
 // RouterConfig holds all handler-level dependencies.
 type RouterConfig struct {
-	ContractSvc  *service.ContractService
-	SignatureSvc *service.SignatureService
-	TaskSvc      *service.TaskService
-	WorklogSvc   *service.WorklogService
-	Pool         *pgxpool.Pool
-	Redis        *redis.Client // may be nil in dev
+	ContractSvc           *service.ContractService
+	SignatureSvc          *service.SignatureService
+	TaskSvc               *service.TaskService
+	WorklogSvc            *service.WorklogService
+	MultipartyContractSvc *service.MultipartyContractService
+	Pool                  *pgxpool.Pool
+	Redis                 *redis.Client // may be nil in dev
 	// ContractServiceToken is the pre-shared secret that the marketplace service
 	// must supply in X-Service-Token to reach the internal contract-create endpoint.
 	ContractServiceToken string
@@ -64,6 +65,20 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	internal := r.Group("/internal/v1")
 	internal.Use(middleware.RequireServiceToken(cfg.ContractServiceToken))
 	internal.POST("/contracts", internalContractH.Create)
+
+	// Multi-party S2S: create-or-add-party (marketplace calls this when a collaborator is APPROVED).
+	if cfg.MultipartyContractSvc != nil {
+		multipartyH := NewMultipartyHandler(cfg.MultipartyContractSvc)
+		internal.POST("/multiparty-contracts", multipartyH.CreateOrAddParty)
+
+		// Multi-party public API routes — authenticated users.
+		mpAPI := r.Group("/v1/multiparty-contracts")
+		mpAPI.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret))
+		mpAPI.Use(middleware.RequireValidIdentity())
+		mpAPI.GET("/:id", middleware.RequireTier(1), multipartyH.GetDetail)
+		mpAPI.POST("/:id/submit-for-signature", middleware.RequireTier(2), multipartyH.SubmitForSignatures)
+		mpAPI.POST("/:id/sign", middleware.RequireTier(2), multipartyH.Sign)
+	}
 
 	// All API routes require a valid identity (gateway-injected X-User-Id).
 	contractH := NewContractHandler(cfg.ContractSvc)

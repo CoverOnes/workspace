@@ -143,22 +143,36 @@ func run() error {
 	worklogStore := postgres.NewWorklogStore(pool)
 	txManager := postgres.NewTxManager(pool)
 
+	// Multiparty store layer.
+	multipartyContractStore := postgres.NewMultipartyContractStore(pool)
+	multipartyPartyStore := postgres.NewMultipartyPartyStore(pool)
+	multipartySignatureStore := postgres.NewMultipartySignatureStore(pool)
+	multipartyTxManager := postgres.NewMultipartyTxManager(pool)
+
 	// Service layer.
 	contractSvc := service.NewContractService(contractStore, signatureStore, txManager, publisher)
 	signatureSvc := service.NewSignatureService(contractStore, signatureStore)
 	taskSvc := service.NewTaskService(contractStore, taskStore)
 	worklogSvc := service.NewWorklogService(contractStore, worklogStore)
+	multipartyContractSvc := service.NewMultipartyContractService(
+		multipartyContractStore,
+		multipartyPartyStore,
+		multipartySignatureStore,
+		multipartyTxManager,
+		publisher,
+	)
 
 	// Router.
 	r := handler.NewRouter(&handler.RouterConfig{
-		ContractSvc:          contractSvc,
-		SignatureSvc:         signatureSvc,
-		TaskSvc:              taskSvc,
-		WorklogSvc:           worklogSvc,
-		Pool:                 pool,
-		Redis:                redisClient,
-		ContractServiceToken: cfg.ContractServiceToken,
-		GatewayHMACSecret:    cfg.GatewayHMACSecret,
+		ContractSvc:           contractSvc,
+		SignatureSvc:          signatureSvc,
+		TaskSvc:               taskSvc,
+		WorklogSvc:            worklogSvc,
+		MultipartyContractSvc: multipartyContractSvc,
+		Pool:                  pool,
+		Redis:                 redisClient,
+		ContractServiceToken:  cfg.ContractServiceToken,
+		GatewayHMACSecret:     cfg.GatewayHMACSecret,
 	})
 
 	srv := &http.Server{
