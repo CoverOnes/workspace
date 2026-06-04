@@ -43,7 +43,10 @@ type Config struct {
 	// Log level: DEBUG, INFO, WARN, ERROR
 	LogLevel string `mapstructure:"log_level"`
 
-	// Environment: development | production
+	// Environment: development | production | test
+	// Defaults to "production" (fail-safe): an unset WORKSPACE_ENV is treated as
+	// prod so the S2S service token is REQUIRED. Dev machines MUST set
+	// WORKSPACE_ENV=development explicitly.
 	Env string `mapstructure:"env"`
 
 	// AutoMigrate, when true, runs embedded *.up.sql migrations at boot.
@@ -86,7 +89,15 @@ func Load() (*Config, error) {
 
 	v.SetDefault("port", 8082)
 	v.SetDefault("log_level", "INFO")
-	v.SetDefault("env", "development")
+	// Fail-safe default: an unset WORKSPACE_ENV is treated as production, which
+	// makes validateServiceToken() REQUIRE a real WORKSPACE_CONTRACT_SERVICE_TOKEN.
+	// If this defaulted to "development", a prod deploy that forgot to set
+	// WORKSPACE_ENV would silently boot IsDev()=true, allow an EMPTY service token,
+	// and then RequireServiceToken("") would reject every supplied header — making
+	// /internal/v1/contracts unreachable while the operator falsely believes a
+	// token gate is active. Dev machines / dev-stack set WORKSPACE_ENV=development
+	// explicitly.
+	v.SetDefault("env", "production")
 	v.SetDefault("db_max_conns", 10)
 	v.SetDefault("db_min_conns", 2)
 

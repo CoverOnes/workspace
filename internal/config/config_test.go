@@ -95,12 +95,44 @@ func TestLoad_Defaults_Applied(t *testing.T) {
 	t.Setenv("WORKSPACE_LOG_LEVEL", "")
 	t.Setenv("WORKSPACE_ENV", "")
 
-	// Default port 8082, log_level INFO, env development should be applied.
+	// Default port 8082, log_level INFO, env production (fail-safe) should be applied.
 	cfg, err := config.Load()
 	require.NoError(t, err)
 	assert.Equal(t, 8082, cfg.Port)
 	assert.Equal(t, strings.ToUpper("INFO"), strings.ToUpper(cfg.LogLevel))
-	assert.Equal(t, "development", cfg.Env)
+	assert.Equal(t, "production", cfg.Env)
+}
+
+// TestLoad_DefaultEnv_IsFailSafeProduction is load-bearing: it directly pins the
+// fail-safe default. An unset WORKSPACE_ENV MUST resolve to production (IsDev()==false)
+// so that an empty WORKSPACE_CONTRACT_SERVICE_TOKEN is REJECTED at boot. Reverting
+// the default in config.go back to "development" makes both sub-assertions fail,
+// which is exactly what we want this test to catch.
+func TestLoad_DefaultEnv_IsFailSafeProduction(t *testing.T) {
+	t.Run("unset env defaults to production, not dev", func(t *testing.T) {
+		t.Setenv("WORKSPACE_POSTGRES_DSN", "postgres://u:p@localhost:5432/db")
+		t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
+		t.Setenv("WORKSPACE_PORT", "")
+		t.Setenv("WORKSPACE_LOG_LEVEL", "")
+		t.Setenv("WORKSPACE_ENV", "")
+
+		cfg, err := config.Load()
+		require.NoError(t, err)
+		assert.Equal(t, "production", cfg.Env, "unset WORKSPACE_ENV must default to production")
+		assert.False(t, cfg.IsDev(), "unset WORKSPACE_ENV must NOT be treated as development")
+	})
+
+	t.Run("unset env + empty service token is rejected at boot", func(t *testing.T) {
+		t.Setenv("WORKSPACE_POSTGRES_DSN", "postgres://u:p@localhost:5432/db")
+		t.Setenv("WORKSPACE_PORT", "")
+		t.Setenv("WORKSPACE_LOG_LEVEL", "")
+		t.Setenv("WORKSPACE_ENV", "")
+		t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", "")
+
+		_, err := config.Load()
+		require.Error(t, err, "unset env (=production) with empty service token must fail validation")
+		assert.Contains(t, err.Error(), "WORKSPACE_CONTRACT_SERVICE_TOKEN is required in non-development")
+	})
 }
 
 func TestIsDev(t *testing.T) {
