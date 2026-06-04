@@ -58,3 +58,60 @@ type WorklogStore interface {
 type TxManager interface {
 	WithTx(ctx context.Context, fn func(ctx context.Context, contracts ContractStore, signatures SignatureStore) error) error
 }
+
+// MultipartyContractStore defines persistence operations for multi-party contracts.
+type MultipartyContractStore interface {
+	// Create inserts a new multi-party contract. Returns ErrConflict (23505) if a
+	// live contract for tender_id already exists (UNIQUE WHERE deleted_at IS NULL).
+	Create(ctx context.Context, c *domain.MultipartyContract) error
+	// GetByID fetches a contract by primary key (excludes soft-deleted rows).
+	GetByID(ctx context.Context, id uuid.UUID) (*domain.MultipartyContract, error)
+	// GetByTenderID fetches the single live contract for a tender, or ErrMultipartyContractNotFound.
+	GetByTenderID(ctx context.Context, tenderID uuid.UUID) (*domain.MultipartyContract, error)
+	// GetByIDForUpdate fetches with SELECT ... FOR UPDATE inside an active transaction.
+	GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*domain.MultipartyContract, error)
+	// Update persists contract status, content_hash, version, and updated_at.
+	Update(ctx context.Context, c *domain.MultipartyContract) error
+}
+
+// MultipartyPartyStore defines persistence operations for multi-party contract parties.
+type MultipartyPartyStore interface {
+	// AddParty inserts a new ACTIVE party row.
+	// Returns ErrConflict (23505) if the vendor already has an ACTIVE row for this contract.
+	AddParty(ctx context.Context, p *domain.MultipartyContractParty) error
+	// GetActivePartyByVendor returns the ACTIVE party row for (contractID, vendorUserID).
+	// Returns ErrNotParty if no ACTIVE row exists (the vendor is not a current member).
+	// Used by signTx to enforce party-membership authz before creating a signature.
+	GetActivePartyByVendor(ctx context.Context, contractID, vendorUserID uuid.UUID) (*domain.MultipartyContractParty, error)
+	// ListActiveByContract returns all ACTIVE parties for a contract.
+	ListActiveByContract(ctx context.Context, contractID uuid.UUID) ([]*domain.MultipartyContractParty, error)
+	// SumActiveBps returns the sum of share_bps for all ACTIVE parties of a contract.
+	SumActiveBps(ctx context.Context, contractID uuid.UUID) (int, error)
+	// CountActiveParties returns the count of ACTIVE parties for a contract.
+	CountActiveParties(ctx context.Context, contractID uuid.UUID) (int, error)
+}
+
+// MultipartySignatureStore defines persistence operations for multi-party contract signatures.
+type MultipartySignatureStore interface {
+	// Create inserts a new signature row.
+	// Returns ErrAlreadySigned (23505) if (contract_id, signer_user_id, version) already exists.
+	Create(ctx context.Context, sig *domain.MultipartyContractSignature) error
+	// CountSignaturesForVersion returns the number of distinct signatures for (contract, version).
+	CountSignaturesForVersion(ctx context.Context, contractID uuid.UUID, version int) (int, error)
+	// ListByContractVersion returns all signatures for a (contract, version).
+	ListByContractVersion(ctx context.Context, contractID uuid.UUID, version int) ([]*domain.MultipartyContractSignature, error)
+}
+
+// MultipartyTxManager runs a function inside a single Postgres transaction providing
+// transaction-scoped stores for the N-party quorum check (TOCTOU-safe).
+type MultipartyTxManager interface {
+	WithMultipartyTx(
+		ctx context.Context,
+		fn func(
+			ctx context.Context,
+			contracts MultipartyContractStore,
+			parties MultipartyPartyStore,
+			sigs MultipartySignatureStore,
+		) error,
+	) error
+}

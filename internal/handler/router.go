@@ -14,12 +14,13 @@ import (
 
 // RouterConfig holds all handler-level dependencies.
 type RouterConfig struct {
-	ContractSvc  *service.ContractService
-	SignatureSvc *service.SignatureService
-	TaskSvc      *service.TaskService
-	WorklogSvc   *service.WorklogService
-	Pool         *pgxpool.Pool
-	Redis        *redis.Client // may be nil in dev
+	ContractSvc           *service.ContractService
+	SignatureSvc          *service.SignatureService
+	TaskSvc               *service.TaskService
+	WorklogSvc            *service.WorklogService
+	MultipartyContractSvc *service.MultipartyContractService
+	Pool                  *pgxpool.Pool
+	Redis                 *redis.Client // may be nil in dev
 	// ContractServiceToken is the pre-shared secret that the marketplace service
 	// must supply in X-Service-Token to reach the internal contract-create endpoint.
 	ContractServiceToken string
@@ -58,12 +59,31 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	ipRL := middleware.NewIPRateLimiter(cfg.Redis, 120, time.Minute)
 	r.Use(ipRL.Handler())
 
-	// Internal service-to-service routes — protected by shared service token.
-	// MUST NOT be exposed by the API gateway (only reachable from within the cluster).
+	// Internal service-to-service routes — protected by a shared pre-shared service token
+	// via RequireServiceToken (constant-time compare; fails-fast on empty token in non-dev).
+	// §24.1 gateway-signature is for gateway→downstream USER requests only and does NOT
+	// apply to this S2S path. The security controls here are:
+	//   1. RequireServiceToken: HMAC-safe constant-time comparison of X-Service-Token.
+	//   2. Network isolation: the /internal/* prefix MUST NOT be routed by the API gateway
+	//      — only reachable from within the cluster (sidecar / VPC internal traffic).
 	internalContractH := NewInternalContractHandler(cfg.ContractSvc)
 	internal := r.Group("/internal/v1")
 	internal.Use(middleware.RequireServiceToken(cfg.ContractServiceToken))
 	internal.POST("/contracts", internalContractH.Create)
+
+	// Multi-party S2S: create-or-add-party (marketplace calls this when a collaborator is APPROVED).
+	if cfg.MultipartyContractSvc != nil {
+		multipartyH := NewMultipartyHandler(cfg.MultipartyContractSvc)
+		internal.POST("/multiparty-contracts", multipartyH.CreateOrAddParty)
+
+		// Multi-party public API routes — authenticated users.
+		mpAPI := r.Group("/v1/multiparty-contracts")
+		mpAPI.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret))
+		mpAPI.Use(middleware.RequireValidIdentity())
+		mpAPI.GET("/:id", middleware.RequireTier(1), multipartyH.GetDetail)
+		mpAPI.POST("/:id/submit-for-signature", middleware.RequireTier(2), multipartyH.SubmitForSignatures)
+		mpAPI.POST("/:id/sign", middleware.RequireTier(2), multipartyH.Sign)
+	}
 
 	// All API routes require a valid identity (gateway-injected X-User-Id).
 	contractH := NewContractHandler(cfg.ContractSvc)

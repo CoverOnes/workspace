@@ -1,0 +1,194 @@
+package handler
+
+import (
+	"net/http"
+
+	"github.com/CoverOnes/workspace/internal/platform/httpx"
+	"github.com/CoverOnes/workspace/internal/service"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+// MultipartyHandler handles multi-party contract endpoints.
+// Read endpoints (GET) are authenticated via RequireValidIdentity;
+// the create-or-add-party endpoint is S2S only (RequireServiceToken).
+type MultipartyHandler struct {
+	svc *service.MultipartyContractService
+}
+
+// NewMultipartyHandler returns a MultipartyHandler.
+func NewMultipartyHandler(svc *service.MultipartyContractService) *MultipartyHandler {
+	return &MultipartyHandler{svc: svc}
+}
+
+// CreateOrAddPartyRequest is the POST /internal/v1/multiparty-contracts request body.
+// All fields are marketplace-authoritative; this endpoint is S2S only, not browser-facing.
+type CreateOrAddPartyRequest struct {
+	TenderID     string  `json:"tenderId"`
+	VendorUserID string  `json:"vendorUserId"`
+	RoleID       *string `json:"roleId,omitempty"`
+	ShareBps     int     `json:"shareBps"`
+	Currency     *string `json:"currency,omitempty"`
+}
+
+// CreateOrAddParty handles POST /internal/v1/multiparty-contracts.
+// Idempotent: creates the contract if none exists for tender_id, then adds the party.
+// Called by marketplace when an approved collaborator is APPROVED for a tender.
+// Protected by RequireServiceToken middleware (S2S only).
+func (h *MultipartyHandler) CreateOrAddParty(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+
+	var req CreateOrAddPartyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
+		return
+	}
+
+	tenderID, err := uuid.Parse(req.TenderID)
+	if err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid tenderId")
+		return
+	}
+
+	vendorUserID, err := uuid.Parse(req.VendorUserID)
+	if err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid vendorUserId")
+		return
+	}
+
+	var roleID *uuid.UUID
+
+	if req.RoleID != nil {
+		parsed, parseErr := uuid.Parse(*req.RoleID)
+		if parseErr != nil {
+			httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid roleId")
+			return
+		}
+
+		roleID = &parsed
+	}
+
+	in := &service.CreateOrAddPartyInput{
+		TenderID:     tenderID,
+		VendorUserID: vendorUserID,
+		RoleID:       roleID,
+		ShareBps:     req.ShareBps,
+		Currency:     req.Currency,
+	}
+
+	contract, party, err := h.svc.CreateOrAddParty(c.Request.Context(), in)
+	if err != nil {
+		httpx.Err(c, err)
+		return
+	}
+
+	httpx.Created(c, gin.H{
+		"contract": contract,
+		"party":    party,
+	})
+}
+
+// SubmitForSignatures handles POST /v1/multiparty-contracts/:id/submit-for-signature.
+// Transitions DRAFT → PENDING_SIGNATURES after validating Σ(share_bps) == 10000.
+func (h *MultipartyHandler) SubmitForSignatures(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid contract id")
+		return
+	}
+
+	contract, err := h.svc.SubmitForSignatures(c.Request.Context(), id)
+	if err != nil {
+		httpx.Err(c, err)
+		return
+	}
+
+	httpx.OK(c, contract)
+}
+
+// MultipartySignRequest is the POST /v1/multiparty-contracts/:id/sign request body.
+type MultipartySignRequest struct {
+	SignedContentHash string `json:"signedContentHash"`
+	Version           int    `json:"version"`
+}
+
+// Sign handles POST /v1/multiparty-contracts/:id/sign.
+// A party submits their signature for the current contract version.
+func (h *MultipartyHandler) Sign(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid contract id")
+		return
+	}
+
+	var req MultipartySignRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
+		return
+	}
+
+	if req.SignedContentHash == "" {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "signedContentHash is required")
+		return
+	}
+
+	if req.Version <= 0 {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "version must be >= 1")
+		return
+	}
+
+	// For multiparty contracts, the signer_user_id is extracted from X-User-Id header
+	// (set by RequireValidIdentity middleware). Only vendors registered as ACTIVE parties
+	// can sign — the service / store enforce this via the unique index.
+	rawUID := c.GetHeader("X-User-Id")
+
+	signerUserID, parseErr := uuid.Parse(rawUID)
+	if parseErr != nil {
+		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+		return
+	}
+
+	in := service.SignInput{
+		ContractID:        id,
+		SignerUserID:      signerUserID,
+		SignedContentHash: req.SignedContentHash,
+		Version:           req.Version,
+	}
+
+	contract, err := h.svc.Sign(c.Request.Context(), in)
+	if err != nil {
+		httpx.Err(c, err)
+		return
+	}
+
+	httpx.OK(c, contract)
+}
+
+// GetDetail handles GET /v1/multiparty-contracts/:id.
+// Returns contract + roster + per-version signature progress.
+// Access is scoped to ACTIVE parties of the contract (non-party → 404).
+func (h *MultipartyHandler) GetDetail(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid contract id")
+		return
+	}
+
+	rawUID := c.GetHeader("X-User-Id")
+
+	callerUserID, parseErr := uuid.Parse(rawUID)
+	if parseErr != nil {
+		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+		return
+	}
+
+	detail, err := h.svc.GetDetail(c.Request.Context(), id, callerUserID)
+	if err != nil {
+		httpx.Err(c, err)
+		return
+	}
+
+	httpx.OK(c, detail)
+}

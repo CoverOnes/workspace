@@ -19,4 +19,9 @@ var (
 	ErrHashMismatch      = errors.New("signed content hash does not match current contract hash")
 	ErrNotParty          = errors.New("caller is not a party to this contract")
 	ErrAlreadySigned     = errors.New("party has already signed this version")
+
+	// Multiparty contract sentinel errors.
+	ErrMultipartyContractNotFound = errors.New("multi-party contract not found")
+	ErrShareSumNotFull            = errors.New("sum of active party share_bps must equal 10000")
+	ErrStaleVersion               = errors.New("signature version does not match current contract version")
 )
