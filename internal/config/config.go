@@ -58,6 +58,15 @@ type Config struct {
 	// Required; must be at least 32 characters to enforce adequate entropy.
 	// Env: WORKSPACE_CONTRACT_SERVICE_TOKEN
 	ContractServiceToken string `mapstructure:"contract_service_token"`
+
+	// GatewayHMACSecret is the shared secret used to verify the gateway-origin
+	// identity signature (conventions §24.1). It MUST equal the gateway's
+	// GATEWAY_HMAC_SECRET. Non-dev (staging/production) fails fast at boot if
+	// empty or shorter than 32 chars; development may omit it (verification
+	// disabled, mirroring the gateway which also disables signing in dev).
+	// chmod 0600 the file that provides it; prefer the env var as canonical.
+	// Env: WORKSPACE_GATEWAY_HMAC_SECRET
+	GatewayHMACSecret string `mapstructure:"gateway_hmac_secret"`
 }
 
 // Load reads configuration from environment variables (prefix WORKSPACE_).
@@ -79,6 +88,7 @@ func Load() (*Config, error) {
 		"db_max_conns":           "WORKSPACE_DB_MAX_CONNS",
 		"db_min_conns":           "WORKSPACE_DB_MIN_CONNS",
 		"contract_service_token": "WORKSPACE_CONTRACT_SERVICE_TOKEN",
+		"gateway_hmac_secret":    "WORKSPACE_GATEWAY_HMAC_SECRET",
 	}
 
 	for key, envKey := range bindings {
@@ -130,9 +140,17 @@ func (c *Config) validate() error {
 		errs = append(errs, "WORKSPACE_LOG_LEVEL must be DEBUG|INFO|WARN|ERROR")
 	}
 
-	validEnvs := map[string]bool{"development": true, "production": true, "test": true}
+	// §24.1 fail-closed env posture: WORKSPACE_ENV MUST be one of the known
+	// values. An unknown or empty string (after defaults) is a boot error.
+	// 'staging' is added per conventions §24.1 three-tier model.
+	validEnvs := map[string]bool{
+		"development": true,
+		"staging":     true,
+		"production":  true,
+		"test":        true,
+	}
 	if !validEnvs[strings.ToLower(c.Env)] {
-		errs = append(errs, "WORKSPACE_ENV must be development|production|test")
+		errs = append(errs, "WORKSPACE_ENV must be development|staging|production|test")
 	}
 
 	if c.PostgresSchema != "" && !schemaNameRe.MatchString(c.PostgresSchema) {
@@ -150,6 +168,8 @@ func (c *Config) validate() error {
 	if tokenErr := c.validateServiceToken(); tokenErr != "" {
 		errs = append(errs, tokenErr)
 	}
+
+	errs = append(errs, c.validateGatewayHMAC()...)
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
@@ -181,6 +201,35 @@ func (c *Config) validateServiceToken() string {
 	default:
 		return ""
 	}
+}
+
+// minHMACSecretLen is the minimum length of the gateway HMAC secret. It mirrors
+// the gateway's GATEWAY_HMAC_SECRET ≥32-char requirement (conventions §24.1).
+const minHMACSecretLen = 32
+
+// validateGatewayHMAC enforces the §24.1 fail-closed secret posture:
+//   - non-dev (staging/production/test): secret is REQUIRED and MUST be ≥32 chars —
+//     boot fails fast otherwise (mirrors the gateway which fails fast in non-dev).
+//   - dev: secret may be empty (verification disabled, mirroring the gateway's
+//     dev signing-skip); but if a secret IS provided it must still be ≥32 chars
+//     so a too-short dev secret never masquerades as a valid one.
+func (c *Config) validateGatewayHMAC() []string {
+	var errs []string
+
+	if !c.IsDev() {
+		if len(c.GatewayHMACSecret) < minHMACSecretLen {
+			errs = append(errs, "WORKSPACE_GATEWAY_HMAC_SECRET must be at least 32 characters in non-dev (staging/production) environments")
+		}
+
+		return errs
+	}
+
+	// Dev: empty is allowed (verification disabled); non-empty must be ≥32.
+	if c.GatewayHMACSecret != "" && len(c.GatewayHMACSecret) < minHMACSecretLen {
+		errs = append(errs, "WORKSPACE_GATEWAY_HMAC_SECRET, when set, must be at least 32 characters")
+	}
+
+	return errs
 }
 
 // IsDev reports whether the service is running in development mode.

@@ -23,6 +23,10 @@ type RouterConfig struct {
 	// ContractServiceToken is the pre-shared secret that the marketplace service
 	// must supply in X-Service-Token to reach the internal contract-create endpoint.
 	ContractServiceToken string
+	// GatewayHMACSecret is the §24.1 shared secret used to verify the
+	// gateway-origin identity signature. Empty == dev posture (verification
+	// disabled); config validation guarantees it is non-empty in non-dev.
+	GatewayHMACSecret string
 }
 
 // NewRouter builds and returns the configured Gin engine.
@@ -32,7 +36,7 @@ type RouterConfig struct {
 // CORS handling. Adding permissive CORS here would widen the attack surface without
 // benefit (CONVENTIONS §9 positions CORS after the access-log in the chain but
 // the gateway/edge handles it before requests reach this service).
-func NewRouter(cfg RouterConfig) *gin.Engine {
+func NewRouter(cfg *RouterConfig) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 
 	r := gin.New()
@@ -68,6 +72,11 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	worklogH := NewWorklogHandler(cfg.WorklogSvc)
 
 	api := r.Group("/v1")
+	// Defense-in-depth (§24.1): verify the gateway-origin HMAC signature BEFORE
+	// RequireValidIdentity trusts any X-User-Id / X-Kyc-Tier / X-Account-Type /
+	// X-Email-Verified header. When the secret is empty (dev) this is a no-op
+	// passthrough, matching the gateway's dev signing-skip.
+	api.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret))
 	api.Use(middleware.RequireValidIdentity())
 
 	// Contracts — Tier>=1 for reads, Tier>=2 for writes.
