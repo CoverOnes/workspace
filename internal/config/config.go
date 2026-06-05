@@ -67,6 +67,16 @@ type Config struct {
 	// chmod 0600 the file that provides it; prefer the env var as canonical.
 	// Env: WORKSPACE_GATEWAY_HMAC_SECRET
 	GatewayHMACSecret string `mapstructure:"gateway_hmac_secret"`
+
+	// UserRateLimitPerMin is the per-user token-bucket rate limit (requests per minute).
+	// Set to 0 to disable per-user rate limiting (IP limiter still applies).
+	// Env: WORKSPACE_USER_RATE_LIMIT_PER_MIN
+	UserRateLimitPerMin int `mapstructure:"user_rate_limit_per_min"`
+
+	// UserRateLimitBurst is the token-bucket burst size for per-user rate limiting.
+	// Must be > 0 when UserRateLimitPerMin > 0.
+	// Env: WORKSPACE_USER_RATE_LIMIT_BURST
+	UserRateLimitBurst int `mapstructure:"user_rate_limit_burst"`
 }
 
 // Load reads configuration from environment variables (prefix WORKSPACE_).
@@ -78,17 +88,19 @@ func Load() (*Config, error) {
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	bindings := map[string]string{
-		"port":                   "WORKSPACE_PORT",
-		"postgres_dsn":           "WORKSPACE_POSTGRES_DSN",
-		"postgres_schema":        "WORKSPACE_DB_SCHEMA",
-		"redis_url":              "WORKSPACE_REDIS_URL",
-		"log_level":              "WORKSPACE_LOG_LEVEL",
-		"env":                    "WORKSPACE_ENV",
-		"auto_migrate":           "WORKSPACE_AUTO_MIGRATE",
-		"db_max_conns":           "WORKSPACE_DB_MAX_CONNS",
-		"db_min_conns":           "WORKSPACE_DB_MIN_CONNS",
-		"contract_service_token": "WORKSPACE_CONTRACT_SERVICE_TOKEN",
-		"gateway_hmac_secret":    "WORKSPACE_GATEWAY_HMAC_SECRET",
+		"port":                    "WORKSPACE_PORT",
+		"postgres_dsn":            "WORKSPACE_POSTGRES_DSN",
+		"postgres_schema":         "WORKSPACE_DB_SCHEMA",
+		"redis_url":               "WORKSPACE_REDIS_URL",
+		"log_level":               "WORKSPACE_LOG_LEVEL",
+		"env":                     "WORKSPACE_ENV",
+		"auto_migrate":            "WORKSPACE_AUTO_MIGRATE",
+		"db_max_conns":            "WORKSPACE_DB_MAX_CONNS",
+		"db_min_conns":            "WORKSPACE_DB_MIN_CONNS",
+		"contract_service_token":  "WORKSPACE_CONTRACT_SERVICE_TOKEN",
+		"gateway_hmac_secret":     "WORKSPACE_GATEWAY_HMAC_SECRET",
+		"user_rate_limit_per_min": "WORKSPACE_USER_RATE_LIMIT_PER_MIN",
+		"user_rate_limit_burst":   "WORKSPACE_USER_RATE_LIMIT_BURST",
 	}
 
 	for key, envKey := range bindings {
@@ -110,6 +122,8 @@ func Load() (*Config, error) {
 	v.SetDefault("env", "production")
 	v.SetDefault("db_max_conns", 10)
 	v.SetDefault("db_min_conns", 2)
+	v.SetDefault("user_rate_limit_per_min", 120)
+	v.SetDefault("user_rate_limit_burst", 20)
 
 	var cfg Config
 
@@ -164,6 +178,8 @@ func (c *Config) validate() error {
 	if c.DBMinConns < 0 || c.DBMinConns > 65535 {
 		errs = append(errs, "WORKSPACE_DB_MIN_CONNS must be 0-65535 (0 = use default of 2)")
 	}
+
+	errs = append(errs, c.validateUserRateLimit()...)
 
 	if tokenErr := c.validateServiceToken(); tokenErr != "" {
 		errs = append(errs, tokenErr)
@@ -227,6 +243,47 @@ func (c *Config) validateGatewayHMAC() []string {
 	// Dev: empty is allowed (verification disabled); non-empty must be ≥32.
 	if c.GatewayHMACSecret != "" && len(c.GatewayHMACSecret) < minHMACSecretLen {
 		errs = append(errs, "WORKSPACE_GATEWAY_HMAC_SECRET, when set, must be at least 32 characters")
+	}
+
+	return errs
+}
+
+// maxUserRateLimitPerMin is a sanity cap on per-user rate limits. Values above
+// this are almost certainly misconfiguration (e.g. accidentally supplying a
+// per-second value or an unbounded integer). The IP limiter already runs at
+// 120 req/min; per-user limits above 100 000 are meaningless in practice.
+const maxUserRateLimitPerMin = 100_000
+
+// maxUserRateLimitBurst mirrors the cap on the sustained rate.
+const maxUserRateLimitBurst = 100_000
+
+// validateUserRateLimit validates per-user rate-limit configuration and returns
+// any error messages (empty slice = valid).
+//
+// Rules:
+//   - UserRateLimitPerMin must be >= 0 (0 disables per-user limiting; IP limiter still runs).
+//   - UserRateLimitPerMin must be <= 100 000 (sanity cap; prevents accidental bypass).
+//   - UserRateLimitBurst must be > 0 when UserRateLimitPerMin > 0, because a zero-burst
+//     token bucket would deny every request immediately.
+//   - UserRateLimitBurst must be <= 100 000 (matching sanity cap).
+//   - UserRateLimitBurst is unchecked when UserRateLimitPerMin == 0 (limiter disabled).
+func (c *Config) validateUserRateLimit() []string {
+	var errs []string
+
+	if c.UserRateLimitPerMin < 0 {
+		errs = append(errs, "WORKSPACE_USER_RATE_LIMIT_PER_MIN must be >= 0 (0 = disabled)")
+	}
+
+	if c.UserRateLimitPerMin > maxUserRateLimitPerMin {
+		errs = append(errs, fmt.Sprintf("WORKSPACE_USER_RATE_LIMIT_PER_MIN must be <= %d", maxUserRateLimitPerMin))
+	}
+
+	if c.UserRateLimitPerMin > 0 && c.UserRateLimitBurst <= 0 {
+		errs = append(errs, "WORKSPACE_USER_RATE_LIMIT_BURST must be > 0 when WORKSPACE_USER_RATE_LIMIT_PER_MIN > 0")
+	}
+
+	if c.UserRateLimitPerMin > 0 && c.UserRateLimitBurst > maxUserRateLimitBurst {
+		errs = append(errs, fmt.Sprintf("WORKSPACE_USER_RATE_LIMIT_BURST must be <= %d", maxUserRateLimitBurst))
 	}
 
 	return errs

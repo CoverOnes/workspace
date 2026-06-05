@@ -313,6 +313,73 @@ func TestLoad_PostgresSchema(t *testing.T) {
 	}
 }
 
+func TestLoad_UserRateLimit(t *testing.T) {
+	tests := []struct {
+		name      string
+		perMin    string
+		burst     string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:      "perMin negative is rejected",
+			perMin:    "-1",
+			burst:     "10",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_USER_RATE_LIMIT_PER_MIN must be >= 0",
+		},
+		{
+			name:      "perMin > 0 and burst <= 0 is rejected",
+			perMin:    "60",
+			burst:     "0",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_USER_RATE_LIMIT_BURST must be > 0",
+		},
+		{
+			name:    "perMin=0 disabled — burst value is irrelevant, no error",
+			perMin:  "0",
+			burst:   "0",
+			wantErr: false,
+		},
+		{
+			name:    "valid perMin and burst passes",
+			perMin:  "120",
+			burst:   "20",
+			wantErr: false,
+		},
+		{
+			name:      "perMin above upper bound is rejected",
+			perMin:    "100001",
+			burst:     "10",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_USER_RATE_LIMIT_PER_MIN must be <=",
+		},
+		{
+			name:      "burst above upper bound is rejected",
+			perMin:    "60",
+			burst:     "100001",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_USER_RATE_LIMIT_BURST must be <=",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setValidEnv(t)
+			t.Setenv("WORKSPACE_USER_RATE_LIMIT_PER_MIN", tc.perMin)
+			t.Setenv("WORKSPACE_USER_RATE_LIMIT_BURST", tc.burst)
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestLoad_GatewayHMAC(t *testing.T) {
 	tests := []struct {
 		name      string
