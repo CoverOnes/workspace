@@ -140,6 +140,10 @@ FOR UPDATE
 	return scanMultipartyContract(q.QueryRow(ctx, query, id))
 }
 
+// updateMultipartyContract persists mutable contract fields: status, content_hash, version,
+// party_count, currency, and updated_at. poster_user_id is intentionally excluded — it is
+// set at creation time only and is immutable thereafter (the service layer enforces ownership
+// by comparing callers against the stored value; the store never overwrites it).
 func updateMultipartyContract(ctx context.Context, q querier, c *domain.MultipartyContract) error {
 	const query = `
 UPDATE multi_party_contracts

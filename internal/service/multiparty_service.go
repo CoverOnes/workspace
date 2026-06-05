@@ -167,6 +167,15 @@ func (s *MultipartyContractService) addPartyViaAddendum(
 			return fmt.Errorf("%w: contract is no longer ACTIVE (concurrent addendum?)", domain.ErrInvalidTransition)
 		}
 
+		// Defense-in-depth owner check on the LOCKED row (M3 hardening).
+		// in.PosterUserID is guaranteed non-nil here (pre-lock guard on line 142).
+		// Re-checking against c (the DB-authoritative locked row) closes the TOCTOU window
+		// on owner identity: a row-level change between the pre-fetch and the lock cannot
+		// sneak through.
+		if err := assertLockedOwner(c, *in.PosterUserID); err != nil {
+			return err
+		}
+
 		now := time.Now().UTC()
 		newParty := &domain.MultipartyContractParty{
 			ID:           uuid.New(),
@@ -470,6 +479,14 @@ func (s *MultipartyContractService) signTx(
 		return fmt.Errorf("%w: contract must be in PENDING_SIGNATURES or ADDENDUM_PENDING state to sign", domain.ErrInvalidTransition)
 	}
 
+	// Invariant guard: a submitted contract must have at least one party. PartyCount==0
+	// means SubmitForSignatures was called on an empty roster — the quorum check below
+	// (sigCount == c.PartyCount) would never fire, leaving the contract permanently stuck
+	// in PENDING_SIGNATURES. Reject early so the caller gets a clear error.
+	if c.PartyCount == 0 {
+		return fmt.Errorf("%w: contract has no parties; cannot accept signatures", domain.ErrInvalidTransition)
+	}
+
 	// Capture pre-sign status so the post-tx publisher can choose the right event.
 	*preSignStatus = c.Status
 
@@ -684,6 +701,10 @@ type UpdatePartyShareInput struct {
 //   - newShareBps must be in [0, 10000].
 //   - Does NOT recompute content_hash (that happens at SubmitForSignatures).
 //
+// TOCTOU-safe: the status check and the share update execute inside a single transaction
+// with SELECT FOR UPDATE on the contract row. A concurrent SubmitForSignatures cannot
+// transition the contract to PENDING_SIGNATURES between the check and the write.
+//
 // Returns the updated party row.
 func (s *MultipartyContractService) UpdatePartyShare(
 	ctx context.Context,
@@ -693,27 +714,59 @@ func (s *MultipartyContractService) UpdatePartyShare(
 		return nil, err
 	}
 
-	c, err := s.contracts.GetByID(ctx, in.ContractID)
-	if err != nil {
-		return nil, err
-	}
+	var updated *domain.MultipartyContractParty
 
-	if c.Status != domain.MultipartyContractStatusAddendumPending {
-		return nil, fmt.Errorf("%w: UpdatePartyShare requires ADDENDUM_PENDING status, got %s",
-			domain.ErrInvalidTransition, c.Status)
-	}
+	txErr := s.tx.WithMultipartyTx(ctx, func(
+		txCtx context.Context,
+		txContracts store.MultipartyContractStore,
+		txParties store.MultipartyPartyStore,
+		_ store.MultipartySignatureStore,
+		_ store.AddendumStore,
+	) error {
+		// FOR UPDATE lock: prevents a concurrent SubmitForSignatures from freezing
+		// the digest between our status check and the share write.
+		c, err := txContracts.GetByIDForUpdate(txCtx, in.ContractID)
+		if err != nil {
+			return err
+		}
 
-	// Owner-only gate.
-	if c.PosterUserID == nil || in.CallerUserID != *c.PosterUserID {
-		return nil, fmt.Errorf("%w: only the contract owner may update party shares", domain.ErrForbidden)
-	}
+		// Re-check status under the lock.
+		if c.Status != domain.MultipartyContractStatusAddendumPending {
+			return fmt.Errorf("%w: UpdatePartyShare requires ADDENDUM_PENDING status, got %s",
+				domain.ErrInvalidTransition, c.Status)
+		}
 
-	updated, err := s.parties.UpdatePartyShare(ctx, in.ContractID, in.PartyID, in.NewShareBps)
-	if err != nil {
-		return nil, err
+		// Owner-only gate — checked on the locked row.
+		if c.PosterUserID == nil || in.CallerUserID != *c.PosterUserID {
+			return fmt.Errorf("%w: only the contract owner may update party shares", domain.ErrForbidden)
+		}
+
+		result, err := txParties.UpdatePartyShare(txCtx, in.ContractID, in.PartyID, in.NewShareBps)
+		if err != nil {
+			return err
+		}
+
+		updated = result
+
+		return nil
+	})
+
+	if txErr != nil {
+		return nil, txErr
 	}
 
 	return updated, nil
+}
+
+// assertLockedOwner checks that the DB-authoritative locked contract row has a PosterUserID
+// that matches callerID. Used inside transactions after GetByIDForUpdate to close the TOCTOU
+// window between the pre-lock owner check and the locked row read (M3 hardening).
+func assertLockedOwner(c *domain.MultipartyContract, callerID uuid.UUID) error {
+	if c.PosterUserID == nil || *c.PosterUserID != callerID {
+		return fmt.Errorf("%w: only the contract owner may perform this operation (locked row check)", domain.ErrForbidden)
+	}
+
+	return nil
 }
 
 // validateShareBps validates that share_bps is in [0, 10000].

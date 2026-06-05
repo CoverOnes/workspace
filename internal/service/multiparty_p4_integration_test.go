@@ -25,7 +25,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/CoverOnes/workspace/internal/domain"
 	"github.com/CoverOnes/workspace/internal/events"
@@ -351,7 +350,7 @@ func TestP4_DigestChangesWithNewRoster(t *testing.T) {
 	vA := uuid.MustParse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 	vB := uuid.MustParse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 	vC := uuid.MustParse("cccccccc-cccc-cccc-cccc-cccccccccccc")
-	currency := "TWD"
+	currency := testCurrencyTWD
 
 	v1Roster := []domain.MultipartyRosterEntry{
 		{VendorUserID: vA, ShareBps: 6000},
@@ -677,8 +676,8 @@ func TestP4_ConcurrentAddParty(t *testing.T) {
 	assert.Equal(t, 1, successCount, "exactly one concurrent add-party must succeed")
 	assert.Equal(t, 1, errCount, "exactly one concurrent add-party must fail")
 
-	time.Sleep(20 * time.Millisecond)
-
+	// wg.Wait() above already joined all goroutines; the addendum row is written inside
+	// the transaction before the goroutine returns, so no sleep is needed here.
 	for _, r := range results {
 		if r.err == nil {
 			assert.Equal(t, domain.MultipartyContractStatusAddendumPending, r.contract.Status,
@@ -708,8 +707,8 @@ func TestP4_AddendumRow(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, domain.MultipartyContractStatusAddendumPending, afterAddendum.Status)
 
-	time.Sleep(10 * time.Millisecond)
-
+	// The addendum row is written inside the transaction before CreateOrAddParty returns;
+	// no sleep needed — the row is guaranteed to be visible to subsequent reads.
 	addenda, listErr := env.addenda.ListByContract(ctx, contractID)
 	require.NoError(t, listErr)
 	require.Len(t, addenda, 1, "exactly one addendum row must be recorded")
@@ -722,6 +721,73 @@ func TestP4_AddendumRow(t *testing.T) {
 	assert.Equal(t, poster, a.TriggeredBy, "triggered_by must be the poster")
 	assert.Equal(t, afterAddendum.Version, a.ToVersion)
 	assert.False(t, a.CreatedAt.IsZero(), "created_at must be set")
+}
+
+// TestP4_UpdatePartyShare_AfterSubmit_ErrInvalidTransition verifies the M1 TOCTOU fix:
+// UpdatePartyShare on a contract that has transitioned to PENDING_SIGNATURES returns
+// ErrInvalidTransition, not a silent success that would land a stale share patch on a
+// contract whose digest is already frozen.
+func TestP4_UpdatePartyShare_AfterSubmit_ErrInvalidTransition(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping P4 integration test in short mode")
+	}
+
+	ctx := context.Background()
+	env := startP4Env(t, ctx)
+
+	fix := activeContractFixture(t, ctx, env.svc)
+	contractID := fix.contractID
+	tenderID := fix.tenderID
+	vA := fix.vA
+	poster := fix.poster
+
+	// Add vC via addendum → ADDENDUM_PENDING.
+	vC := uuid.New()
+	addPending, _, err := env.svc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+		TenderID: tenderID, VendorUserID: vC, ShareBps: 0, PosterUserID: &poster,
+	})
+	require.NoError(t, err)
+	require.Equal(t, domain.MultipartyContractStatusAddendumPending, addPending.Status)
+
+	// Fetch party IDs so we can call UpdatePartyShare.
+	detail, err := env.svc.GetDetail(ctx, contractID, vA)
+	require.NoError(t, err)
+
+	partyIDs := make(map[uuid.UUID]uuid.UUID)
+	for _, p := range detail.Parties {
+		partyIDs[p.VendorUserID] = p.ID
+	}
+
+	// Set shares to a valid sum: vA=5000, vB=4000, vC=1000.
+	_, err = env.svc.UpdatePartyShare(ctx, service.UpdatePartyShareInput{
+		ContractID: contractID, PartyID: partyIDs[vA], CallerUserID: poster, NewShareBps: 5000,
+	})
+	require.NoError(t, err)
+
+	_, err = env.svc.UpdatePartyShare(ctx, service.UpdatePartyShareInput{
+		ContractID: contractID, PartyID: partyIDs[fix.vB], CallerUserID: poster, NewShareBps: 4000,
+	})
+	require.NoError(t, err)
+
+	_, err = env.svc.UpdatePartyShare(ctx, service.UpdatePartyShareInput{
+		ContractID: contractID, PartyID: partyIDs[vC], CallerUserID: poster, NewShareBps: 1000,
+	})
+	require.NoError(t, err)
+
+	// SubmitForSignatures transitions the contract to PENDING_SIGNATURES and freezes the digest.
+	_, err = env.svc.SubmitForSignatures(ctx, contractID)
+	require.NoError(t, err)
+
+	// Now the contract is PENDING_SIGNATURES. A subsequent UpdatePartyShare must return
+	// ErrInvalidTransition — the frozen digest must not be invalidated by a late PATCH.
+	_, updateErr := env.svc.UpdatePartyShare(ctx, service.UpdatePartyShareInput{
+		ContractID:   contractID,
+		PartyID:      partyIDs[vA],
+		CallerUserID: poster,
+		NewShareBps:  9999,
+	})
+	require.ErrorIs(t, updateErr, domain.ErrInvalidTransition,
+		"UpdatePartyShare on PENDING_SIGNATURES contract must return ErrInvalidTransition (M1 TOCTOU fix)")
 }
 
 // TestP4_Migration000008_AppliesAndRollsBack verifies migration 000008 up + down.

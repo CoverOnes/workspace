@@ -39,6 +39,12 @@ type CreateOrAddPartyRequest struct {
 // Idempotent: creates the contract if none exists for tender_id, then adds the party.
 // Called by marketplace when an approved collaborator is APPROVED for a tender.
 // Protected by RequireServiceToken middleware (S2S only).
+//
+// S2S trust model: X-Service-Token is the trust boundary for this group.
+// The posterUserId field is caller-asserted and is ONLY trusted at first creation (when no
+// contract exists for the tender yet). On existing contracts the service validates the
+// caller-supplied posterUserId against the stored contract.PosterUserID — a mismatch is
+// rejected as ErrForbidden. posterUserId cannot be changed after the contract is created.
 func (h *MultipartyHandler) CreateOrAddParty(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
 

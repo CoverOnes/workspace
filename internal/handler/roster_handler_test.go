@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/CoverOnes/workspace/internal/domain"
 	"github.com/CoverOnes/workspace/internal/events"
 	"github.com/CoverOnes/workspace/internal/handler"
 	"github.com/CoverOnes/workspace/internal/service"
@@ -131,7 +132,64 @@ func startRosterTestDB(t *testing.T, ctx context.Context) *rosterTestEnv {
 	}
 }
 
+// activateRosterContract creates a 2-party contract, submits it for signatures, and
+// signs with both parties so the contract reaches ACTIVE status. Returns the contract ID.
+// The roster endpoint (M2 guard) only serves ACTIVE and COMPLETED contracts.
+func activateRosterContract(
+	t *testing.T,
+	ctx context.Context,
+	svc *service.MultipartyContractService,
+	vendorA, vendorB uuid.UUID,
+	shareBpsA, shareBpsB int,
+) uuid.UUID {
+	t.Helper()
+
+	tenderID := uuid.New()
+	posterID := uuid.New()
+	currency := "TWD"
+
+	contract, _, err := svc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+		TenderID:     tenderID,
+		VendorUserID: vendorA,
+		ShareBps:     shareBpsA,
+		Currency:     &currency,
+		PosterUserID: &posterID,
+	})
+	require.NoError(t, err)
+
+	_, _, err = svc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+		TenderID:     tenderID,
+		VendorUserID: vendorB,
+		ShareBps:     shareBpsB,
+	})
+	require.NoError(t, err)
+
+	submitted, err := svc.SubmitForSignatures(ctx, contract.ID)
+	require.NoError(t, err)
+
+	_, err = svc.Sign(ctx, service.SignInput{
+		ContractID:        contract.ID,
+		SignerUserID:      vendorA,
+		SignedContentHash: submitted.ContentHash,
+		Version:           1,
+	})
+	require.NoError(t, err)
+
+	active, err := svc.Sign(ctx, service.SignInput{
+		ContractID:        contract.ID,
+		SignerUserID:      vendorB,
+		SignedContentHash: submitted.ContentHash,
+		Version:           1,
+	})
+	require.NoError(t, err)
+	require.Equal(t, domain.MultipartyContractStatusActive, active.Status)
+
+	return contract.ID
+}
+
 // TestRoster_GetParties_RequiresServiceToken verifies S2S gate enforcement.
+// Uses an ACTIVE contract — the M2 status guard rejects transient states (DRAFT, etc.)
+// to ensure payment can only settle against a finalized, fully-allocated roster.
 func TestRoster_GetParties_RequiresServiceToken(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping roster handler integration test in short mode")
@@ -140,28 +198,13 @@ func TestRoster_GetParties_RequiresServiceToken(t *testing.T) {
 	ctx := context.Background()
 	env := startRosterTestDB(t, ctx)
 
-	// Create a contract with two parties.
-	tenderID := uuid.New()
 	vendorA := uuid.New()
 	vendorB := uuid.New()
-	posterID := uuid.New()
 
-	contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
-		TenderID:     tenderID,
-		VendorUserID: vendorA,
-		ShareBps:     7000,
-		PosterUserID: &posterID,
-	})
-	require.NoError(t, err)
+	// Activate the contract so the M2 status guard allows roster reads.
+	contractID := activateRosterContract(t, ctx, env.mpSvc, vendorA, vendorB, 7000, 3000)
 
-	_, _, err = env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
-		TenderID:     tenderID,
-		VendorUserID: vendorB,
-		ShareBps:     3000,
-	})
-	require.NoError(t, err)
-
-	path := fmt.Sprintf("/internal/v1/contracts/%s/parties", contract.ID)
+	path := fmt.Sprintf("/internal/v1/contracts/%s/parties", contractID)
 
 	t.Run("no token → 401", func(t *testing.T) {
 		req := httptest.NewRequestWithContext(ctx, http.MethodGet, path, http.NoBody)
@@ -207,7 +250,7 @@ func TestRoster_GetParties_RequiresServiceToken(t *testing.T) {
 
 	t.Run("roster NOT reachable on public /v1 group", func(t *testing.T) {
 		// The public group is at /v1, not /internal/v1; this path must 404.
-		publicPath := fmt.Sprintf("/v1/contracts/%s/parties", contract.ID)
+		publicPath := fmt.Sprintf("/v1/contracts/%s/parties", contractID)
 		req := httptest.NewRequestWithContext(ctx, http.MethodGet, publicPath, http.NoBody)
 		req.Header.Set("X-User-Id", uuid.New().String())
 		req.Header.Set("X-Kyc-Tier", "2")
