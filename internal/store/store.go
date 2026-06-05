@@ -3,6 +3,7 @@ package store
 
 import (
 	"context"
+	"time"
 
 	"github.com/CoverOnes/workspace/internal/domain"
 	"github.com/google/uuid"
@@ -114,4 +115,18 @@ type MultipartyTxManager interface {
 			sigs MultipartySignatureStore,
 		) error,
 	) error
+}
+
+// MilestoneStore defines persistence operations for multiparty contract milestones.
+type MilestoneStore interface {
+	// Create inserts a new milestone row.
+	Create(ctx context.Context, m *domain.Milestone) error
+	// GetByID fetches a milestone by primary key.
+	GetByID(ctx context.Context, id uuid.UUID) (*domain.Milestone, error)
+	// ListByContract returns all milestones for a multiparty contract ordered by sequence ASC, created_at ASC.
+	ListByContract(ctx context.Context, contractID uuid.UUID) ([]*domain.Milestone, error)
+	// MarkCompleted sets status=COMPLETED and completed_at for the given milestone.
+	// Returns ErrMilestoneNotFound if the row does not exist.
+	// Returns ErrMilestoneAlreadyDone if it is already COMPLETED.
+	MarkCompleted(ctx context.Context, id uuid.UUID, completedAt time.Time) (*domain.Milestone, error)
 }

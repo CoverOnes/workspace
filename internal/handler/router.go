@@ -19,6 +19,7 @@ type RouterConfig struct {
 	TaskSvc               *service.TaskService
 	WorklogSvc            *service.WorklogService
 	MultipartyContractSvc *service.MultipartyContractService
+	MilestoneSvc          *service.MilestoneService
 	Pool                  *pgxpool.Pool
 	Redis                 *redis.Client // may be nil in dev
 	// ContractServiceToken is the pre-shared secret that the marketplace service
@@ -71,18 +72,38 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	internal.Use(middleware.RequireServiceToken(cfg.ContractServiceToken))
 	internal.POST("/contracts", internalContractH.Create)
 
-	// Multi-party S2S: create-or-add-party (marketplace calls this when a collaborator is APPROVED).
+	// Multi-party routes (both S2S internal and authenticated public) share a single
+	// handler instance to avoid double-construction.
 	if cfg.MultipartyContractSvc != nil {
 		multipartyH := NewMultipartyHandler(cfg.MultipartyContractSvc)
+
+		// S2S: create-or-add-party (marketplace calls this when a collaborator is APPROVED).
 		internal.POST("/multiparty-contracts", multipartyH.CreateOrAddParty)
 
-		// Multi-party public API routes — authenticated users.
+		// Public API routes — authenticated users.
 		mpAPI := r.Group("/v1/multiparty-contracts")
 		mpAPI.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret))
 		mpAPI.Use(middleware.RequireValidIdentity())
 		mpAPI.GET("/:id", middleware.RequireTier(1), multipartyH.GetDetail)
 		mpAPI.POST("/:id/submit-for-signature", middleware.RequireTier(2), multipartyH.SubmitForSignatures)
 		mpAPI.POST("/:id/sign", middleware.RequireTier(2), multipartyH.Sign)
+
+		// Milestone endpoints — owner-only (Tier>=2, poster IDOR guard in service layer).
+		if cfg.MilestoneSvc != nil {
+			milestoneH := NewMilestoneHandler(cfg.MilestoneSvc)
+			mpAPI.POST("/:id/milestones", middleware.RequireTier(2), milestoneH.AddMilestone)
+			mpAPI.GET("/:id/milestones", middleware.RequireTier(1), milestoneH.ListMilestones)
+			mpAPI.POST("/:id/milestones/:mid/complete", middleware.RequireTier(2), milestoneH.CompleteMilestone)
+		}
+	}
+
+	// S2S roster endpoint — registered when MilestoneSvc is available (it owns the
+	// existence-check + party-list logic). Returns the frozen ACTIVE-party
+	// [{vendorUserId, shareBps}] for payment; 404 on unknown contract (prevents phantom
+	// contracts from returning an empty roster that payment would use for settlement).
+	if cfg.MilestoneSvc != nil {
+		internalPartiesH := NewInternalPartiesHandler(cfg.MilestoneSvc)
+		internal.GET("/contracts/:id/parties", internalPartiesH.GetParties)
 	}
 
 	// All API routes require a valid identity (gateway-injected X-User-Id).

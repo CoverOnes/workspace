@@ -56,7 +56,8 @@ type CreateOrAddPartyInput struct {
 	VendorUserID uuid.UUID
 	RoleID       *uuid.UUID
 	ShareBps     int
-	Currency     *string // optional; only considered at creation time
+	Currency     *string    // optional; only considered at creation time
+	PosterUserID *uuid.UUID // optional; the tender owner; stored on first contract creation only
 }
 
 // CreateOrAddParty is the idempotent S2S endpoint:
@@ -125,14 +126,15 @@ func (s *MultipartyContractService) getOrCreateContract(
 
 	now := time.Now().UTC()
 	contract := &domain.MultipartyContract{
-		ID:          uuid.New(),
-		TenderID:    in.TenderID,
-		Status:      domain.MultipartyContractStatusDraft,
-		ContentHash: "", // computed at submit-for-signature
-		Version:     1,
-		Currency:    in.Currency,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		ID:           uuid.New(),
+		TenderID:     in.TenderID,
+		Status:       domain.MultipartyContractStatusDraft,
+		ContentHash:  "", // computed at submit-for-signature
+		Version:      1,
+		Currency:     in.Currency,
+		PosterUserID: in.PosterUserID,
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
 
 	if createErr := s.contracts.Create(ctx, contract); createErr != nil {

@@ -86,14 +86,14 @@ func (s *MultipartyContractStore) Update(ctx context.Context, c *domain.Multipar
 func createMultipartyContract(ctx context.Context, q querier, c *domain.MultipartyContract) error {
 	const query = `
 INSERT INTO multi_party_contracts
-    (id, tender_id, status, content_hash, version, party_count, currency, created_at, updated_at, deleted_at)
+    (id, tender_id, status, content_hash, version, party_count, currency, poster_user_id, created_at, updated_at, deleted_at)
 VALUES
-    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 `
 
 	_, err := q.Exec(
 		ctx, query,
-		c.ID, c.TenderID, string(c.Status), c.ContentHash, c.Version, c.PartyCount, c.Currency,
+		c.ID, c.TenderID, string(c.Status), c.ContentHash, c.Version, c.PartyCount, c.Currency, c.PosterUserID,
 		c.CreatedAt, c.UpdatedAt, c.DeletedAt,
 	)
 	if err != nil {
@@ -110,7 +110,7 @@ VALUES
 
 func getMultipartyContractByID(ctx context.Context, q querier, id uuid.UUID) (*domain.MultipartyContract, error) {
 	const query = `
-SELECT id, tender_id, status, content_hash, version, party_count, currency, created_at, updated_at, deleted_at
+SELECT id, tender_id, status, content_hash, version, party_count, currency, poster_user_id, created_at, updated_at, deleted_at
 FROM multi_party_contracts
 WHERE id = $1 AND deleted_at IS NULL
 `
@@ -120,7 +120,7 @@ WHERE id = $1 AND deleted_at IS NULL
 
 func getMultipartyContractByTenderID(ctx context.Context, q querier, tenderID uuid.UUID) (*domain.MultipartyContract, error) {
 	const query = `
-SELECT id, tender_id, status, content_hash, version, party_count, currency, created_at, updated_at, deleted_at
+SELECT id, tender_id, status, content_hash, version, party_count, currency, poster_user_id, created_at, updated_at, deleted_at
 FROM multi_party_contracts
 WHERE tender_id = $1 AND deleted_at IS NULL
 LIMIT 1
@@ -131,7 +131,7 @@ LIMIT 1
 
 func getMultipartyContractByIDForUpdate(ctx context.Context, q querier, id uuid.UUID) (*domain.MultipartyContract, error) {
 	const query = `
-SELECT id, tender_id, status, content_hash, version, party_count, currency, created_at, updated_at, deleted_at
+SELECT id, tender_id, status, content_hash, version, party_count, currency, poster_user_id, created_at, updated_at, deleted_at
 FROM multi_party_contracts
 WHERE id = $1 AND deleted_at IS NULL
 FOR UPDATE
@@ -166,7 +166,7 @@ func scanMultipartyContract(row rowScanner) (*domain.MultipartyContract, error) 
 	)
 
 	err := row.Scan(
-		&c.ID, &c.TenderID, &status, &c.ContentHash, &c.Version, &c.PartyCount, &c.Currency,
+		&c.ID, &c.TenderID, &status, &c.ContentHash, &c.Version, &c.PartyCount, &c.Currency, &c.PosterUserID,
 		&c.CreatedAt, &c.UpdatedAt, &c.DeletedAt,
 	)
 	if err != nil {

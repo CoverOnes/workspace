@@ -30,11 +30,14 @@ type MultipartyContract struct {
 	// PartyCount is frozen at SubmitForSignatures time (= count of ACTIVE parties when
 	// submit is called). The quorum check uses this frozen value — NOT a live COUNT(*) —
 	// so that a roster shrink after submit cannot manipulate the activation threshold.
-	PartyCount int        `json:"partyCount"`
-	Currency   *string    `json:"currency,omitempty"`
-	CreatedAt  time.Time  `json:"createdAt"`
-	UpdatedAt  time.Time  `json:"updatedAt"`
-	DeletedAt  *time.Time `json:"deletedAt,omitempty"`
+	PartyCount int     `json:"partyCount"`
+	Currency   *string `json:"currency,omitempty"`
+	// PosterUserID is the tender owner who may manage milestones (add/complete).
+	// Nullable: rows created before migration 000007 will have nil.
+	PosterUserID *uuid.UUID `json:"posterUserId,omitempty"`
+	CreatedAt    time.Time  `json:"createdAt"`
+	UpdatedAt    time.Time  `json:"updatedAt"`
+	DeletedAt    *time.Time `json:"deletedAt,omitempty"`
 }
 
 // MultipartyPartyStatus represents the status of a party within a multi-party contract.
