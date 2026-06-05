@@ -148,6 +148,7 @@ func run() error {
 	multipartyPartyStore := postgres.NewMultipartyPartyStore(pool)
 	multipartySignatureStore := postgres.NewMultipartySignatureStore(pool)
 	multipartyTxManager := postgres.NewMultipartyTxManager(pool)
+	addendumStore := postgres.NewAddendumStore(pool)
 	milestoneStore := postgres.NewMilestoneStore(pool)
 
 	// Service layer.
@@ -159,6 +160,7 @@ func run() error {
 		multipartyContractStore,
 		multipartyPartyStore,
 		multipartySignatureStore,
+		addendumStore,
 		multipartyTxManager,
 		publisher,
 	)

@@ -183,6 +183,57 @@ func (h *MultipartyHandler) Sign(c *gin.Context) {
 	httpx.OK(c, contract)
 }
 
+// UpdatePartyShareRequest is the PATCH /v1/multiparty-contracts/:id/parties/:partyId/share body.
+type UpdatePartyShareRequest struct {
+	ShareBps int `json:"shareBps"`
+}
+
+// UpdatePartyShare handles PATCH /v1/multiparty-contracts/:id/parties/:partyId/share.
+// Updates a party's share_bps on an ADDENDUM_PENDING contract.
+// Owner-only: caller must be the PosterUserID of the contract.
+func (h *MultipartyHandler) UpdatePartyShare(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+
+	contractID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid contract id")
+		return
+	}
+
+	partyID, err := uuid.Parse(c.Param("partyId"))
+	if err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid partyId")
+		return
+	}
+
+	var req UpdatePartyShareRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
+		return
+	}
+
+	rawUID := c.GetHeader("X-User-Id")
+
+	callerUserID, parseErr := uuid.Parse(rawUID)
+	if parseErr != nil {
+		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+		return
+	}
+
+	updated, svcErr := h.svc.UpdatePartyShare(c.Request.Context(), service.UpdatePartyShareInput{
+		ContractID:   contractID,
+		PartyID:      partyID,
+		CallerUserID: callerUserID,
+		NewShareBps:  req.ShareBps,
+	})
+	if svcErr != nil {
+		httpx.Err(c, svcErr)
+		return
+	}
+
+	httpx.OK(c, updated)
+}
+
 // GetDetail handles GET /v1/multiparty-contracts/:id.
 // Returns contract + roster + per-version signature progress.
 // Access is scoped to ACTIVE parties of the contract (non-party → 404).

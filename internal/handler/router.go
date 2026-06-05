@@ -87,6 +87,7 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 		mpAPI.GET("/:id", middleware.RequireTier(1), multipartyH.GetDetail)
 		mpAPI.POST("/:id/submit-for-signature", middleware.RequireTier(2), multipartyH.SubmitForSignatures)
 		mpAPI.POST("/:id/sign", middleware.RequireTier(2), multipartyH.Sign)
+		mpAPI.PATCH("/:id/parties/:partyId/share", middleware.RequireTier(2), multipartyH.UpdatePartyShare)
 
 		// Milestone endpoints — owner-only (Tier>=2, poster IDOR guard in service layer).
 		if cfg.MilestoneSvc != nil {

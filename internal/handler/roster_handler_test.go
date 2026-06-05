@@ -99,10 +99,11 @@ func startRosterTestDB(t *testing.T, ctx context.Context) *rosterTestEnv {
 	mpParties := postgres.NewMultipartyPartyStore(pool)
 	mpSigs := postgres.NewMultipartySignatureStore(pool)
 	mpTx := postgres.NewMultipartyTxManager(pool)
+	addendaStore := postgres.NewAddendumStore(pool)
 	msStore := postgres.NewMilestoneStore(pool)
 	pub := events.NewNoopPublisher()
 
-	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, mpTx, pub)
+	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, addendaStore, mpTx, pub)
 	milestoneSvc := service.NewMilestoneService(mpContracts, msStore, mpParties, pub)
 
 	contractStore := postgres.NewContractStore(pool)

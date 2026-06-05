@@ -118,10 +118,11 @@ func startMilestoneTestDB(t *testing.T, ctx context.Context) *milestoneTestEnv {
 	mpParties := postgres.NewMultipartyPartyStore(pool)
 	mpSigs := postgres.NewMultipartySignatureStore(pool)
 	mpTx := postgres.NewMultipartyTxManager(pool)
+	addendaStore := postgres.NewAddendumStore(pool)
 	msStore := postgres.NewMilestoneStore(pool)
 
 	pub := &recordingPublisher{}
-	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, mpTx, pub)
+	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, addendaStore, mpTx, pub)
 	milestoneSvc := service.NewMilestoneService(mpContracts, msStore, mpParties, pub)
 
 	return &milestoneTestEnv{

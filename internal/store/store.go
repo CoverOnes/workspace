@@ -84,12 +84,28 @@ type MultipartyPartyStore interface {
 	// Returns ErrNotParty if no ACTIVE row exists (the vendor is not a current member).
 	// Used by signTx to enforce party-membership authz before creating a signature.
 	GetActivePartyByVendor(ctx context.Context, contractID, vendorUserID uuid.UUID) (*domain.MultipartyContractParty, error)
+	// GetActivePartyByID returns the ACTIVE party row by its primary key.
+	// Returns ErrNotParty if no ACTIVE row exists.
+	GetActivePartyByID(ctx context.Context, partyID uuid.UUID) (*domain.MultipartyContractParty, error)
+	// UpdatePartyShare updates share_bps for an ACTIVE party row.
+	// Returns ErrNotParty if the party does not exist or is not ACTIVE.
+	UpdatePartyShare(ctx context.Context, contractID, partyID uuid.UUID, newShareBps int) (*domain.MultipartyContractParty, error)
 	// ListActiveByContract returns all ACTIVE parties for a contract.
 	ListActiveByContract(ctx context.Context, contractID uuid.UUID) ([]*domain.MultipartyContractParty, error)
 	// SumActiveBps returns the sum of share_bps for all ACTIVE parties of a contract.
 	SumActiveBps(ctx context.Context, contractID uuid.UUID) (int, error)
 	// CountActiveParties returns the count of ACTIVE parties for a contract.
 	CountActiveParties(ctx context.Context, contractID uuid.UUID) (int, error)
+}
+
+// AddendumStore defines persistence operations for contract addenda.
+// Addenda record each addendum event: which party was added, by whom, and which
+// version transition it represents. No FK — all IDs are soft references.
+type AddendumStore interface {
+	// Create inserts a new addendum row.
+	Create(ctx context.Context, a *domain.ContractAddendum) error
+	// ListByContract returns all addenda for a contract ordered by created_at ASC.
+	ListByContract(ctx context.Context, contractID uuid.UUID) ([]*domain.ContractAddendum, error)
 }
 
 // MultipartySignatureStore defines persistence operations for multi-party contract signatures.
@@ -105,6 +121,8 @@ type MultipartySignatureStore interface {
 
 // MultipartyTxManager runs a function inside a single Postgres transaction providing
 // transaction-scoped stores for the N-party quorum check (TOCTOU-safe).
+// The addenda AddendumStore is the 4th arg — callers that do not use it may ignore it
+// with `_ store.AddendumStore`.
 type MultipartyTxManager interface {
 	WithMultipartyTx(
 		ctx context.Context,
@@ -113,6 +131,7 @@ type MultipartyTxManager interface {
 			contracts MultipartyContractStore,
 			parties MultipartyPartyStore,
 			sigs MultipartySignatureStore,
+			addenda AddendumStore,
 		) error,
 	) error
 }
