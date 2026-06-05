@@ -29,6 +29,12 @@ type RouterConfig struct {
 	// gateway-origin identity signature. Empty == dev posture (verification
 	// disabled); config validation guarantees it is non-empty in non-dev.
 	GatewayHMACSecret string
+	// UserRateLimitPerMin is the per-authenticated-user token-bucket rate limit
+	// (requests per minute). 0 disables per-user limiting (IP limiter still runs).
+	UserRateLimitPerMin int
+	// UserRateLimitBurst is the token-bucket burst size. Must be > 0 when
+	// UserRateLimitPerMin > 0; config.validateUserRateLimit enforces this.
+	UserRateLimitBurst int
 }
 
 // NewRouter builds and returns the configured Gin engine.
@@ -120,6 +126,13 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	// passthrough, matching the gateway's dev signing-skip.
 	api.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret))
 	api.Use(middleware.RequireValidIdentity())
+	// Per-user rate limiter — mounted AFTER RequireValidIdentity so the identity
+	// is already in context and the limiter key is always gateway-verified.
+	// Disabled when UserRateLimitPerMin == 0 (IP limiter still applies above).
+	if cfg.UserRateLimitPerMin > 0 {
+		userRL := middleware.NewGeneralUserRateLimiter(cfg.UserRateLimitPerMin, cfg.UserRateLimitBurst)
+		api.Use(userRL.Handler())
+	}
 
 	// Contracts — Tier>=1 for reads, Tier>=2 for writes.
 	// NOTE: POST /v1/contracts is intentionally removed (M-2 fix). Contracts are

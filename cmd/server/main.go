@@ -178,6 +178,8 @@ func run() error {
 		Redis:                 redisClient,
 		ContractServiceToken:  cfg.ContractServiceToken,
 		GatewayHMACSecret:     cfg.GatewayHMACSecret,
+		UserRateLimitPerMin:   cfg.UserRateLimitPerMin,
+		UserRateLimitBurst:    cfg.UserRateLimitBurst,
 	})
 
 	srv := &http.Server{

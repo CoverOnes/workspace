@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/CoverOnes/workspace/internal/platform/httpx"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/time/rate"
@@ -21,6 +23,11 @@ const fallbackBurst = 10
 // fallbackLRUCap is the maximum number of unique keys tracked by the in-process
 // fallback limiter. Bounded LRU prevents memory-DoS from IP rotation attacks.
 const fallbackLRUCap = 100_000
+
+// userRateLRUCap is the maximum number of unique user IDs tracked by the
+// in-process per-user limiter. Bounding by LRU prevents memory exhaustion under
+// high account-rotation attacks.
+const userRateLRUCap = 100_000
 
 // RateLimiter is a Redis-backed fixed-window rate limiter with an in-process
 // token-bucket fallback that engages when Redis errors (fails safe, not open).
@@ -140,4 +147,96 @@ func (rl *RateLimiter) increment(ctx context.Context, key string) (int, error) {
 	}
 
 	return int(incr.Val()), nil
+}
+
+// GeneralUserRateLimiter is a per-authenticated-user in-process token-bucket
+// rate limiter. Key is derived from the verified identity set by
+// RequireValidIdentity (via IdentityFromCtx). When no verified identity is
+// present in context — which cannot happen on properly-wired routes since
+// RequireValidIdentity always runs before this middleware — the request is
+// passed through with a Warn log.
+//
+// Multi-pod caveat: this is an in-process limiter. Each pod maintains its own
+// bucket, so the effective per-user limit across N pods is N×limitPerMin. A
+// Redis sliding-window implementation should be added when accurate cross-pod
+// enforcement is required.
+type GeneralUserRateLimiter struct {
+	mu          sync.Mutex
+	buckets     *lru.Cache[string, *rate.Limiter]
+	r           rate.Limit
+	burst       int
+	limitPerMin int
+}
+
+// NewGeneralUserRateLimiter builds a per-authenticated-user rate limiter keyed
+// on the verified user UUID from IdentityFromCtx. limitPerMin is the sustained
+// request budget per user per minute; burst is the token-bucket burst size.
+// burst must be > 0; caller is responsible for validating this at config load.
+func NewGeneralUserRateLimiter(limitPerMin, burst int) *GeneralUserRateLimiter {
+	r := rate.Limit(float64(limitPerMin) / 60.0)
+
+	cache, err := lru.New[string, *rate.Limiter](userRateLRUCap)
+	if err != nil {
+		// lru.New only errors when cap <= 0, which cannot happen here.
+		panic(fmt.Sprintf("GeneralUserRateLimiter: unexpected lru.New error: %v", err))
+	}
+
+	return &GeneralUserRateLimiter{
+		buckets:     cache,
+		r:           r,
+		burst:       burst,
+		limitPerMin: limitPerMin,
+	}
+}
+
+func (l *GeneralUserRateLimiter) allow(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	lim, ok := l.buckets.Get(key)
+	if !ok {
+		lim = rate.NewLimiter(l.r, l.burst)
+		l.buckets.Add(key, lim)
+	}
+
+	return lim.Allow()
+}
+
+// Handler returns the Gin middleware function.
+// Deny path: over-limit returns 429 RATE_LIMITED with a Retry-After header.
+// Pass-through: if the verified identity is absent from context (should never
+// happen after RequireValidIdentity), a Warn is logged and the request is
+// passed through belt-and-suspenders style — RequireValidIdentity has already
+// rejected unauthenticated requests before this middleware runs.
+//
+// Security: identity is read exclusively via IdentityFromCtx, which returns
+// the uuid.UUID stored by RequireValidIdentity — never from a raw header.
+// This ensures the rate-limit key is always gateway-verified.
+func (l *GeneralUserRateLimiter) Handler() gin.HandlerFunc {
+	retryAfter := strconv.Itoa(int(60.0 / float64(l.limitPerMin)))
+
+	return func(c *gin.Context) {
+		identity, ok := IdentityFromCtx(c)
+		if !ok || identity.UserID == uuid.Nil {
+			slog.Warn(
+				"GeneralUserRateLimiter: no verified user identity in context; passing through",
+				"path", c.Request.URL.Path,
+			)
+			c.Next()
+
+			return
+		}
+
+		key := "workspace:rl:user:" + identity.UserID.String()
+
+		if !l.allow(key) {
+			c.Header("Retry-After", retryAfter)
+			c.Abort()
+			httpx.ErrCode(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests, please try again later")
+
+			return
+		}
+
+		c.Next()
+	}
 }
