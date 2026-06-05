@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
@@ -213,7 +214,10 @@ func (l *GeneralUserRateLimiter) allow(key string) bool {
 // the uuid.UUID stored by RequireValidIdentity — never from a raw header.
 // This ensures the rate-limit key is always gateway-verified.
 func (l *GeneralUserRateLimiter) Handler() gin.HandlerFunc {
-	retryAfter := strconv.Itoa(int(60.0 / float64(l.limitPerMin)))
+	// math.Ceil ensures Retry-After is at least 1 second for any limitPerMin value,
+	// including the default of 120 (60/120 = 0.5 → ceil → 1). Without Ceil, values
+	// > 60 req/min truncate to "0", telling clients to retry immediately (wrong).
+	retryAfter := strconv.Itoa(max(1, int(math.Ceil(60.0/float64(l.limitPerMin)))))
 
 	return func(c *gin.Context) {
 		identity, ok := IdentityFromCtx(c)

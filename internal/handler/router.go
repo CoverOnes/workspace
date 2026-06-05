@@ -78,6 +78,15 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	internal.Use(middleware.RequireServiceToken(cfg.ContractServiceToken))
 	internal.POST("/contracts", internalContractH.Create)
 
+	// Shared per-user rate limiter — constructed once so mpAPI and api groups share a
+	// single LRU/token-budget. Mounted AFTER RequireValidIdentity on each group so the
+	// identity is always gateway-verified before the limiter reads it.
+	// Disabled (nil) when UserRateLimitPerMin == 0 (IP limiter still applies above).
+	var userRL *middleware.GeneralUserRateLimiter
+	if cfg.UserRateLimitPerMin > 0 {
+		userRL = middleware.NewGeneralUserRateLimiter(cfg.UserRateLimitPerMin, cfg.UserRateLimitBurst)
+	}
+
 	// Multi-party routes (both S2S internal and authenticated public) share a single
 	// handler instance to avoid double-construction.
 	if cfg.MultipartyContractSvc != nil {
@@ -90,6 +99,11 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 		mpAPI := r.Group("/v1/multiparty-contracts")
 		mpAPI.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret))
 		mpAPI.Use(middleware.RequireValidIdentity())
+		// Apply the shared per-user limiter to mpAPI as well so that
+		// /v1/multiparty-contracts/* cannot bypass the per-user budget.
+		if userRL != nil {
+			mpAPI.Use(userRL.Handler())
+		}
 		mpAPI.GET("/:id", middleware.RequireTier(1), multipartyH.GetDetail)
 		mpAPI.POST("/:id/submit-for-signature", middleware.RequireTier(2), multipartyH.SubmitForSignatures)
 		mpAPI.POST("/:id/sign", middleware.RequireTier(2), multipartyH.Sign)
@@ -126,11 +140,10 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	// passthrough, matching the gateway's dev signing-skip.
 	api.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret))
 	api.Use(middleware.RequireValidIdentity())
-	// Per-user rate limiter — mounted AFTER RequireValidIdentity so the identity
-	// is already in context and the limiter key is always gateway-verified.
+	// Apply the shared per-user limiter — mounted AFTER RequireValidIdentity so the
+	// identity is already in context and the limiter key is always gateway-verified.
 	// Disabled when UserRateLimitPerMin == 0 (IP limiter still applies above).
-	if cfg.UserRateLimitPerMin > 0 {
-		userRL := middleware.NewGeneralUserRateLimiter(cfg.UserRateLimitPerMin, cfg.UserRateLimitBurst)
+	if userRL != nil {
 		api.Use(userRL.Handler())
 	}
 

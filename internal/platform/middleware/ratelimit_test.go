@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/CoverOnes/workspace/internal/platform/middleware"
@@ -57,28 +58,54 @@ func TestGeneralUserRateLimiter_AllowWithinBudget(t *testing.T) {
 }
 
 func TestGeneralUserRateLimiter_DenyWhenOverBudget(t *testing.T) {
-	// burst=1: only 1 token initially; the second request finds the bucket
-	// empty and must receive 429 RATE_LIMITED with a Retry-After header.
-	userRL := middleware.NewGeneralUserRateLimiter(60, 1)
-	r := newRLTestRouter(userRL)
+	t.Parallel()
 
-	uid := uuid.New().String()
-
-	w1 := doRLRequest(r, uid)
-	require.Equal(t, http.StatusOK, w1.Code, "first request should be allowed")
-
-	w2 := doRLRequest(r, uid)
-	assert.Equal(t, http.StatusTooManyRequests, w2.Code, "second request must be denied after burst exhausted")
-	assert.NotEmpty(t, w2.Header().Get("Retry-After"), "429 response must include Retry-After header")
-
-	// Response envelope: {"error": {"code": "RATE_LIMITED", "message": "..."}}
-	var body struct {
-		Error struct {
-			Code string `json:"code"`
-		} `json:"error"`
+	tests := []struct {
+		name        string
+		limitPerMin int
+		burst       int
+	}{
+		// burst=1: only 1 token initially; the second request finds the bucket empty.
+		{"perMin=60 burst=1", 60, 1},
+		// Default config (perMin=120): with the ceil fix, Retry-After must be "1" not "0".
+		{"perMin=120 burst=1 (default rate, zero-truncation regression)", 120, 1},
 	}
-	require.NoError(t, json.Unmarshal(w2.Body.Bytes(), &body))
-	assert.Equal(t, "RATE_LIMITED", body.Error.Code, "error code must be RATE_LIMITED")
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			userRL := middleware.NewGeneralUserRateLimiter(tc.limitPerMin, tc.burst)
+			r := newRLTestRouter(userRL)
+
+			uid := uuid.New().String()
+
+			w1 := doRLRequest(r, uid)
+			require.Equal(t, http.StatusOK, w1.Code, "first request should be allowed")
+
+			w2 := doRLRequest(r, uid)
+			assert.Equal(t, http.StatusTooManyRequests, w2.Code, "second request must be denied after burst exhausted")
+
+			retryAfterStr := w2.Header().Get("Retry-After")
+			assert.NotEmpty(t, retryAfterStr, "429 response must include Retry-After header")
+
+			// Retry-After MUST be >= 1 — "0" would tell clients to retry immediately,
+			// which defeats the purpose of the header and was the pre-fix bug for
+			// any limitPerMin > 60 (including the default 120).
+			retryAfterVal, parseErr := strconv.Atoi(retryAfterStr)
+			require.NoError(t, parseErr, "Retry-After header must be a valid integer, got %q", retryAfterStr)
+			assert.GreaterOrEqual(t, retryAfterVal, 1, "Retry-After must be >= 1 second (got %d for limitPerMin=%d)", retryAfterVal, tc.limitPerMin)
+
+			// Response envelope: {"error": {"code": "RATE_LIMITED", "message": "..."}}
+			var body struct {
+				Error struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			require.NoError(t, json.Unmarshal(w2.Body.Bytes(), &body))
+			assert.Equal(t, "RATE_LIMITED", body.Error.Code, "error code must be RATE_LIMITED")
+		})
+	}
 }
 
 func TestGeneralUserRateLimiter_IndependentBucketsPerUser(t *testing.T) {

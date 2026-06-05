@@ -248,13 +248,24 @@ func (c *Config) validateGatewayHMAC() []string {
 	return errs
 }
 
+// maxUserRateLimitPerMin is a sanity cap on per-user rate limits. Values above
+// this are almost certainly misconfiguration (e.g. accidentally supplying a
+// per-second value or an unbounded integer). The IP limiter already runs at
+// 120 req/min; per-user limits above 100 000 are meaningless in practice.
+const maxUserRateLimitPerMin = 100_000
+
+// maxUserRateLimitBurst mirrors the cap on the sustained rate.
+const maxUserRateLimitBurst = 100_000
+
 // validateUserRateLimit validates per-user rate-limit configuration and returns
 // any error messages (empty slice = valid).
 //
 // Rules:
 //   - UserRateLimitPerMin must be >= 0 (0 disables per-user limiting; IP limiter still runs).
+//   - UserRateLimitPerMin must be <= 100 000 (sanity cap; prevents accidental bypass).
 //   - UserRateLimitBurst must be > 0 when UserRateLimitPerMin > 0, because a zero-burst
 //     token bucket would deny every request immediately.
+//   - UserRateLimitBurst must be <= 100 000 (matching sanity cap).
 //   - UserRateLimitBurst is unchecked when UserRateLimitPerMin == 0 (limiter disabled).
 func (c *Config) validateUserRateLimit() []string {
 	var errs []string
@@ -263,8 +274,16 @@ func (c *Config) validateUserRateLimit() []string {
 		errs = append(errs, "WORKSPACE_USER_RATE_LIMIT_PER_MIN must be >= 0 (0 = disabled)")
 	}
 
+	if c.UserRateLimitPerMin > maxUserRateLimitPerMin {
+		errs = append(errs, fmt.Sprintf("WORKSPACE_USER_RATE_LIMIT_PER_MIN must be <= %d", maxUserRateLimitPerMin))
+	}
+
 	if c.UserRateLimitPerMin > 0 && c.UserRateLimitBurst <= 0 {
 		errs = append(errs, "WORKSPACE_USER_RATE_LIMIT_BURST must be > 0 when WORKSPACE_USER_RATE_LIMIT_PER_MIN > 0")
+	}
+
+	if c.UserRateLimitPerMin > 0 && c.UserRateLimitBurst > maxUserRateLimitBurst {
+		errs = append(errs, fmt.Sprintf("WORKSPACE_USER_RATE_LIMIT_BURST must be <= %d", maxUserRateLimitBurst))
 	}
 
 	return errs
