@@ -13,6 +13,8 @@ const (
 	channelContractActivated           = "workspace.contract_activated"
 	channelMultipartyContractActivated = "workspace.contract_activated"
 	channelContractCompleted           = "workspace.contract_completed"
+	channelContractAddendumCreated     = "workspace.contract_addendum_created"
+	channelContractReSigned            = "workspace.contract_re_signed"
 )
 
 // RedisPublisher publishes events to Redis pub/sub channels.
@@ -69,6 +71,37 @@ func (p *RedisPublisher) PublishMultipartyContractCompleted(ctx context.Context,
 
 	if err := p.rdb.Publish(ctx, channelContractCompleted, payload).Err(); err != nil {
 		return fmt.Errorf("redis publish %s: %w", channelContractCompleted, err)
+	}
+
+	return nil
+}
+
+// PublishMultipartyContractAddendumCreated serializes the event and publishes it to Redis.
+func (p *RedisPublisher) PublishMultipartyContractAddendumCreated(
+	ctx context.Context,
+	evt *domain.MultipartyContractAddendumCreatedEvent,
+) error {
+	payload, err := json.Marshal(evt)
+	if err != nil {
+		return fmt.Errorf("marshal contract_addendum_created event: %w", err)
+	}
+
+	if err := p.rdb.Publish(ctx, channelContractAddendumCreated, payload).Err(); err != nil {
+		return fmt.Errorf("redis publish %s: %w", channelContractAddendumCreated, err)
+	}
+
+	return nil
+}
+
+// PublishMultipartyContractReSigned serializes the event and publishes it to Redis.
+func (p *RedisPublisher) PublishMultipartyContractReSigned(ctx context.Context, evt *domain.MultipartyContractReSignedEvent) error {
+	payload, err := json.Marshal(evt)
+	if err != nil {
+		return fmt.Errorf("marshal contract_re_signed event: %w", err)
+	}
+
+	if err := p.rdb.Publish(ctx, channelContractReSigned, payload).Err(); err != nil {
+		return fmt.Errorf("redis publish %s: %w", channelContractReSigned, err)
 	}
 
 	return nil

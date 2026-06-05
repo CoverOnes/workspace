@@ -165,10 +165,23 @@ func (s *MilestoneService) CompleteMilestone(ctx context.Context, in CompleteMil
 // This is the S2S roster endpoint consumed by payment at settlement-plan creation.
 // No owner check — this is called by payment service using X-Service-Token, not end users.
 // Returns ErrMultipartyContractNotFound (mapped to 404) if the contract does not exist.
+//
+// Status guard: only ACTIVE and COMPLETED contracts have a stable, fully-allocated
+// roster (Σ share_bps == 10000, no mid-reallocation). ADDENDUM_PENDING, PENDING_SIGNATURES,
+// DRAFT, and CANCELED are transient or pre-activation states where the roster may be
+// inconsistent. Payment must only settle against a finalized roster.
 func (s *MilestoneService) GetPartyRoster(ctx context.Context, contractID uuid.UUID) ([]*domain.MultipartyContractParty, error) {
 	// Existence check: 404 on miss (phantoms must not return a successful empty roster).
-	if _, err := s.contracts.GetByID(ctx, contractID); err != nil {
+	contract, err := s.contracts.GetByID(ctx, contractID)
+	if err != nil {
 		return nil, err
+	}
+
+	// Status guard: reject transient states where shares may be mid-reallocation.
+	if contract.Status != domain.MultipartyContractStatusActive &&
+		contract.Status != domain.MultipartyContractStatusCompleted {
+		return nil, fmt.Errorf("%w: roster not stable while contract is %s",
+			domain.ErrInvalidTransition, contract.Status)
 	}
 
 	parties, err := s.parties.ListActiveByContract(ctx, contractID)

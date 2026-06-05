@@ -25,4 +25,14 @@ type Publisher interface {
 	// when a multiparty contract milestone is marked COMPLETED.
 	// Best-effort: callers MUST NOT roll back the milestone completion on publish failure.
 	PublishMultipartyContractCompleted(ctx context.Context, evt *domain.MultipartyContractCompletedEvent) error
+
+	// PublishMultipartyContractAddendumCreated sends the workspace.contract_addendum_created
+	// event when a new party is added to an ACTIVE contract (ADDENDUM_PENDING transition).
+	// Best-effort: callers MUST NOT roll back on publish failure.
+	PublishMultipartyContractAddendumCreated(ctx context.Context, evt *domain.MultipartyContractAddendumCreatedEvent) error
+
+	// PublishMultipartyContractReSigned sends the workspace.contract_re_signed event
+	// when all ACTIVE parties re-sign after an addendum and the contract returns to ACTIVE.
+	// Best-effort: callers MUST NOT roll back on publish failure.
+	PublishMultipartyContractReSigned(ctx context.Context, evt *domain.MultipartyContractReSignedEvent) error
 }

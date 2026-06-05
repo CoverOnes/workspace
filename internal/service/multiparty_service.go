@@ -20,13 +20,11 @@ import (
 // Parties are the approved vendor collaborators who hold a role and a share_bps allocation.
 // The owner acts as initiator / governance (owner-only governance per Phase 0 locked decisions).
 // This is documented here as the canonical decision record.
-//
-// TODO Phase 4: when adding a party to an ACTIVE contract, bump version and initiate
-// addendum re-sign so all existing parties must re-sign the new roster.
 type MultipartyContractService struct {
 	contracts store.MultipartyContractStore
 	parties   store.MultipartyPartyStore
 	sigs      store.MultipartySignatureStore
+	addenda   store.AddendumStore
 	tx        store.MultipartyTxManager
 	publisher events.Publisher
 }
@@ -36,6 +34,7 @@ func NewMultipartyContractService(
 	contracts store.MultipartyContractStore,
 	parties store.MultipartyPartyStore,
 	sigs store.MultipartySignatureStore,
+	addenda store.AddendumStore,
 	tx store.MultipartyTxManager,
 	publisher events.Publisher,
 ) *MultipartyContractService {
@@ -43,6 +42,7 @@ func NewMultipartyContractService(
 		contracts: contracts,
 		parties:   parties,
 		sigs:      sigs,
+		addenda:   addenda,
 		tx:        tx,
 		publisher: publisher,
 	}
@@ -64,8 +64,9 @@ type CreateOrAddPartyInput struct {
 //   - If no live contract exists for TenderID, create one and add the party.
 //   - If a live DRAFT contract already exists, add the party to it (idempotent on
 //     vendor_user_id: returns ErrConflict if the vendor already has an ACTIVE row).
-//   - If the contract is not in DRAFT status, returns ErrInvalidTransition — adding
-//     parties to non-DRAFT contracts requires the addendum flow (TODO Phase 4).
+//   - If the contract is ACTIVE, triggers the addendum flow (Phase 4).
+//   - If the contract is in PENDING_SIGNATURES / ADDENDUM_PENDING / COMPLETED / CANCELED,
+//     returns ErrInvalidTransition.
 //
 // Returns the contract and the new party row.
 func (s *MultipartyContractService) CreateOrAddParty(
@@ -81,15 +82,27 @@ func (s *MultipartyContractService) CreateOrAddParty(
 		return nil, nil, err
 	}
 
-	// Gate: parties can only be added to DRAFT contracts.
-	// Adding to ACTIVE/PENDING_SIGNATURES triggers addendum (TODO Phase 4).
-	if contract.Status != domain.MultipartyContractStatusDraft {
+	switch contract.Status {
+	case domain.MultipartyContractStatusDraft:
+		return s.addPartyToDraft(ctx, contract, in)
+
+	case domain.MultipartyContractStatusActive:
+		return s.addPartyViaAddendum(ctx, contract, in)
+
+	default:
 		return nil, nil, fmt.Errorf(
-			"%w: parties can only be added to DRAFT contracts (addendum flow TODO Phase 4)",
-			domain.ErrInvalidTransition,
+			"%w: cannot add party to contract in status %s",
+			domain.ErrInvalidTransition, contract.Status,
 		)
 	}
+}
 
+// addPartyToDraft adds a party directly to a DRAFT contract (original flow).
+func (s *MultipartyContractService) addPartyToDraft(
+	ctx context.Context,
+	contract *domain.MultipartyContract,
+	in *CreateOrAddPartyInput,
+) (*domain.MultipartyContract, *domain.MultipartyContractParty, error) {
 	now := time.Now().UTC()
 	party := &domain.MultipartyContractParty{
 		ID:           uuid.New(),
@@ -107,6 +120,148 @@ func (s *MultipartyContractService) CreateOrAddParty(
 	}
 
 	return contract, party, nil
+}
+
+// addPartyViaAddendum adds a new party to an ACTIVE contract using the Phase-4
+// addendum flow (Model B: add-then-resubmit + re-sign).
+//
+// Flow:
+//  1. Lock contract FOR UPDATE, re-check status == ACTIVE under lock.
+//  2. Verify caller is the owner (PosterUserID).
+//  3. Insert new party at 0 bps placeholder (23505 → idempotent 409).
+//  4. Bump version, recompute digest over ALL ACTIVE parties incl. new one.
+//  5. Transition contract: ACTIVE → ADDENDUM_PENDING, update version + digest + party_count.
+//  6. Insert contract_addenda row.
+//  7. Post-tx publish workspace.contract_addendum_created (best-effort).
+func (s *MultipartyContractService) addPartyViaAddendum(
+	ctx context.Context,
+	contract *domain.MultipartyContract,
+	in *CreateOrAddPartyInput,
+) (*domain.MultipartyContract, *domain.MultipartyContractParty, error) {
+	// Owner-only gate: PosterUserID must be set and match the contract's owner.
+	if in.PosterUserID == nil || contract.PosterUserID == nil || *in.PosterUserID != *contract.PosterUserID {
+		return nil, nil, fmt.Errorf("%w: only the contract owner may add a party via addendum", domain.ErrForbidden)
+	}
+
+	var (
+		resultContract *domain.MultipartyContract
+		resultParty    *domain.MultipartyContractParty
+		addendum       *domain.ContractAddendum
+	)
+
+	txErr := s.tx.WithMultipartyTx(ctx, func(
+		txCtx context.Context,
+		txContracts store.MultipartyContractStore,
+		txParties store.MultipartyPartyStore,
+		_ store.MultipartySignatureStore,
+		txAddenda store.AddendumStore,
+	) error {
+		// Re-fetch under FOR UPDATE lock.
+		c, err := txContracts.GetByIDForUpdate(txCtx, contract.ID)
+		if err != nil {
+			return err
+		}
+
+		// Re-check status under lock (concurrent addendum guard).
+		if c.Status != domain.MultipartyContractStatusActive {
+			return fmt.Errorf("%w: contract is no longer ACTIVE (concurrent addendum?)", domain.ErrInvalidTransition)
+		}
+
+		// Defense-in-depth owner check on the LOCKED row (M3 hardening).
+		// in.PosterUserID is guaranteed non-nil here (pre-lock guard on line 142).
+		// Re-checking against c (the DB-authoritative locked row) closes the TOCTOU window
+		// on owner identity: a row-level change between the pre-fetch and the lock cannot
+		// sneak through.
+		if err := assertLockedOwner(c, *in.PosterUserID); err != nil {
+			return err
+		}
+
+		now := time.Now().UTC()
+		newParty := &domain.MultipartyContractParty{
+			ID:           uuid.New(),
+			ContractID:   c.ID,
+			VendorUserID: in.VendorUserID,
+			RoleID:       in.RoleID,
+			ShareBps:     0, // placeholder; owner updates shares via PATCH before re-submit
+			Status:       domain.MultipartyPartyStatusActive,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}
+
+		if addErr := txParties.AddParty(txCtx, newParty); addErr != nil {
+			return fmt.Errorf("add party via addendum: %w", addErr)
+		}
+
+		// Build the new version's roster: all ACTIVE parties incl. the new one.
+		activeParties, listErr := txParties.ListActiveByContract(txCtx, c.ID)
+		if listErr != nil {
+			return fmt.Errorf("list active parties for addendum digest: %w", listErr)
+		}
+
+		roster := make([]domain.MultipartyRosterEntry, len(activeParties))
+		for i, p := range activeParties {
+			roster[i] = domain.MultipartyRosterEntry{
+				VendorUserID: p.VendorUserID,
+				ShareBps:     p.ShareBps,
+			}
+		}
+
+		currency := ""
+		if c.Currency != nil {
+			currency = *c.Currency
+		}
+
+		fromVersion := c.Version
+		newVersion := c.Version + 1
+
+		c.ContentHash = domain.CanonicalMultipartyDigest(c.TenderID, newVersion, currency, roster)
+		c.Status = domain.MultipartyContractStatusAddendumPending
+		c.Version = newVersion
+		c.PartyCount = len(activeParties)
+
+		if updateErr := txContracts.Update(txCtx, c); updateErr != nil {
+			return fmt.Errorf("update contract to ADDENDUM_PENDING: %w", updateErr)
+		}
+
+		triggeredBy := *in.PosterUserID
+		a := &domain.ContractAddendum{
+			ID:              uuid.New(),
+			ContractID:      c.ID,
+			FromVersion:     fromVersion,
+			ToVersion:       newVersion,
+			NewPartyID:      newParty.ID,
+			NewVendorUserID: in.VendorUserID,
+			TriggeredBy:     triggeredBy,
+			CreatedAt:       now,
+		}
+
+		if addendumErr := txAddenda.Create(txCtx, a); addendumErr != nil {
+			return fmt.Errorf("create addendum record: %w", addendumErr)
+		}
+
+		resultContract = c
+		resultParty = newParty
+		addendum = a
+
+		return nil
+	})
+
+	if txErr != nil {
+		return nil, nil, txErr
+	}
+
+	// Post-tx publish (best-effort, detached goroutine with independent context).
+	// context.Background() is intentional: the request context is canceled when the
+	// HTTP handler returns; the publish goroutine must outlive the request.
+	capturedContract := resultContract
+	capturedAddendum := addendum
+	capturedVendor := in.VendorUserID
+	//nolint:contextcheck,gosec // intentional: goroutine must outlive the request context; G118 is the design intent
+	go func() {
+		s.publishAddendumCreated(context.Background(), capturedContract, capturedAddendum, capturedVendor)
+	}()
+
+	return resultContract, resultParty, nil
 }
 
 // getOrCreateContract fetches the live contract for a tender, or creates a new DRAFT.
@@ -154,7 +309,7 @@ func (s *MultipartyContractService) getOrCreateContract(
 	return contract, nil
 }
 
-// SubmitForSignatures transitions a DRAFT contract to PENDING_SIGNATURES.
+// SubmitForSignatures transitions a DRAFT or ADDENDUM_PENDING contract to PENDING_SIGNATURES.
 // Hard gate: Σ(ACTIVE parties' share_bps) MUST equal exactly 10000.
 // Runs inside a transaction with FOR UPDATE to prevent concurrent lost-updates.
 // Freezes the version's canonical digest (stored as content_hash).
@@ -169,6 +324,7 @@ func (s *MultipartyContractService) SubmitForSignatures(
 		txContracts store.MultipartyContractStore,
 		txParties store.MultipartyPartyStore,
 		_ store.MultipartySignatureStore,
+		_ store.AddendumStore,
 	) error {
 		return s.submitForSignaturesTx(ctx, txContracts, txParties, contractID, &result)
 	})
@@ -193,7 +349,7 @@ func (s *MultipartyContractService) submitForSignaturesTx(
 	}
 
 	if !domain.ValidMultipartyContractTransition(c.Status, domain.MultipartyContractStatusPendingSignatures) {
-		return fmt.Errorf("%w: contract must be in DRAFT status to submit for signatures", domain.ErrInvalidTransition)
+		return fmt.Errorf("%w: contract must be in DRAFT or ADDENDUM_PENDING status to submit for signatures", domain.ErrInvalidTransition)
 	}
 
 	// Hard gate: Σ of ACTIVE party share_bps must equal exactly 10000.
@@ -251,27 +407,31 @@ type SignInput struct {
 }
 
 // Sign records a party's signature. Inside one tx (SELECT FOR UPDATE):
-//   - Validates contract is PENDING_SIGNATURES.
+//   - Validates contract is PENDING_SIGNATURES or ADDENDUM_PENDING.
 //   - Validates signed_content_hash == current digest.
 //   - Validates version == contract.Version (rejects stale-version signatures).
 //   - Inserts the signature row (23505 -> ErrAlreadySigned).
 //   - Counts signatures for this version AND counts ACTIVE parties in the same tx.
-//   - When signatures == ACTIVE parties -> transitions to ACTIVE, publishes event.
+//   - When signatures == ACTIVE parties -> transitions to ACTIVE, publishes appropriate event.
 //
 // TOCTOU-safe: SELECT FOR UPDATE on the contract row serializes all concurrent signers.
 // Exactly-once activation: the UPDATE to ACTIVE is only executed once (the first tx that
 // finds count==parties); subsequent concurrent signers land on a locked row that is already
 // ACTIVE and the transition guard rejects them.
 func (s *MultipartyContractService) Sign(ctx context.Context, in SignInput) (*domain.MultipartyContract, error) {
-	var result *domain.MultipartyContract
+	var (
+		result        *domain.MultipartyContract
+		preSignStatus domain.MultipartyContractStatus
+	)
 
 	txErr := s.tx.WithMultipartyTx(ctx, func(
 		ctx context.Context,
 		txContracts store.MultipartyContractStore,
 		txParties store.MultipartyPartyStore,
 		txSigs store.MultipartySignatureStore,
+		_ store.AddendumStore,
 	) error {
-		return s.signTx(ctx, txContracts, txParties, txSigs, in, &result)
+		return s.signTx(ctx, txContracts, txParties, txSigs, in, &result, &preSignStatus)
 	})
 
 	if txErr != nil {
@@ -279,8 +439,20 @@ func (s *MultipartyContractService) Sign(ctx context.Context, in SignInput) (*do
 	}
 
 	// Best-effort event publish after tx commit.
+	// context.Background() is intentional: the request context is canceled when the
+	// HTTP handler returns; the publish goroutine must outlive the request.
 	if result != nil && result.Status == domain.MultipartyContractStatusActive {
-		s.publishActivated(ctx, result)
+		capturedResult := result
+		capturedStatus := preSignStatus
+
+		//nolint:contextcheck,gosec // intentional: goroutine must outlive the request context; G118 is the design intent
+		go func() {
+			if capturedStatus == domain.MultipartyContractStatusAddendumPending {
+				s.publishReSigned(context.Background(), capturedResult)
+			} else {
+				s.publishActivated(context.Background(), capturedResult)
+			}
+		}()
 	}
 
 	return result, nil
@@ -293,6 +465,7 @@ func (s *MultipartyContractService) signTx(
 	txSigs store.MultipartySignatureStore,
 	in SignInput,
 	result **domain.MultipartyContract,
+	preSignStatus *domain.MultipartyContractStatus,
 ) error {
 	// FOR UPDATE lock: serializes all concurrent sign calls on the same contract.
 	c, err := txContracts.GetByIDForUpdate(ctx, in.ContractID)
@@ -300,9 +473,22 @@ func (s *MultipartyContractService) signTx(
 		return err
 	}
 
-	if c.Status != domain.MultipartyContractStatusPendingSignatures {
-		return fmt.Errorf("%w: contract must be in PENDING_SIGNATURES state to sign", domain.ErrInvalidTransition)
+	// Accept signing in both PENDING_SIGNATURES and ADDENDUM_PENDING states.
+	if c.Status != domain.MultipartyContractStatusPendingSignatures &&
+		c.Status != domain.MultipartyContractStatusAddendumPending {
+		return fmt.Errorf("%w: contract must be in PENDING_SIGNATURES or ADDENDUM_PENDING state to sign", domain.ErrInvalidTransition)
 	}
+
+	// Invariant guard: a submitted contract must have at least one party. PartyCount==0
+	// means SubmitForSignatures was called on an empty roster — the quorum check below
+	// (sigCount == c.PartyCount) would never fire, leaving the contract permanently stuck
+	// in PENDING_SIGNATURES. Reject early so the caller gets a clear error.
+	if c.PartyCount == 0 {
+		return fmt.Errorf("%w: contract has no parties; cannot accept signatures", domain.ErrInvalidTransition)
+	}
+
+	// Capture pre-sign status so the post-tx publisher can choose the right event.
+	*preSignStatus = c.Status
 
 	// Reject stale-version signatures (version must match current contract version).
 	if in.Version != c.Version {
@@ -401,6 +587,47 @@ func (s *MultipartyContractService) publishActivated(ctx context.Context, contra
 	}
 }
 
+func (s *MultipartyContractService) publishAddendumCreated(
+	ctx context.Context,
+	contract *domain.MultipartyContract,
+	addendum *domain.ContractAddendum,
+	newVendorUserID uuid.UUID,
+) {
+	evt := &domain.MultipartyContractAddendumCreatedEvent{
+		EventID:    uuid.New(),
+		OccurredAt: time.Now().UTC(),
+		Version:    1,
+	}
+	evt.Data.ContractID = contract.ID
+	evt.Data.TenderID = contract.TenderID
+	evt.Data.FromVersion = addendum.FromVersion
+	evt.Data.ToVersion = addendum.ToVersion
+	evt.Data.NewVendorUserID = newVendorUserID
+	evt.Data.PartyCount = contract.PartyCount
+
+	if pubErr := s.publisher.PublishMultipartyContractAddendumCreated(ctx, evt); pubErr != nil {
+		slog.Warn("publish multiparty contract_addendum_created event failed",
+			"contract_id", contract.ID, "err", pubErr)
+	}
+}
+
+func (s *MultipartyContractService) publishReSigned(ctx context.Context, contract *domain.MultipartyContract) {
+	evt := &domain.MultipartyContractReSignedEvent{
+		EventID:    uuid.New(),
+		OccurredAt: time.Now().UTC(),
+		Version:    1,
+	}
+	evt.Data.ContractID = contract.ID
+	evt.Data.TenderID = contract.TenderID
+	evt.Data.NewVersion = contract.Version
+	evt.Data.PartyCount = contract.PartyCount
+
+	if pubErr := s.publisher.PublishMultipartyContractReSigned(ctx, evt); pubErr != nil {
+		slog.Warn("publish multiparty contract_re_signed event failed",
+			"contract_id", contract.ID, "err", pubErr)
+	}
+}
+
 // ContractDetail carries the full contract read model for the GET endpoint.
 type ContractDetail struct {
 	Contract       *domain.MultipartyContract
@@ -457,6 +684,89 @@ func (s *MultipartyContractService) GetDetail(ctx context.Context, contractID, c
 		ContentHash:    c.ContentHash,
 		CurrentVersion: c.Version,
 	}, nil
+}
+
+// UpdatePartyShareInput carries input for updating a party's share_bps.
+type UpdatePartyShareInput struct {
+	ContractID   uuid.UUID
+	PartyID      uuid.UUID
+	CallerUserID uuid.UUID
+	NewShareBps  int
+}
+
+// UpdatePartyShare updates a party's share_bps allocation on an ADDENDUM_PENDING contract.
+// Rules:
+//   - Contract must be ADDENDUM_PENDING.
+//   - Caller must be the contract owner (PosterUserID).
+//   - newShareBps must be in [0, 10000].
+//   - Does NOT recompute content_hash (that happens at SubmitForSignatures).
+//
+// TOCTOU-safe: the status check and the share update execute inside a single transaction
+// with SELECT FOR UPDATE on the contract row. A concurrent SubmitForSignatures cannot
+// transition the contract to PENDING_SIGNATURES between the check and the write.
+//
+// Returns the updated party row.
+func (s *MultipartyContractService) UpdatePartyShare(
+	ctx context.Context,
+	in UpdatePartyShareInput,
+) (*domain.MultipartyContractParty, error) {
+	if err := validateShareBps(in.NewShareBps); err != nil {
+		return nil, err
+	}
+
+	var updated *domain.MultipartyContractParty
+
+	txErr := s.tx.WithMultipartyTx(ctx, func(
+		txCtx context.Context,
+		txContracts store.MultipartyContractStore,
+		txParties store.MultipartyPartyStore,
+		_ store.MultipartySignatureStore,
+		_ store.AddendumStore,
+	) error {
+		// FOR UPDATE lock: prevents a concurrent SubmitForSignatures from freezing
+		// the digest between our status check and the share write.
+		c, err := txContracts.GetByIDForUpdate(txCtx, in.ContractID)
+		if err != nil {
+			return err
+		}
+
+		// Re-check status under the lock.
+		if c.Status != domain.MultipartyContractStatusAddendumPending {
+			return fmt.Errorf("%w: UpdatePartyShare requires ADDENDUM_PENDING status, got %s",
+				domain.ErrInvalidTransition, c.Status)
+		}
+
+		// Owner-only gate — checked on the locked row.
+		if c.PosterUserID == nil || in.CallerUserID != *c.PosterUserID {
+			return fmt.Errorf("%w: only the contract owner may update party shares", domain.ErrForbidden)
+		}
+
+		result, err := txParties.UpdatePartyShare(txCtx, in.ContractID, in.PartyID, in.NewShareBps)
+		if err != nil {
+			return err
+		}
+
+		updated = result
+
+		return nil
+	})
+
+	if txErr != nil {
+		return nil, txErr
+	}
+
+	return updated, nil
+}
+
+// assertLockedOwner checks that the DB-authoritative locked contract row has a PosterUserID
+// that matches callerID. Used inside transactions after GetByIDForUpdate to close the TOCTOU
+// window between the pre-lock owner check and the locked row read (M3 hardening).
+func assertLockedOwner(c *domain.MultipartyContract, callerID uuid.UUID) error {
+	if c.PosterUserID == nil || *c.PosterUserID != callerID {
+		return fmt.Errorf("%w: only the contract owner may perform this operation (locked row check)", domain.ErrForbidden)
+	}
+
+	return nil
 }
 
 // validateShareBps validates that share_bps is in [0, 10000].

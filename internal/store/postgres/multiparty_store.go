@@ -140,6 +140,10 @@ FOR UPDATE
 	return scanMultipartyContract(q.QueryRow(ctx, query, id))
 }
 
+// updateMultipartyContract persists mutable contract fields: status, content_hash, version,
+// party_count, currency, and updated_at. poster_user_id is intentionally excluded — it is
+// set at creation time only and is immutable thereafter (the service layer enforces ownership
+// by comparing callers against the stored value; the store never overwrites it).
 func updateMultipartyContract(ctx context.Context, q querier, c *domain.MultipartyContract) error {
 	const query = `
 UPDATE multi_party_contracts
@@ -209,6 +213,16 @@ func (s *txMultipartyPartyStore) GetActivePartyByVendor(
 	return getActiveMultipartyPartyByVendor(ctx, s.tx, contractID, vendorUserID)
 }
 
+func (s *txMultipartyPartyStore) GetActivePartyByID(ctx context.Context, partyID uuid.UUID) (*domain.MultipartyContractParty, error) {
+	return getActiveMultipartyPartyByID(ctx, s.tx, partyID)
+}
+
+func (s *txMultipartyPartyStore) UpdatePartyShare(
+	ctx context.Context, contractID, partyID uuid.UUID, newShareBps int,
+) (*domain.MultipartyContractParty, error) {
+	return updateMultipartyPartyShare(ctx, s.tx, contractID, partyID, newShareBps)
+}
+
 func (s *txMultipartyPartyStore) ListActiveByContract(
 	ctx context.Context,
 	contractID uuid.UUID,
@@ -234,6 +248,18 @@ func (s *MultipartyPartyStore) GetActivePartyByVendor(
 	ctx context.Context, contractID, vendorUserID uuid.UUID,
 ) (*domain.MultipartyContractParty, error) {
 	return getActiveMultipartyPartyByVendor(ctx, s.q, contractID, vendorUserID)
+}
+
+// GetActivePartyByID returns the ACTIVE party row by its primary key.
+func (s *MultipartyPartyStore) GetActivePartyByID(ctx context.Context, partyID uuid.UUID) (*domain.MultipartyContractParty, error) {
+	return getActiveMultipartyPartyByID(ctx, s.q, partyID)
+}
+
+// UpdatePartyShare updates share_bps for an ACTIVE party row.
+func (s *MultipartyPartyStore) UpdatePartyShare(
+	ctx context.Context, contractID, partyID uuid.UUID, newShareBps int,
+) (*domain.MultipartyContractParty, error) {
+	return updateMultipartyPartyShare(ctx, s.q, contractID, partyID, newShareBps)
 }
 
 // ListActiveByContract returns all ACTIVE parties for a contract.
@@ -277,6 +303,70 @@ WHERE contract_id = $1 AND vendor_user_id = $2 AND status = 'ACTIVE'
 		}
 
 		return nil, fmt.Errorf("get active multi_party_contract_party: %w", err)
+	}
+
+	p.Status = domain.MultipartyPartyStatus(status)
+
+	return &p, nil
+}
+
+func getActiveMultipartyPartyByID(ctx context.Context, q querier, partyID uuid.UUID) (*domain.MultipartyContractParty, error) {
+	const query = `
+SELECT id, contract_id, vendor_user_id, role_id, share_bps, status, created_at, updated_at
+FROM multi_party_contract_parties
+WHERE id = $1 AND status = 'ACTIVE'
+`
+
+	var (
+		p      domain.MultipartyContractParty
+		status string
+	)
+
+	err := q.QueryRow(ctx, query, partyID).Scan(
+		&p.ID, &p.ContractID, &p.VendorUserID, &p.RoleID, &p.ShareBps, &status,
+		&p.CreatedAt, &p.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrNotParty
+		}
+
+		return nil, fmt.Errorf("get active multi_party_contract_party by id: %w", err)
+	}
+
+	p.Status = domain.MultipartyPartyStatus(status)
+
+	return &p, nil
+}
+
+func updateMultipartyPartyShare(
+	ctx context.Context,
+	q querier,
+	contractID, partyID uuid.UUID,
+	newShareBps int,
+) (*domain.MultipartyContractParty, error) {
+	const query = `
+UPDATE multi_party_contract_parties
+SET share_bps = $3, updated_at = now()
+WHERE id = $1 AND contract_id = $2 AND status = 'ACTIVE'
+RETURNING id, contract_id, vendor_user_id, role_id, share_bps, status, created_at, updated_at
+`
+
+	var (
+		p      domain.MultipartyContractParty
+		status string
+	)
+
+	err := q.QueryRow(ctx, query, partyID, contractID, newShareBps).Scan(
+		&p.ID, &p.ContractID, &p.VendorUserID, &p.RoleID, &p.ShareBps, &status,
+		&p.CreatedAt, &p.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrNotParty
+		}
+
+		return nil, fmt.Errorf("update multi_party_contract_party share: %w", err)
 	}
 
 	p.Status = domain.MultipartyPartyStatus(status)

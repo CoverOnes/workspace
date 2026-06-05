@@ -118,10 +118,11 @@ func startMilestoneTestDB(t *testing.T, ctx context.Context) *milestoneTestEnv {
 	mpParties := postgres.NewMultipartyPartyStore(pool)
 	mpSigs := postgres.NewMultipartySignatureStore(pool)
 	mpTx := postgres.NewMultipartyTxManager(pool)
+	addendaStore := postgres.NewAddendumStore(pool)
 	msStore := postgres.NewMilestoneStore(pool)
 
 	pub := &recordingPublisher{}
-	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, mpTx, pub)
+	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, addendaStore, mpTx, pub)
 	milestoneSvc := service.NewMilestoneService(mpContracts, msStore, mpParties, pub)
 
 	return &milestoneTestEnv{
@@ -145,7 +146,7 @@ func setupActiveContract(
 	posterID = uuid.New()
 	tenderID := uuid.New()
 	vendorA := uuid.New()
-	currency := "TWD"
+	currency := testCurrencyTWD
 
 	// Create contract with a single party (10000 bps) and poster.
 	c, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
@@ -499,9 +500,45 @@ func TestMilestone_Complete(t *testing.T) {
 	})
 }
 
+// activateContract submits and signs a contract through to ACTIVE status.
+// Both vendorA (6000 bps) and vendorB (4000 bps) sign; returns the final ACTIVE contract.
+// Requires that the contract already has vendorA and vendorB as parties summing to 10000 bps.
+func activateContract(
+	t *testing.T,
+	ctx context.Context,
+	svc *service.MultipartyContractService,
+	contractID uuid.UUID,
+	vendorA, vendorB uuid.UUID,
+) {
+	t.Helper()
+
+	submitted, err := svc.SubmitForSignatures(ctx, contractID)
+	require.NoError(t, err)
+
+	v1Hash := submitted.ContentHash
+
+	_, err = svc.Sign(ctx, service.SignInput{
+		ContractID:        contractID,
+		SignerUserID:      vendorA,
+		SignedContentHash: v1Hash,
+		Version:           1,
+	})
+	require.NoError(t, err)
+
+	active, err := svc.Sign(ctx, service.SignInput{
+		ContractID:        contractID,
+		SignerUserID:      vendorB,
+		SignedContentHash: v1Hash,
+		Version:           1,
+	})
+	require.NoError(t, err)
+	require.Equal(t, domain.MultipartyContractStatusActive, active.Status, "contract must be ACTIVE after all parties sign")
+}
+
 // TestMilestone_Roster_ReturnsActiveParties proves the roster service method returns
-// the frozen ACTIVE-party list with correct vendorUserId and shareBps, and returns
-// 404 (ErrMultipartyContractNotFound) for a phantom/non-existent contract ID.
+// the frozen ACTIVE-party list with correct vendorUserId and shareBps, returns
+// 404 (ErrMultipartyContractNotFound) for a phantom/non-existent contract ID,
+// and rejects transient states where shares may be mid-reallocation (M2 guard).
 func TestMilestone_Roster_ReturnsActiveParties(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping milestone integration test in short mode")
@@ -509,18 +546,20 @@ func TestMilestone_Roster_ReturnsActiveParties(t *testing.T) {
 
 	ctx := context.Background()
 
-	t.Run("returns active parties for existing contract", func(t *testing.T) {
+	t.Run("returns active parties for ACTIVE contract", func(t *testing.T) {
 		env := startMilestoneTestDB(t, ctx)
 
 		tenderID := uuid.New()
 		vendorA := uuid.New()
 		vendorB := uuid.New()
 		posterID := uuid.New()
+		currency := testCurrencyTWD
 
 		contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
 			TenderID:     tenderID,
 			VendorUserID: vendorA,
 			ShareBps:     6000,
+			Currency:     &currency,
 			PosterUserID: &posterID,
 		})
 		require.NoError(t, err)
@@ -531,6 +570,8 @@ func TestMilestone_Roster_ReturnsActiveParties(t *testing.T) {
 			ShareBps:     4000,
 		})
 		require.NoError(t, err)
+
+		activateContract(t, ctx, env.mpSvc, contract.ID, vendorA, vendorB)
 
 		parties, err := env.milestoneSvc.GetPartyRoster(ctx, contract.ID)
 		require.NoError(t, err)
@@ -551,6 +592,49 @@ func TestMilestone_Roster_ReturnsActiveParties(t *testing.T) {
 		_, err := env.milestoneSvc.GetPartyRoster(ctx, uuid.New())
 		require.ErrorIs(t, err, domain.ErrMultipartyContractNotFound,
 			"phantom contract must return ErrMultipartyContractNotFound (mapped to 404)")
+	})
+
+	t.Run("ADDENDUM_PENDING contract returns ErrInvalidTransition (M2 status guard)", func(t *testing.T) {
+		env := startMilestoneTestDB(t, ctx)
+
+		tenderID := uuid.New()
+		vendorA := uuid.New()
+		vendorB := uuid.New()
+		vendorC := uuid.New()
+		posterID := uuid.New()
+		currency := testCurrencyTWD
+
+		contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+			TenderID:     tenderID,
+			VendorUserID: vendorA,
+			ShareBps:     6000,
+			Currency:     &currency,
+			PosterUserID: &posterID,
+		})
+		require.NoError(t, err)
+
+		_, _, err = env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+			TenderID:     tenderID,
+			VendorUserID: vendorB,
+			ShareBps:     4000,
+		})
+		require.NoError(t, err)
+
+		activateContract(t, ctx, env.mpSvc, contract.ID, vendorA, vendorB)
+
+		// Add a third party via addendum → ADDENDUM_PENDING with vendorC at 0 bps.
+		_, _, err = env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+			TenderID:     tenderID,
+			VendorUserID: vendorC,
+			ShareBps:     0,
+			PosterUserID: &posterID,
+		})
+		require.NoError(t, err)
+
+		// GetPartyRoster must reject ADDENDUM_PENDING (shares are mid-reallocation).
+		_, rosterErr := env.milestoneSvc.GetPartyRoster(ctx, contract.ID)
+		require.ErrorIs(t, rosterErr, domain.ErrInvalidTransition,
+			"roster on ADDENDUM_PENDING contract must return ErrInvalidTransition")
 	})
 }
 

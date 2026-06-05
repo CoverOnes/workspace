@@ -106,9 +106,10 @@ func startMultipartyTestDB(t *testing.T, ctx context.Context) *multipartyTestEnv
 	mpParties := postgres.NewMultipartyPartyStore(pool)
 	mpSigs := postgres.NewMultipartySignatureStore(pool)
 	mpTx := postgres.NewMultipartyTxManager(pool)
+	addendaStore := postgres.NewAddendumStore(pool)
 	pub := events.NewNoopPublisher()
 
-	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, mpTx, pub)
+	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, addendaStore, mpTx, pub)
 
 	return &multipartyTestEnv{
 		mpSvc:         mpSvc,
@@ -116,6 +117,9 @@ func startMultipartyTestDB(t *testing.T, ctx context.Context) *multipartyTestEnv
 		sigStore:      postgres.NewSignatureStore(pool),
 	}
 }
+
+// testCurrencyTWD is the TWD currency code used across multiparty test helpers.
+const testCurrencyTWD = "TWD"
 
 // mustDecimal parses a decimal string and panics on error (test helper).
 func mustDecimal(s string) decimal.Decimal {
@@ -136,7 +140,7 @@ func makeDualSignContract(clientID, freelancerID uuid.UUID) *domain.Contract {
 	amount := "5000.00"
 	hash := domain.CanonicalContractDigest(
 		cid.String(), clientID.String(), freelancerID.String(),
-		"Regression Contract", "Terms body", amount, "TWD", 1,
+		"Regression Contract", "Terms body", amount, testCurrencyTWD, 1,
 	)
 
 	return &domain.Contract{
@@ -148,7 +152,7 @@ func makeDualSignContract(clientID, freelancerID uuid.UUID) *domain.Contract {
 		Title:            "Regression Contract",
 		Terms:            "Terms body",
 		Amount:           mustDecimal(amount),
-		Currency:         "TWD",
+		Currency:         testCurrencyTWD,
 		ContentHash:      hash,
 		Version:          1,
 		Status:           domain.ContractStatusDraft,
@@ -243,7 +247,7 @@ func TestMultiparty_CreateOrAddParty_Idempotent(t *testing.T) {
 	tenderID := uuid.New()
 	vendorA := uuid.New()
 	vendorB := uuid.New()
-	currency := "TWD"
+	currency := testCurrencyTWD
 
 	// First call: creates the contract + adds vendorA.
 	contract1, partyA, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
@@ -730,7 +734,8 @@ func TestMultiparty_FrozenPartyCount_QuorumNotManipulable(t *testing.T) {
 
 	// Simulate vendorB "exiting" by directly marking the party row EXITED.
 	// (Phase-4 exit flow is not yet implemented; we test the quorum invariant directly.)
-	_, execErr := env.contractStore.Pool().Exec(ctx,
+	_, execErr := env.contractStore.Pool().Exec(
+		ctx,
 		`UPDATE multi_party_contract_parties SET status = 'EXITED', updated_at = now()
 		 WHERE contract_id = $1 AND vendor_user_id = $2 AND status = 'ACTIVE'`,
 		contract.ID, vendorB,

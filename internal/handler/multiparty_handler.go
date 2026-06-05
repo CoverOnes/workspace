@@ -39,6 +39,12 @@ type CreateOrAddPartyRequest struct {
 // Idempotent: creates the contract if none exists for tender_id, then adds the party.
 // Called by marketplace when an approved collaborator is APPROVED for a tender.
 // Protected by RequireServiceToken middleware (S2S only).
+//
+// S2S trust model: X-Service-Token is the trust boundary for this group.
+// The posterUserId field is caller-asserted and is ONLY trusted at first creation (when no
+// contract exists for the tender yet). On existing contracts the service validates the
+// caller-supplied posterUserId against the stored contract.PosterUserID — a mismatch is
+// rejected as ErrForbidden. posterUserId cannot be changed after the contract is created.
 func (h *MultipartyHandler) CreateOrAddParty(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
 
@@ -181,6 +187,57 @@ func (h *MultipartyHandler) Sign(c *gin.Context) {
 	}
 
 	httpx.OK(c, contract)
+}
+
+// UpdatePartyShareRequest is the PATCH /v1/multiparty-contracts/:id/parties/:partyId/share body.
+type UpdatePartyShareRequest struct {
+	ShareBps int `json:"shareBps"`
+}
+
+// UpdatePartyShare handles PATCH /v1/multiparty-contracts/:id/parties/:partyId/share.
+// Updates a party's share_bps on an ADDENDUM_PENDING contract.
+// Owner-only: caller must be the PosterUserID of the contract.
+func (h *MultipartyHandler) UpdatePartyShare(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+
+	contractID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid contract id")
+		return
+	}
+
+	partyID, err := uuid.Parse(c.Param("partyId"))
+	if err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid partyId")
+		return
+	}
+
+	var req UpdatePartyShareRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
+		return
+	}
+
+	rawUID := c.GetHeader("X-User-Id")
+
+	callerUserID, parseErr := uuid.Parse(rawUID)
+	if parseErr != nil {
+		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+		return
+	}
+
+	updated, svcErr := h.svc.UpdatePartyShare(c.Request.Context(), service.UpdatePartyShareInput{
+		ContractID:   contractID,
+		PartyID:      partyID,
+		CallerUserID: callerUserID,
+		NewShareBps:  req.ShareBps,
+	})
+	if svcErr != nil {
+		httpx.Err(c, svcErr)
+		return
+	}
+
+	httpx.OK(c, updated)
 }
 
 // GetDetail handles GET /v1/multiparty-contracts/:id.

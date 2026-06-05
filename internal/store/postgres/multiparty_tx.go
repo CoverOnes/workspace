@@ -25,6 +25,8 @@ func NewMultipartyTxManager(pool *pgxpool.Pool) *MultipartyTxManager {
 // The transaction-scoped stores passed to fn satisfy the same interfaces as the
 // pool-backed stores, so service logic does not need to know whether it is inside
 // a transaction.
+// The addenda AddendumStore is the 4th arg — callers that do not use it may ignore it
+// with `_ store.AddendumStore`.
 func (m *MultipartyTxManager) WithMultipartyTx(
 	ctx context.Context,
 	fn func(
@@ -32,6 +34,7 @@ func (m *MultipartyTxManager) WithMultipartyTx(
 		contracts store.MultipartyContractStore,
 		parties store.MultipartyPartyStore,
 		sigs store.MultipartySignatureStore,
+		addenda store.AddendumStore,
 	) error,
 ) error {
 	tx, err := m.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -48,8 +51,9 @@ func (m *MultipartyTxManager) WithMultipartyTx(
 	txContracts := &txMultipartyContractStore{tx: tx}
 	txParties := &txMultipartyPartyStore{tx: tx}
 	txSigs := &txMultipartySignatureStore{tx: tx}
+	txAddenda := &txAddendumStore{tx: tx}
 
-	if fnErr := fn(ctx, txContracts, txParties, txSigs); fnErr != nil {
+	if fnErr := fn(ctx, txContracts, txParties, txSigs, txAddenda); fnErr != nil {
 		return fnErr
 	}
 

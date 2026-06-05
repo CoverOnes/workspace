@@ -13,7 +13,11 @@ const (
 	MultipartyContractStatusDraft             MultipartyContractStatus = "DRAFT"
 	MultipartyContractStatusPendingSignatures MultipartyContractStatus = "PENDING_SIGNATURES"
 	MultipartyContractStatusActive            MultipartyContractStatus = "ACTIVE"
-	MultipartyContractStatusCompleted         MultipartyContractStatus = "COMPLETED"
+	// MultipartyContractStatusAddendumPending is set when a new party is added to an ACTIVE
+	// contract. The owner must update all shares (Σ=10000) and re-submit before parties
+	// can re-sign the new digest. This is the Phase-4 "add-then-resubmit + re-sign" state.
+	MultipartyContractStatusAddendumPending MultipartyContractStatus = "ADDENDUM_PENDING"
+	MultipartyContractStatusCompleted       MultipartyContractStatus = "COMPLETED"
 	// MultipartyContractStatusCancelled matches the SQL CHECK constraint spelling.
 	MultipartyContractStatusCancelled MultipartyContractStatus = "CANCELLED" //nolint:misspell // matches SQL CHECK constraint
 )
@@ -75,6 +79,20 @@ type MultipartyContractSignature struct {
 	CreatedAt         time.Time `json:"createdAt"`
 }
 
+// ContractAddendum records one addendum event: a new party was added to an ACTIVE
+// contract, causing a version bump and a transition to ADDENDUM_PENDING.
+// No FK — contract_id, new_party_id, new_vendor_user_id, triggered_by are soft refs.
+type ContractAddendum struct {
+	ID              uuid.UUID `json:"id"`
+	ContractID      uuid.UUID `json:"contractId"`
+	FromVersion     int       `json:"fromVersion"`
+	ToVersion       int       `json:"toVersion"`
+	NewPartyID      uuid.UUID `json:"newPartyId"`
+	NewVendorUserID uuid.UUID `json:"newVendorUserId"`
+	TriggeredBy     uuid.UUID `json:"triggeredBy"`
+	CreatedAt       time.Time `json:"createdAt"`
+}
+
 // MultipartyContractActivatedEvent is published (§14 dotted-lowercase channel
 // workspace.contract_activated) when a multi-party contract reaches quorum.
 type MultipartyContractActivatedEvent struct {
@@ -84,6 +102,36 @@ type MultipartyContractActivatedEvent struct {
 	Data       struct {
 		ContractID uuid.UUID `json:"contractId"`
 		TenderID   uuid.UUID `json:"tenderId"`
+		PartyCount int       `json:"partyCount"`
+	} `json:"data"`
+}
+
+// MultipartyContractAddendumCreatedEvent is published (workspace.contract_addendum_created)
+// when a new party is added to an ACTIVE contract and the contract transitions to ADDENDUM_PENDING.
+type MultipartyContractAddendumCreatedEvent struct {
+	EventID    uuid.UUID `json:"eventId"`
+	OccurredAt time.Time `json:"occurredAt"`
+	Version    int       `json:"version"`
+	Data       struct {
+		ContractID      uuid.UUID `json:"contractId"`
+		TenderID        uuid.UUID `json:"tenderId"`
+		FromVersion     int       `json:"fromVersion"`
+		ToVersion       int       `json:"toVersion"`
+		NewVendorUserID uuid.UUID `json:"newVendorUserId"`
+		PartyCount      int       `json:"partyCount"`
+	} `json:"data"`
+}
+
+// MultipartyContractReSignedEvent is published (workspace.contract_re_signed)
+// when all ACTIVE parties have re-signed after an addendum and the contract returns to ACTIVE.
+type MultipartyContractReSignedEvent struct {
+	EventID    uuid.UUID `json:"eventId"`
+	OccurredAt time.Time `json:"occurredAt"`
+	Version    int       `json:"version"`
+	Data       struct {
+		ContractID uuid.UUID `json:"contractId"`
+		TenderID   uuid.UUID `json:"tenderId"`
+		NewVersion int       `json:"newVersion"`
 		PartyCount int       `json:"partyCount"`
 	} `json:"data"`
 }
@@ -110,7 +158,13 @@ func ValidMultipartyContractTransition(from, to MultipartyContractStatus) bool {
 
 	case MultipartyContractStatusActive:
 		switch to {
-		case MultipartyContractStatusCompleted, MultipartyContractStatusCancelled:
+		case MultipartyContractStatusAddendumPending, MultipartyContractStatusCompleted, MultipartyContractStatusCancelled:
+			return true
+		}
+
+	case MultipartyContractStatusAddendumPending:
+		switch to {
+		case MultipartyContractStatusPendingSignatures, MultipartyContractStatusCancelled:
 			return true
 		}
 	}
