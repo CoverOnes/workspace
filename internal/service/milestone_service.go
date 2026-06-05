@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"time"
 
 	"github.com/CoverOnes/workspace/internal/domain"
@@ -20,6 +21,7 @@ import (
 type MilestoneService struct {
 	contracts  store.MultipartyContractStore
 	milestones store.MilestoneStore
+	parties    store.MultipartyPartyStore
 	publisher  events.Publisher
 }
 
@@ -27,11 +29,13 @@ type MilestoneService struct {
 func NewMilestoneService(
 	contracts store.MultipartyContractStore,
 	milestones store.MilestoneStore,
+	parties store.MultipartyPartyStore,
 	publisher events.Publisher,
 ) *MilestoneService {
 	return &MilestoneService{
 		contracts:  contracts,
 		milestones: milestones,
+		parties:    parties,
 		publisher:  publisher,
 	}
 }
@@ -157,11 +161,26 @@ func (s *MilestoneService) CompleteMilestone(ctx context.Context, in CompleteMil
 	return m, nil
 }
 
-// GetPartiesForRoster returns the frozen ACTIVE-party roster for a multiparty contract.
+// GetPartyRoster returns the frozen ACTIVE-party roster for a multiparty contract.
 // This is the S2S roster endpoint consumed by payment at settlement-plan creation.
 // No owner check — this is called by payment service using X-Service-Token, not end users.
-func (s *MilestoneService) GetPartiesForRoster(ctx context.Context, contractID uuid.UUID) (*domain.MultipartyContract, error) {
-	return s.contracts.GetByID(ctx, contractID)
+// Returns ErrMultipartyContractNotFound (mapped to 404) if the contract does not exist.
+func (s *MilestoneService) GetPartyRoster(ctx context.Context, contractID uuid.UUID) ([]*domain.MultipartyContractParty, error) {
+	// Existence check: 404 on miss (phantoms must not return a successful empty roster).
+	if _, err := s.contracts.GetByID(ctx, contractID); err != nil {
+		return nil, err
+	}
+
+	parties, err := s.parties.ListActiveByContract(ctx, contractID)
+	if err != nil {
+		return nil, fmt.Errorf("list active parties: %w", err)
+	}
+
+	if parties == nil {
+		parties = []*domain.MultipartyContractParty{}
+	}
+
+	return parties, nil
 }
 
 // publishCompleted publishes the workspace.contract_completed event.
@@ -199,18 +218,29 @@ func assertContractOwner(contract *domain.MultipartyContract, callerID uuid.UUID
 	return nil
 }
 
+// iso4217Re matches a valid ISO 4217 currency code: exactly 3 uppercase ASCII letters.
+var iso4217Re = regexp.MustCompile(`^[A-Z]{3}$`)
+
 // validateMilestoneInput validates milestone creation fields.
 func validateMilestoneInput(name string, amount decimal.Decimal, currency string) error {
-	if name == "" || len([]rune(name)) > 255 {
+	runes := []rune(name)
+	if len(runes) == 0 || len(runes) > 255 {
 		return fmt.Errorf("%w: name must be 1-255 characters", domain.ErrValidation)
+	}
+
+	// Reject control characters in name (null byte, CR, LF, and runes < 0x20 except tab).
+	for _, r := range runes {
+		if r == '\x00' || r == '\r' || r == '\n' || (r < 0x20 && r != '\t') {
+			return fmt.Errorf("%w: name must not contain control characters", domain.ErrValidation)
+		}
 	}
 
 	if amount.LessThanOrEqual(decimal.Zero) {
 		return fmt.Errorf("%w: amount must be greater than 0", domain.ErrValidation)
 	}
 
-	if len(currency) != 3 {
-		return fmt.Errorf("%w: currency must be a 3-character ISO 4217 code", domain.ErrValidation)
+	if !iso4217Re.MatchString(currency) {
+		return fmt.Errorf("%w: currency must be a valid ISO 4217 code (3 uppercase letters)", domain.ErrValidation)
 	}
 
 	return nil

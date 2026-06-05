@@ -9,8 +9,8 @@ package service_test
 //  4. Complete milestone — sets COMPLETED, emits workspace.contract_completed event.
 //  5. Complete already-completed milestone → ErrMilestoneAlreadyDone.
 //  6. Complete milestone from wrong contract → ErrMilestoneNotFound (IDOR guard).
-//  7. S2S roster (GetPartiesForRoster) returns contract; separate roster handler
-//     test verifies ListActiveByContract returns correct [{vendorUserId, shareBps}].
+//  7. GetPartyRoster: returns [{vendorUserId, shareBps}] for existing contract;
+//     returns ErrMultipartyContractNotFound for phantom contract ID (404 guard).
 //  8. Sum-of-milestone-amounts: NOT enforced (documented decision — poster adds incrementally).
 
 import (
@@ -39,7 +39,6 @@ type milestoneTestEnv struct {
 	mpSvc          *service.MultipartyContractService
 	milestoneSvc   *service.MilestoneService
 	contractStore  *postgres.MultipartyContractStore
-	partyStore     *postgres.MultipartyPartyStore
 	milestoneStore *postgres.MilestoneStore
 	pub            *recordingPublisher
 }
@@ -123,13 +122,12 @@ func startMilestoneTestDB(t *testing.T, ctx context.Context) *milestoneTestEnv {
 
 	pub := &recordingPublisher{}
 	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, mpTx, pub)
-	milestoneSvc := service.NewMilestoneService(mpContracts, msStore, pub)
+	milestoneSvc := service.NewMilestoneService(mpContracts, msStore, mpParties, pub)
 
 	return &milestoneTestEnv{
 		mpSvc:          mpSvc,
 		milestoneSvc:   milestoneSvc,
 		contractStore:  mpContracts,
-		partyStore:     mpParties,
 		milestoneStore: msStore,
 		pub:            pub,
 	}
@@ -501,48 +499,59 @@ func TestMilestone_Complete(t *testing.T) {
 	})
 }
 
-// TestMilestone_Roster_ReturnsActiveParties proves the roster endpoint returns
-// the frozen ACTIVE-party list with correct vendorUserId and shareBps.
+// TestMilestone_Roster_ReturnsActiveParties proves the roster service method returns
+// the frozen ACTIVE-party list with correct vendorUserId and shareBps, and returns
+// 404 (ErrMultipartyContractNotFound) for a phantom/non-existent contract ID.
 func TestMilestone_Roster_ReturnsActiveParties(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping milestone integration test in short mode")
 	}
 
 	ctx := context.Background()
-	env := startMilestoneTestDB(t, ctx)
 
-	tenderID := uuid.New()
-	vendorA := uuid.New()
-	vendorB := uuid.New()
-	posterID := uuid.New()
+	t.Run("returns active parties for existing contract", func(t *testing.T) {
+		env := startMilestoneTestDB(t, ctx)
 
-	contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
-		TenderID:     tenderID,
-		VendorUserID: vendorA,
-		ShareBps:     6000,
-		PosterUserID: &posterID,
+		tenderID := uuid.New()
+		vendorA := uuid.New()
+		vendorB := uuid.New()
+		posterID := uuid.New()
+
+		contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+			TenderID:     tenderID,
+			VendorUserID: vendorA,
+			ShareBps:     6000,
+			PosterUserID: &posterID,
+		})
+		require.NoError(t, err)
+
+		_, _, err = env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+			TenderID:     tenderID,
+			VendorUserID: vendorB,
+			ShareBps:     4000,
+		})
+		require.NoError(t, err)
+
+		parties, err := env.milestoneSvc.GetPartyRoster(ctx, contract.ID)
+		require.NoError(t, err)
+		require.Len(t, parties, 2)
+
+		shareMap := make(map[uuid.UUID]int)
+		for _, p := range parties {
+			shareMap[p.VendorUserID] = p.ShareBps
+		}
+
+		assert.Equal(t, 6000, shareMap[vendorA], "vendorA must have 6000 bps")
+		assert.Equal(t, 4000, shareMap[vendorB], "vendorB must have 4000 bps")
 	})
-	require.NoError(t, err)
 
-	_, _, err = env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
-		TenderID:     tenderID,
-		VendorUserID: vendorB,
-		ShareBps:     4000,
+	t.Run("non-existent contract returns ErrMultipartyContractNotFound", func(t *testing.T) {
+		env := startMilestoneTestDB(t, ctx)
+
+		_, err := env.milestoneSvc.GetPartyRoster(ctx, uuid.New())
+		require.ErrorIs(t, err, domain.ErrMultipartyContractNotFound,
+			"phantom contract must return ErrMultipartyContractNotFound (mapped to 404)")
 	})
-	require.NoError(t, err)
-
-	// Fetch the roster via the party store (simulating what InternalPartiesHandler does).
-	parties, err := env.partyStore.ListActiveByContract(ctx, contract.ID)
-	require.NoError(t, err)
-	require.Len(t, parties, 2)
-
-	shareMap := make(map[uuid.UUID]int)
-	for _, p := range parties {
-		shareMap[p.VendorUserID] = p.ShareBps
-	}
-
-	assert.Equal(t, 6000, shareMap[vendorA], "vendorA must have 6000 bps")
-	assert.Equal(t, 4000, shareMap[vendorB], "vendorB must have 4000 bps")
 }
 
 // TestMilestone_SumInvariant_NotEnforced documents that milestone amounts are NOT

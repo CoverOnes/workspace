@@ -4,7 +4,7 @@ import (
 	"net/http"
 
 	"github.com/CoverOnes/workspace/internal/platform/httpx"
-	"github.com/CoverOnes/workspace/internal/store"
+	"github.com/CoverOnes/workspace/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -20,12 +20,12 @@ import (
 // This is what payment calls at settlement-plan creation to obtain the
 // authoritative share allocation for disbursement.
 type InternalPartiesHandler struct {
-	parties store.MultipartyPartyStore
+	svc *service.MilestoneService
 }
 
-// NewInternalPartiesHandler returns an InternalPartiesHandler.
-func NewInternalPartiesHandler(parties store.MultipartyPartyStore) *InternalPartiesHandler {
-	return &InternalPartiesHandler{parties: parties}
+// NewInternalPartiesHandler returns an InternalPartiesHandler wired through MilestoneService.
+func NewInternalPartiesHandler(svc *service.MilestoneService) *InternalPartiesHandler {
+	return &InternalPartiesHandler{svc: svc}
 }
 
 // partyRosterEntry is the response shape for one party in the roster.
@@ -37,7 +37,9 @@ type partyRosterEntry struct {
 
 // GetParties handles GET /internal/v1/contracts/:id/parties.
 // Returns the frozen ACTIVE-party roster [{vendorUserId, shareBps}].
-// The contract_id parameter here refers to the multi_party_contract id.
+// Returns 404 if the contract does not exist — a phantom/unknown contract must
+// never return a successful empty roster that payment would use to build a
+// settlement plan.
 func (h *InternalPartiesHandler) GetParties(c *gin.Context) {
 	contractID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -45,7 +47,7 @@ func (h *InternalPartiesHandler) GetParties(c *gin.Context) {
 		return
 	}
 
-	parties, err := h.parties.ListActiveByContract(c.Request.Context(), contractID)
+	parties, err := h.svc.GetPartyRoster(c.Request.Context(), contractID)
 	if err != nil {
 		httpx.Err(c, err)
 		return

@@ -162,7 +162,7 @@ func run() error {
 		multipartyTxManager,
 		publisher,
 	)
-	milestoneSvc := service.NewMilestoneService(multipartyContractStore, milestoneStore, publisher)
+	milestoneSvc := service.NewMilestoneService(multipartyContractStore, milestoneStore, multipartyPartyStore, publisher)
 
 	// Router.
 	r := handler.NewRouter(&handler.RouterConfig{
@@ -172,7 +172,6 @@ func run() error {
 		WorklogSvc:            worklogSvc,
 		MultipartyContractSvc: multipartyContractSvc,
 		MilestoneSvc:          milestoneSvc,
-		MultipartyPartyStore:  multipartyPartyStore,
 		Pool:                  pool,
 		Redis:                 redisClient,
 		ContractServiceToken:  cfg.ContractServiceToken,

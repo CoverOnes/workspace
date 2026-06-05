@@ -7,6 +7,7 @@ package handler_test
 //  3. Rejects requests with an incorrect X-Service-Token (403).
 //  4. NOT reachable on the public /v1 group (i.e., the path does not exist there).
 //  5. Returns the correct [{vendorUserId, shareBps}] roster.
+//  6. Returns 404 for a valid token + non-existent contract ID (phantom guard).
 
 import (
 	"context"
@@ -34,9 +35,8 @@ const rosterTestServiceToken = "test-service-token-32-chars-long!"
 
 // rosterTestEnv holds everything needed for roster handler tests.
 type rosterTestEnv struct {
-	router  http.Handler
-	mpSvc   *service.MultipartyContractService
-	parties *postgres.MultipartyPartyStore
+	router http.Handler
+	mpSvc  *service.MultipartyContractService
 }
 
 func startRosterTestDB(t *testing.T, ctx context.Context) *rosterTestEnv {
@@ -103,7 +103,7 @@ func startRosterTestDB(t *testing.T, ctx context.Context) *rosterTestEnv {
 	pub := events.NewNoopPublisher()
 
 	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, mpTx, pub)
-	milestoneSvc := service.NewMilestoneService(mpContracts, msStore, pub)
+	milestoneSvc := service.NewMilestoneService(mpContracts, msStore, mpParties, pub)
 
 	contractStore := postgres.NewContractStore(pool)
 	sigStore := postgres.NewSignatureStore(pool)
@@ -115,7 +115,6 @@ func startRosterTestDB(t *testing.T, ctx context.Context) *rosterTestEnv {
 	r := handler.NewRouter(&handler.RouterConfig{
 		MultipartyContractSvc: mpSvc,
 		MilestoneSvc:          milestoneSvc,
-		MultipartyPartyStore:  mpParties,
 		Pool:                  pool,
 		ContractServiceToken:  rosterTestServiceToken,
 		GatewayHMACSecret:     "", // dev mode — no gateway HMAC
@@ -126,9 +125,8 @@ func startRosterTestDB(t *testing.T, ctx context.Context) *rosterTestEnv {
 	})
 
 	return &rosterTestEnv{
-		router:  r,
-		mpSvc:   mpSvc,
-		parties: mpParties,
+		router: r,
+		mpSvc:  mpSvc,
 	}
 }
 
@@ -218,4 +216,29 @@ func TestRoster_GetParties_RequiresServiceToken(t *testing.T) {
 		assert.Equal(t, http.StatusNotFound, w.Code,
 			"roster endpoint must NOT be mounted on the public /v1 group")
 	})
+}
+
+// TestRoster_GetParties_NonExistentContract verifies the phantom-contract guard:
+// a valid service token + a UUID that does not exist in the DB must return 404,
+// not 200 with an empty roster. Payment uses this endpoint to build settlement plans,
+// so a phantom/unknown contract MUST NOT return a successful empty payload.
+func TestRoster_GetParties_NonExistentContract(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping roster handler integration test in short mode")
+	}
+
+	ctx := context.Background()
+	env := startRosterTestDB(t, ctx)
+
+	// Use a random UUID that was never inserted into the DB.
+	phantomID := uuid.New()
+	path := fmt.Sprintf("/internal/v1/contracts/%s/parties", phantomID)
+
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, path, http.NoBody)
+	req.Header.Set("X-Service-Token", rosterTestServiceToken)
+	w := httptest.NewRecorder()
+	env.router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusNotFound, w.Code,
+		"roster of a non-existent contract must return 404, not 200 with empty []")
 }

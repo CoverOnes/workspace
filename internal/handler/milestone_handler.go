@@ -109,6 +109,8 @@ func (h *MilestoneHandler) ListMilestones(c *gin.Context) {
 // Owner-only (PosterUserID). Sets the milestone COMPLETED and emits a
 // workspace.contract_completed event (§14 best-effort publish).
 func (h *MilestoneHandler) CompleteMilestone(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+
 	contractID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid contract id")
