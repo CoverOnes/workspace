@@ -314,8 +314,18 @@ func (c *Config) validateGatewayCIDR() []string {
 		return nil
 	}
 
-	if _, _, err := net.ParseCIDR(c.GatewayCIDR); err != nil {
+	_, ipNet, err := net.ParseCIDR(c.GatewayCIDR)
+	if err != nil {
 		return []string{fmt.Sprintf("WORKSPACE_GATEWAY_CIDR must be a valid CIDR block (e.g. 10.0.0.0/16): %v", err)}
+	}
+
+	// Reject wildcard CIDRs (0.0.0.0/0, ::/0): trusting all peers lets any client
+	// spoof their IP via X-Forwarded-For, defeating signer_ip audit + rate limiting.
+	if ones, _ := ipNet.Mask.Size(); ones == 0 {
+		return []string{
+			"WORKSPACE_GATEWAY_CIDR must not be a wildcard (0.0.0.0/0 or ::/0): " +
+				"it lets any client spoof their IP via X-Forwarded-For",
+		}
 	}
 
 	return nil

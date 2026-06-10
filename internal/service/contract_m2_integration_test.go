@@ -15,11 +15,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"net/http"
 	"net/http/httptest"
-	"sort"
-	"strings"
 	"testing"
 
 	"github.com/CoverOnes/workspace/internal/domain"
@@ -28,18 +25,17 @@ import (
 	"github.com/CoverOnes/workspace/internal/platform/middleware"
 	"github.com/CoverOnes/workspace/internal/service"
 	"github.com/CoverOnes/workspace/internal/store/postgres"
-	migrations "github.com/CoverOnes/workspace/migrations"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
 const m2ServiceToken = "m2-integration-test-service-token-secret!"
 
-// startM2TestDB spins up a real Postgres container for M-2 integration tests.
+// startM2TestDB returns a real ContractStore backed by the singleton sharedServicePool
+// (started once in TestMain). No new container is started here.
 func startM2TestDB(t *testing.T) *postgres.ContractStore {
 	t.Helper()
 
@@ -47,59 +43,9 @@ func startM2TestDB(t *testing.T) *postgres.ContractStore {
 		t.Skip("skipping integration test in short mode")
 	}
 
-	ctx := context.Background()
+	require.NotNil(t, sharedServicePool, "sharedServicePool must be initialized by TestMain")
 
-	ctr, err := tcpostgres.Run(
-		ctx,
-		"postgres:17-alpine",
-		tcpostgres.WithDatabase("testdb"),
-		tcpostgres.WithUsername("testuser"),
-		tcpostgres.WithPassword("testpass"),
-		tcpostgres.BasicWaitStrategies(),
-	)
-	require.NoError(t, err)
-
-	t.Cleanup(func() {
-		if termErr := ctr.Terminate(ctx); termErr != nil {
-			t.Logf("terminate container: %v", termErr)
-		}
-	})
-
-	dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
-	require.NoError(t, err)
-
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolConfig{})
-	require.NoError(t, err)
-
-	t.Cleanup(pool.Close)
-
-	// Apply all migrations.
-	var upFiles []string
-
-	err = fs.WalkDir(migrations.FS, ".", func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-
-		if !d.IsDir() && strings.HasSuffix(path, ".up.sql") {
-			upFiles = append(upFiles, path)
-		}
-
-		return nil
-	})
-	require.NoError(t, err)
-
-	sort.Strings(upFiles)
-
-	for _, file := range upFiles {
-		data, readErr := migrations.FS.ReadFile(file)
-		require.NoError(t, readErr)
-
-		_, execErr := pool.Exec(ctx, string(data))
-		require.NoError(t, execErr, "apply migration %s", file)
-	}
-
-	return postgres.NewContractStore(pool)
+	return postgres.NewContractStore(sharedServicePool)
 }
 
 // buildM2Router creates a real router backed by the given contract store.

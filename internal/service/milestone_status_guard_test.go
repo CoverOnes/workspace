@@ -110,6 +110,7 @@ func TestCompleteMilestone_RequiresActiveContract(t *testing.T) {
 		{"CANCELED_SQL", domain.MultipartyContractStatusCancelled},
 		{"DRAFT", domain.MultipartyContractStatusDraft},
 		{"PENDING_SIGNATURES", domain.MultipartyContractStatusPendingSignatures},
+		{"ADDENDUM_PENDING", domain.MultipartyContractStatusAddendumPending},
 		{"COMPLETED", domain.MultipartyContractStatusCompleted},
 	}
 

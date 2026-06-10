@@ -47,7 +47,7 @@ tasks:
   test:
     desc: "Run all tests (integration tests require Docker)"
     cmds:
-      - go test -p 4 -timeout 120s ./...
+      - go test -p 2 -timeout 120s ./...
 
   test-unit:
     desc: "Run unit tests only (no Docker required)"

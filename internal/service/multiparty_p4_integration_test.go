@@ -43,63 +43,18 @@ type p4Env struct {
 	addenda *postgres.AddendumStore
 }
 
-// startP4Env spins up a Postgres testcontainer, applies all migrations, and returns a p4Env.
-func startP4Env(t *testing.T, ctx context.Context) *p4Env {
+// startP4Env returns a p4Env backed by the singleton sharedServicePool
+// (started once in TestMain).  No new container is started here.
+func startP4Env(t *testing.T, _ context.Context) *p4Env {
 	t.Helper()
 
 	if testing.Short() {
 		t.Skip("skipping P4 integration test in short mode")
 	}
 
-	ctr, err := tcpostgres.Run(
-		ctx,
-		"postgres:17-alpine",
-		tcpostgres.WithDatabase("testdb"),
-		tcpostgres.WithUsername("testuser"),
-		tcpostgres.WithPassword("testpass"),
-		tcpostgres.BasicWaitStrategies(),
-	)
-	require.NoError(t, err)
+	require.NotNil(t, sharedServicePool, "sharedServicePool must be initialized by TestMain")
 
-	t.Cleanup(func() {
-		if termErr := ctr.Terminate(ctx); termErr != nil {
-			t.Logf("terminate container: %v", termErr)
-		}
-	})
-
-	dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
-	require.NoError(t, err)
-
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolConfig{})
-	require.NoError(t, err)
-
-	t.Cleanup(pool.Close)
-
-	var upFiles []string
-
-	err = fs.WalkDir(migrations.FS, ".", func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-
-		if !d.IsDir() && strings.HasSuffix(path, ".up.sql") {
-			upFiles = append(upFiles, path)
-		}
-
-		return nil
-	})
-	require.NoError(t, err)
-	require.NotEmpty(t, upFiles, "no *.up.sql files found")
-
-	sort.Strings(upFiles)
-
-	for _, file := range upFiles {
-		data, readErr := migrations.FS.ReadFile(file)
-		require.NoError(t, readErr, "read migration %s", file)
-
-		_, execErr := pool.Exec(ctx, string(data))
-		require.NoError(t, execErr, "apply migration %s", file)
-	}
+	pool := sharedServicePool
 
 	mpContracts := postgres.NewMultipartyContractStore(pool)
 	mpParties := postgres.NewMultipartyPartyStore(pool)

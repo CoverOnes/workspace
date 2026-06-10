@@ -427,6 +427,18 @@ func TestLoad_GatewayCIDR(t *testing.T) {
 			wantErr:   true,
 			errSubstr: "WORKSPACE_GATEWAY_CIDR",
 		},
+		{
+			name:      "IPv4 wildcard 0.0.0.0/0 is rejected (IP spoof risk)",
+			cidr:      "0.0.0.0/0",
+			wantErr:   true,
+			errSubstr: "wildcard",
+		},
+		{
+			name:      "IPv6 wildcard ::/0 is rejected (IP spoof risk)",
+			cidr:      "::/0",
+			wantErr:   true,
+			errSubstr: "wildcard",
+		},
 	}
 
 	for _, tc := range tests {
