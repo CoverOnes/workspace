@@ -16,9 +16,6 @@ package service_test
 import (
 	"context"
 	"fmt"
-	"io/fs"
-	"sort"
-	"strings"
 	"testing"
 	"time"
 
@@ -26,12 +23,10 @@ import (
 	"github.com/CoverOnes/workspace/internal/events"
 	"github.com/CoverOnes/workspace/internal/service"
 	"github.com/CoverOnes/workspace/internal/store/postgres"
-	migrations "github.com/CoverOnes/workspace/migrations"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
 // milestoneTestEnv holds all stores and services for milestone integration tests.
@@ -54,65 +49,20 @@ func (r *recordingPublisher) PublishMultipartyContractCompleted(_ context.Contex
 	return nil
 }
 
-// startMilestoneTestDB spins up a Postgres testcontainer, applies all migrations,
-// and returns a populated milestoneTestEnv.
-func startMilestoneTestDB(t *testing.T, ctx context.Context) *milestoneTestEnv {
+// startMilestoneTestDB returns a populated milestoneTestEnv backed by the singleton
+// sharedServicePool (started once in TestMain).  No new container is started here.
+// Each call creates a fresh recordingPublisher and fresh service instances so there
+// is no state leakage between tests (data isolation comes from unique UUIDs per test).
+func startMilestoneTestDB(t *testing.T, _ context.Context) *milestoneTestEnv {
 	t.Helper()
 
 	if testing.Short() {
 		t.Skip("skipping milestone integration test in short mode")
 	}
 
-	ctr, err := tcpostgres.Run(
-		ctx,
-		"postgres:17-alpine",
-		tcpostgres.WithDatabase("testdb"),
-		tcpostgres.WithUsername("testuser"),
-		tcpostgres.WithPassword("testpass"),
-		tcpostgres.BasicWaitStrategies(),
-	)
-	require.NoError(t, err)
+	require.NotNil(t, sharedServicePool, "sharedServicePool must be initialized by TestMain")
 
-	t.Cleanup(func() {
-		if termErr := ctr.Terminate(ctx); termErr != nil {
-			t.Logf("terminate container: %v", termErr)
-		}
-	})
-
-	dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
-	require.NoError(t, err)
-
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolConfig{})
-	require.NoError(t, err)
-
-	t.Cleanup(pool.Close)
-
-	// Apply all embedded migrations.
-	var upFiles []string
-
-	err = fs.WalkDir(migrations.FS, ".", func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-
-		if !d.IsDir() && strings.HasSuffix(path, ".up.sql") {
-			upFiles = append(upFiles, path)
-		}
-
-		return nil
-	})
-	require.NoError(t, err)
-	require.NotEmpty(t, upFiles, "no *.up.sql files found")
-
-	sort.Strings(upFiles)
-
-	for _, file := range upFiles {
-		data, readErr := migrations.FS.ReadFile(file)
-		require.NoError(t, readErr, "read migration %s", file)
-
-		_, execErr := pool.Exec(ctx, string(data))
-		require.NoError(t, execErr, "apply migration %s", file)
-	}
+	pool := sharedServicePool
 
 	mpContracts := postgres.NewMultipartyContractStore(pool)
 	mpParties := postgres.NewMultipartyPartyStore(pool)
@@ -134,7 +84,8 @@ func startMilestoneTestDB(t *testing.T, ctx context.Context) *milestoneTestEnv {
 	}
 }
 
-// setupActiveContract creates a multiparty contract with N parties and activates it.
+// setupActiveContract creates a multiparty contract, submits it for signatures,
+// and has the single vendor sign, producing an ACTIVE contract.
 // Returns the contract and the poster user ID.
 func setupActiveContract(
 	t *testing.T,
@@ -148,7 +99,7 @@ func setupActiveContract(
 	vendorA := uuid.New()
 	currency := testCurrencyTWD
 
-	// Create contract with a single party (10000 bps) and poster.
+	// Create contract with a single party (10000 bps) and poster — starts as DRAFT.
 	c, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
 		TenderID:     tenderID,
 		VendorUserID: vendorA,
@@ -158,75 +109,44 @@ func setupActiveContract(
 	})
 	require.NoError(t, err)
 
-	return c, posterID
+	// Submit DRAFT → PENDING_SIGNATURES.
+	submitted, err := env.mpSvc.SubmitForSignatures(ctx, c.ID)
+	require.NoError(t, err)
+
+	// The sole vendor signs → PENDING_SIGNATURES → ACTIVE (quorum = 1/1 satisfied).
+	active, err := env.mpSvc.Sign(ctx, service.SignInput{
+		ContractID:        c.ID,
+		SignerUserID:      vendorA,
+		SignedContentHash: submitted.ContentHash,
+		Version:           submitted.Version,
+	})
+	require.NoError(t, err)
+	require.Equal(t, domain.MultipartyContractStatusActive, active.Status,
+		"setupActiveContract: contract must be ACTIVE after the sole vendor signs")
+
+	return active, posterID
 }
 
 // TestMilestone_MigrationsApply verifies migration 000007 tables and columns exist.
+// Uses the singleton sharedServicePool (migrations already applied by TestMain).
 func TestMilestone_MigrationsApply(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping milestone integration test in short mode")
 	}
 
+	require.NotNil(t, sharedServicePool, "sharedServicePool must be initialized by TestMain")
+
 	ctx := context.Background()
-
-	ctr, err := tcpostgres.Run(
-		ctx,
-		"postgres:17-alpine",
-		tcpostgres.WithDatabase("testdb"),
-		tcpostgres.WithUsername("testuser"),
-		tcpostgres.WithPassword("testpass"),
-		tcpostgres.BasicWaitStrategies(),
-	)
-	require.NoError(t, err)
-
-	t.Cleanup(func() {
-		if termErr := ctr.Terminate(ctx); termErr != nil {
-			t.Logf("terminate: %v", termErr)
-		}
-	})
-
-	dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
-	require.NoError(t, err)
-
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolConfig{})
-	require.NoError(t, err)
-
-	t.Cleanup(pool.Close)
-
-	var upFiles []string
-
-	err = fs.WalkDir(migrations.FS, ".", func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-
-		if !d.IsDir() && strings.HasSuffix(path, ".up.sql") {
-			upFiles = append(upFiles, path)
-		}
-
-		return nil
-	})
-	require.NoError(t, err)
-
-	sort.Strings(upFiles)
-
-	for _, file := range upFiles {
-		data, readErr := migrations.FS.ReadFile(file)
-		require.NoError(t, readErr)
-
-		_, execErr := pool.Exec(ctx, string(data))
-		require.NoError(t, execErr, "apply %s", file)
-	}
 
 	// multiparty_milestones table must exist.
 	var count int
-	row := pool.QueryRow(ctx,
+	row := sharedServicePool.QueryRow(ctx,
 		`SELECT COUNT(*) FROM information_schema.tables WHERE table_name='multiparty_milestones' AND table_schema='public'`)
 	require.NoError(t, row.Scan(&count))
 	assert.Equal(t, 1, count, "multiparty_milestones table must exist after migration 000007")
 
 	// poster_user_id column must exist on multi_party_contracts.
-	row = pool.QueryRow(ctx,
+	row = sharedServicePool.QueryRow(ctx,
 		`SELECT COUNT(*) FROM information_schema.columns
 		 WHERE table_name='multi_party_contracts' AND column_name='poster_user_id' AND table_schema='public'`)
 	require.NoError(t, row.Scan(&count))
@@ -462,10 +382,12 @@ func TestMilestone_Complete(t *testing.T) {
 
 		// Two separate contracts with the same poster.
 		posterID := uuid.New()
+		vendorForA := uuid.New()
+		vendorForB := uuid.New()
 
 		contractA, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
 			TenderID:     uuid.New(),
-			VendorUserID: uuid.New(),
+			VendorUserID: vendorForA,
 			ShareBps:     10000,
 			PosterUserID: &posterID,
 		})
@@ -473,11 +395,15 @@ func TestMilestone_Complete(t *testing.T) {
 
 		contractB, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
 			TenderID:     uuid.New(),
-			VendorUserID: uuid.New(),
+			VendorUserID: vendorForB,
 			ShareBps:     10000,
 			PosterUserID: &posterID,
 		})
 		require.NoError(t, err)
+
+		// Both contracts must be ACTIVE before milestones can be added.
+		activateSinglePartyContract(t, ctx, env.mpSvc, contractA.ID, vendorForA)
+		activateSinglePartyContract(t, ctx, env.mpSvc, contractB.ID, vendorForB)
 
 		// Add milestone to contract A.
 		mA, err := env.milestoneSvc.AddMilestone(ctx, &service.AddMilestoneInput{
@@ -498,6 +424,32 @@ func TestMilestone_Complete(t *testing.T) {
 		require.ErrorIs(t, err, domain.ErrMilestoneNotFound,
 			"completing a milestone via a different contract must return ErrMilestoneNotFound")
 	})
+}
+
+// activateSinglePartyContract submits a single-party (10000 bps) contract for
+// signatures and has the sole vendor sign, producing an ACTIVE contract.
+// vendor must be the VendorUserID used in CreateOrAddParty.
+func activateSinglePartyContract(
+	t *testing.T,
+	ctx context.Context,
+	svc *service.MultipartyContractService,
+	contractID uuid.UUID,
+	vendor uuid.UUID,
+) {
+	t.Helper()
+
+	submitted, err := svc.SubmitForSignatures(ctx, contractID)
+	require.NoError(t, err)
+
+	active, err := svc.Sign(ctx, service.SignInput{
+		ContractID:        contractID,
+		SignerUserID:      vendor,
+		SignedContentHash: submitted.ContentHash,
+		Version:           submitted.Version,
+	})
+	require.NoError(t, err)
+	require.Equal(t, domain.MultipartyContractStatusActive, active.Status,
+		"contract must be ACTIVE after the sole vendor signs")
 }
 
 // activateContract submits and signs a contract through to ACTIVE status.

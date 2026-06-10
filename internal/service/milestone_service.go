@@ -54,6 +54,8 @@ type AddMilestoneInput struct {
 // Only the contract's poster (PosterUserID) may call this endpoint.
 // Returns ErrNotContractOwner (mapped to 404) if the caller is not the poster.
 // Returns ErrMultipartyContractNotFound if the contract does not exist.
+// Returns ErrInvalidTransition if the contract is not in ACTIVE status (DRAFT,
+// PENDING_SIGNATURES, ADDENDUM_PENDING, CANCELED, COMPLETED are all rejected).
 func (s *MilestoneService) AddMilestone(ctx context.Context, in *AddMilestoneInput) (*domain.Milestone, error) {
 	if err := validateMilestoneInput(in.Name, in.Amount, in.Currency); err != nil {
 		return nil, err
@@ -66,6 +68,16 @@ func (s *MilestoneService) AddMilestone(ctx context.Context, in *AddMilestoneInp
 
 	if err := assertContractOwner(contract, in.CallerID); err != nil {
 		return nil, err
+	}
+
+	// Status guard: milestones may only be added to ACTIVE contracts.
+	// DRAFT / PENDING_SIGNATURES / ADDENDUM_PENDING: contract is not yet activated
+	// and has no finalized, fully-signed roster. CANCELED / COMPLETED: terminal
+	// states where disbursements must not be created. This mirrors the ACTIVE-only
+	// guard already enforced by GetPartyRoster (line 181).
+	if contract.Status != domain.MultipartyContractStatusActive {
+		return nil, fmt.Errorf("%w: milestones may only be added to ACTIVE contracts (contract is %s)",
+			domain.ErrInvalidTransition, contract.Status)
 	}
 
 	now := time.Now().UTC()
@@ -125,6 +137,7 @@ type CompleteMilestoneInput struct {
 // is logged as a warning but does NOT roll back the completion.
 //
 // Returns ErrNotContractOwner (404) if the caller is not the poster.
+// Returns ErrInvalidTransition if the contract is not in ACTIVE status.
 // Returns ErrMilestoneAlreadyDone if the milestone is already COMPLETED.
 // Returns ErrMilestoneNotFound if the milestone does not exist.
 func (s *MilestoneService) CompleteMilestone(ctx context.Context, in CompleteMilestoneInput) (*domain.Milestone, error) {
@@ -135,6 +148,18 @@ func (s *MilestoneService) CompleteMilestone(ctx context.Context, in CompleteMil
 
 	if err := assertContractOwner(contract, in.CallerID); err != nil {
 		return nil, err
+	}
+
+	// Status guard: disbursement events may only be emitted for ACTIVE contracts.
+	// A CANCELED contract can still have PENDING milestone rows (the state machine
+	// allows ACTIVE→CANCELED). Completing a milestone on a CANCELED contract would
+	// publish a workspace.contract_completed event consumed by payment for
+	// disbursement — a real money-path hole. This guard closes that gap independently
+	// of the AddMilestone guard, because a contract can be canceled while a PENDING
+	// milestone already exists.
+	if contract.Status != domain.MultipartyContractStatusActive {
+		return nil, fmt.Errorf("%w: milestone completion requires an ACTIVE contract (contract is %s)",
+			domain.ErrInvalidTransition, contract.Status)
 	}
 
 	// Verify the milestone belongs to this contract before completing it (IDOR guard).

@@ -35,6 +35,13 @@ type RouterConfig struct {
 	// UserRateLimitBurst is the token-bucket burst size. Must be > 0 when
 	// UserRateLimitPerMin > 0; config.validateUserRateLimit enforces this.
 	UserRateLimitBurst int
+	// GatewayCIDR is the CIDR of the API gateway/LB that forwards requests.
+	// When non-empty, Gin trusts X-Forwarded-For from this source so
+	// c.ClientIP() returns the real end-user IP. This is required for the IP
+	// rate limiter to key per-user rather than per-gateway, and for signer_ip
+	// to record the real signer rather than the gateway address.
+	// Empty (dev/unset): SetTrustedProxies(nil) — safe fallback.
+	GatewayCIDR string
 }
 
 // NewRouter builds and returns the configured Gin engine.
@@ -48,7 +55,27 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 
 	r := gin.New()
-	r.SetTrustedProxies(nil) //nolint:errcheck // nil proxy list disables proxy trust; gin docs confirm error is always nil for nil argument
+
+	// Trust the gateway proxy CIDR so c.ClientIP() returns the real end-user IP
+	// from X-Forwarded-For rather than the gateway's IP.
+	//
+	// When GatewayCIDR is set (non-dev): Gin honors X-Forwarded-For only from
+	// the gateway, so the IP rate limiter keys per-user and signer_ip records the
+	// real signer. When GatewayCIDR is empty (dev/unset): SetTrustedProxies(nil)
+	// disables proxy trust entirely — c.ClientIP() returns RemoteAddr (safe fallback).
+	//
+	// We must not trust XFF blindly (r.SetTrustedProxies([]string{"0.0.0.0/0"}))
+	// as that allows any client to spoof their IP via the header.
+	if cfg.GatewayCIDR != "" {
+		if err := r.SetTrustedProxies([]string{cfg.GatewayCIDR}); err != nil {
+			// SetTrustedProxies only fails on invalid CIDR, which config.validate()
+			// already rejects at boot. Panic here to surface a config bug fast rather
+			// than silently running without proxy trust.
+			panic("router: invalid GatewayCIDR: " + err.Error())
+		}
+	} else {
+		r.SetTrustedProxies(nil) //nolint:errcheck // nil proxy list disables proxy trust; gin docs confirm error is always nil for nil argument
+	}
 
 	// Global middleware chain (order per CONVENTIONS §9).
 	r.Use(middleware.Recover())

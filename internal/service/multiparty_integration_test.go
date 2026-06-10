@@ -16,9 +16,6 @@ package service_test
 import (
 	"context"
 	"fmt"
-	"io/fs"
-	"sort"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -27,12 +24,10 @@ import (
 	"github.com/CoverOnes/workspace/internal/events"
 	"github.com/CoverOnes/workspace/internal/service"
 	"github.com/CoverOnes/workspace/internal/store/postgres"
-	migrations "github.com/CoverOnes/workspace/migrations"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
 // multipartyTestEnv holds all stores and services for multiparty integration tests.
@@ -42,65 +37,18 @@ type multipartyTestEnv struct {
 	sigStore      *postgres.SignatureStore
 }
 
-// startMultipartyTestDB spins up a Postgres testcontainer, applies all migrations,
-// and returns a populated multipartyTestEnv.
-func startMultipartyTestDB(t *testing.T, ctx context.Context) *multipartyTestEnv {
+// startMultipartyTestDB returns a populated multipartyTestEnv backed by the singleton
+// sharedServicePool (started once in TestMain).  No new container is started here.
+func startMultipartyTestDB(t *testing.T, _ context.Context) *multipartyTestEnv {
 	t.Helper()
 
 	if testing.Short() {
 		t.Skip("skipping multiparty integration test in short mode")
 	}
 
-	ctr, err := tcpostgres.Run(
-		ctx,
-		"postgres:17-alpine",
-		tcpostgres.WithDatabase("testdb"),
-		tcpostgres.WithUsername("testuser"),
-		tcpostgres.WithPassword("testpass"),
-		tcpostgres.BasicWaitStrategies(),
-	)
-	require.NoError(t, err)
+	require.NotNil(t, sharedServicePool, "sharedServicePool must be initialized by TestMain")
 
-	t.Cleanup(func() {
-		if termErr := ctr.Terminate(ctx); termErr != nil {
-			t.Logf("terminate container: %v", termErr)
-		}
-	})
-
-	dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
-	require.NoError(t, err)
-
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolConfig{})
-	require.NoError(t, err)
-
-	t.Cleanup(pool.Close)
-
-	// Apply all embedded migrations (includes new multiparty tables).
-	var upFiles []string
-
-	err = fs.WalkDir(migrations.FS, ".", func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-
-		if !d.IsDir() && strings.HasSuffix(path, ".up.sql") {
-			upFiles = append(upFiles, path)
-		}
-
-		return nil
-	})
-	require.NoError(t, err)
-	require.NotEmpty(t, upFiles, "no *.up.sql files found")
-
-	sort.Strings(upFiles)
-
-	for _, file := range upFiles {
-		data, readErr := migrations.FS.ReadFile(file)
-		require.NoError(t, readErr, "read migration %s", file)
-
-		_, execErr := pool.Exec(ctx, string(data))
-		require.NoError(t, execErr, "apply migration %s", file)
-	}
+	pool := sharedServicePool
 
 	mpContracts := postgres.NewMultipartyContractStore(pool)
 	mpParties := postgres.NewMultipartyPartyStore(pool)
@@ -162,61 +110,15 @@ func makeDualSignContract(clientID, freelancerID uuid.UUID) *domain.Contract {
 }
 
 // TestMultiparty_MigrationsApply verifies the multiparty tables were created by migration 000006.
+// Uses the singleton sharedServicePool (migrations already applied by TestMain).
 func TestMultiparty_MigrationsApply(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping multiparty integration test in short mode")
 	}
 
+	require.NotNil(t, sharedServicePool, "sharedServicePool must be initialized by TestMain")
+
 	ctx := context.Background()
-
-	ctr, err := tcpostgres.Run(
-		ctx,
-		"postgres:17-alpine",
-		tcpostgres.WithDatabase("testdb"),
-		tcpostgres.WithUsername("testuser"),
-		tcpostgres.WithPassword("testpass"),
-		tcpostgres.BasicWaitStrategies(),
-	)
-	require.NoError(t, err)
-
-	t.Cleanup(func() {
-		if termErr := ctr.Terminate(ctx); termErr != nil {
-			t.Logf("terminate: %v", termErr)
-		}
-	})
-
-	dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
-	require.NoError(t, err)
-
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolConfig{})
-	require.NoError(t, err)
-
-	t.Cleanup(pool.Close)
-
-	var upFiles []string
-
-	err = fs.WalkDir(migrations.FS, ".", func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-
-		if !d.IsDir() && strings.HasSuffix(path, ".up.sql") {
-			upFiles = append(upFiles, path)
-		}
-
-		return nil
-	})
-	require.NoError(t, err)
-
-	sort.Strings(upFiles)
-
-	for _, file := range upFiles {
-		data, readErr := migrations.FS.ReadFile(file)
-		require.NoError(t, readErr)
-
-		_, execErr := pool.Exec(ctx, string(data))
-		require.NoError(t, execErr, "apply %s", file)
-	}
 
 	tables := []string{
 		"multi_party_contracts",
@@ -227,7 +129,7 @@ func TestMultiparty_MigrationsApply(t *testing.T) {
 	for _, tbl := range tables {
 		var count int
 
-		row := pool.QueryRow(ctx,
+		row := sharedServicePool.QueryRow(ctx,
 			`SELECT COUNT(*) FROM information_schema.tables WHERE table_name=$1 AND table_schema='public'`,
 			tbl)
 		require.NoError(t, row.Scan(&count))
@@ -796,16 +698,16 @@ func TestMultiparty_DualSignRegression(t *testing.T) {
 	require.Len(t, sigs, 1)
 	assert.Equal(t, sig.ID, sigs[0].ID)
 
-	// Confirm the multiparty tables are separate (no cross-contamination).
+	// Confirm the multiparty tables are separate (no cross-contamination):
+	// the 1:1 contract c.ID must NOT appear in multi_party_contracts.
 	var mpContractCount int
 
 	row := env.contractStore.Pool().QueryRow(ctx,
-		`SELECT COUNT(*) FROM multi_party_contracts`)
+		`SELECT COUNT(*) FROM multi_party_contracts WHERE id = $1`, c.ID)
 	require.NoError(t, row.Scan(&mpContractCount))
 
-	t.Logf("multi_party_contracts count: %d (expected 0 — no multiparty data in this test)", mpContractCount)
 	assert.Equal(t, 0, mpContractCount,
-		"multiparty contracts must be isolated from the 1:1 contract tests")
+		"1:1 contract %s must not appear in multi_party_contracts (no cross-contamination)", c.ID)
 }
 
 // TestMultiparty_GetDetail returns contract + roster + signature progress.
