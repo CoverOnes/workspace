@@ -169,7 +169,6 @@ func ValidMultipartyContractTransition(from, to MultipartyContractStatus) bool {
 		}
 	}
 
-	// COMPLETED and CANCELLED are terminal states — no further transitions.
-	//nolint:misspell // "CANCELLED" matches the SQL CHECK constraint spelling used in migrations
+	// COMPLETED and CANCELED are terminal states — no further transitions.
 	return false
 }

@@ -134,7 +134,8 @@ func startMilestoneTestDB(t *testing.T, ctx context.Context) *milestoneTestEnv {
 	}
 }
 
-// setupActiveContract creates a multiparty contract with N parties and activates it.
+// setupActiveContract creates a multiparty contract, submits it for signatures,
+// and has the single vendor sign, producing an ACTIVE contract.
 // Returns the contract and the poster user ID.
 func setupActiveContract(
 	t *testing.T,
@@ -148,7 +149,7 @@ func setupActiveContract(
 	vendorA := uuid.New()
 	currency := testCurrencyTWD
 
-	// Create contract with a single party (10000 bps) and poster.
+	// Create contract with a single party (10000 bps) and poster — starts as DRAFT.
 	c, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
 		TenderID:     tenderID,
 		VendorUserID: vendorA,
@@ -158,7 +159,22 @@ func setupActiveContract(
 	})
 	require.NoError(t, err)
 
-	return c, posterID
+	// Submit DRAFT → PENDING_SIGNATURES.
+	submitted, err := env.mpSvc.SubmitForSignatures(ctx, c.ID)
+	require.NoError(t, err)
+
+	// The sole vendor signs → PENDING_SIGNATURES → ACTIVE (quorum = 1/1 satisfied).
+	active, err := env.mpSvc.Sign(ctx, service.SignInput{
+		ContractID:        c.ID,
+		SignerUserID:      vendorA,
+		SignedContentHash: submitted.ContentHash,
+		Version:           submitted.Version,
+	})
+	require.NoError(t, err)
+	require.Equal(t, domain.MultipartyContractStatusActive, active.Status,
+		"setupActiveContract: contract must be ACTIVE after the sole vendor signs")
+
+	return active, posterID
 }
 
 // TestMilestone_MigrationsApply verifies migration 000007 tables and columns exist.
@@ -462,10 +478,12 @@ func TestMilestone_Complete(t *testing.T) {
 
 		// Two separate contracts with the same poster.
 		posterID := uuid.New()
+		vendorForA := uuid.New()
+		vendorForB := uuid.New()
 
 		contractA, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
 			TenderID:     uuid.New(),
-			VendorUserID: uuid.New(),
+			VendorUserID: vendorForA,
 			ShareBps:     10000,
 			PosterUserID: &posterID,
 		})
@@ -473,11 +491,15 @@ func TestMilestone_Complete(t *testing.T) {
 
 		contractB, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
 			TenderID:     uuid.New(),
-			VendorUserID: uuid.New(),
+			VendorUserID: vendorForB,
 			ShareBps:     10000,
 			PosterUserID: &posterID,
 		})
 		require.NoError(t, err)
+
+		// Both contracts must be ACTIVE before milestones can be added.
+		activateSinglePartyContract(t, ctx, env.mpSvc, contractA.ID, vendorForA)
+		activateSinglePartyContract(t, ctx, env.mpSvc, contractB.ID, vendorForB)
 
 		// Add milestone to contract A.
 		mA, err := env.milestoneSvc.AddMilestone(ctx, &service.AddMilestoneInput{
@@ -498,6 +520,32 @@ func TestMilestone_Complete(t *testing.T) {
 		require.ErrorIs(t, err, domain.ErrMilestoneNotFound,
 			"completing a milestone via a different contract must return ErrMilestoneNotFound")
 	})
+}
+
+// activateSinglePartyContract submits a single-party (10000 bps) contract for
+// signatures and has the sole vendor sign, producing an ACTIVE contract.
+// vendor must be the VendorUserID used in CreateOrAddParty.
+func activateSinglePartyContract(
+	t *testing.T,
+	ctx context.Context,
+	svc *service.MultipartyContractService,
+	contractID uuid.UUID,
+	vendor uuid.UUID,
+) {
+	t.Helper()
+
+	submitted, err := svc.SubmitForSignatures(ctx, contractID)
+	require.NoError(t, err)
+
+	active, err := svc.Sign(ctx, service.SignInput{
+		ContractID:        contractID,
+		SignerUserID:      vendor,
+		SignedContentHash: submitted.ContentHash,
+		Version:           submitted.Version,
+	})
+	require.NoError(t, err)
+	require.Equal(t, domain.MultipartyContractStatusActive, active.Status,
+		"contract must be ACTIVE after the sole vendor signs")
 }
 
 // activateContract submits and signs a contract through to ACTIVE status.

@@ -380,6 +380,71 @@ func TestLoad_UserRateLimit(t *testing.T) {
 	}
 }
 
+// TestLoad_GatewayCIDR proves that WORKSPACE_GATEWAY_CIDR is validated as a CIDR
+// block when set and accepted when empty (dev/default case).
+func TestLoad_GatewayCIDR(t *testing.T) {
+	tests := []struct {
+		name      string
+		cidr      string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:    "empty CIDR allowed (dev default: SetTrustedProxies(nil))",
+			cidr:    "",
+			wantErr: false,
+		},
+		{
+			name:    "valid IPv4 CIDR is accepted",
+			cidr:    "10.0.0.0/16",
+			wantErr: false,
+		},
+		{
+			name:    "valid /32 host CIDR is accepted",
+			cidr:    "192.168.1.1/32",
+			wantErr: false,
+		},
+		{
+			name:    "valid RFC-1918 VPC CIDR is accepted",
+			cidr:    "172.16.0.0/12",
+			wantErr: false,
+		},
+		{
+			name:      "bare IP address without prefix is rejected",
+			cidr:      "10.0.0.1",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_GATEWAY_CIDR",
+		},
+		{
+			name:      "garbage string is rejected",
+			cidr:      "not-a-cidr",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_GATEWAY_CIDR",
+		},
+		{
+			name:      "CIDR with out-of-range octet is rejected",
+			cidr:      "256.0.0.0/8",
+			wantErr:   true,
+			errSubstr: "WORKSPACE_GATEWAY_CIDR",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setValidEnv(t)
+			t.Setenv("WORKSPACE_GATEWAY_CIDR", tc.cidr)
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestLoad_GatewayHMAC(t *testing.T) {
 	tests := []struct {
 		name      string

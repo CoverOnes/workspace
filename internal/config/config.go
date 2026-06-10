@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"regexp"
 	"strings"
 
@@ -77,6 +78,18 @@ type Config struct {
 	// Must be > 0 when UserRateLimitPerMin > 0.
 	// Env: WORKSPACE_USER_RATE_LIMIT_BURST
 	UserRateLimitBurst int `mapstructure:"user_rate_limit_burst"`
+
+	// GatewayCIDR is the IP CIDR of the API gateway/load-balancer that forwards
+	// requests to this service. When set, Gin is told to trust X-Forwarded-For
+	// only from this source, so c.ClientIP() returns the real end-user IP rather
+	// than the gateway's IP. This fixes two blocking audit findings:
+	//   - IP rate limiter bucket collapses to a single global bucket (self-DoS).
+	//   - signer_ip records the gateway IP instead of the real signer.
+	// Example: "10.0.0.0/16" (k8s cluster CIDR), "172.16.0.0/12" (VPC internal).
+	// Empty (default): trusted-proxy list is nil — c.ClientIP() returns RemoteAddr
+	// (safe fallback; use when gateway forwards no X-Forwarded-For).
+	// Env: WORKSPACE_GATEWAY_CIDR
+	GatewayCIDR string `mapstructure:"gateway_cidr"`
 }
 
 // Load reads configuration from environment variables (prefix WORKSPACE_).
@@ -101,6 +114,7 @@ func Load() (*Config, error) {
 		"gateway_hmac_secret":     "WORKSPACE_GATEWAY_HMAC_SECRET",
 		"user_rate_limit_per_min": "WORKSPACE_USER_RATE_LIMIT_PER_MIN",
 		"user_rate_limit_burst":   "WORKSPACE_USER_RATE_LIMIT_BURST",
+		"gateway_cidr":            "WORKSPACE_GATEWAY_CIDR",
 	}
 
 	for key, envKey := range bindings {
@@ -186,6 +200,8 @@ func (c *Config) validate() error {
 	}
 
 	errs = append(errs, c.validateGatewayHMAC()...)
+
+	errs = append(errs, c.validateGatewayCIDR()...)
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
@@ -287,6 +303,22 @@ func (c *Config) validateUserRateLimit() []string {
 	}
 
 	return errs
+}
+
+// validateGatewayCIDR validates WORKSPACE_GATEWAY_CIDR and returns any error messages.
+// An empty CIDR is valid (trusted-proxy list falls back to nil, safe for local dev).
+// A non-empty value must be a valid CIDR block (e.g. "10.0.0.0/16").
+// NEVER set to "0.0.0.0/0" — that allows clients to spoof their IP via X-Forwarded-For.
+func (c *Config) validateGatewayCIDR() []string {
+	if c.GatewayCIDR == "" {
+		return nil
+	}
+
+	if _, _, err := net.ParseCIDR(c.GatewayCIDR); err != nil {
+		return []string{fmt.Sprintf("WORKSPACE_GATEWAY_CIDR must be a valid CIDR block (e.g. 10.0.0.0/16): %v", err)}
+	}
+
+	return nil
 }
 
 // IsDev reports whether the service is running in development mode.

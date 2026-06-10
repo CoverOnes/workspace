@@ -180,6 +180,7 @@ func run() error {
 		GatewayHMACSecret:     cfg.GatewayHMACSecret,
 		UserRateLimitPerMin:   cfg.UserRateLimitPerMin,
 		UserRateLimitBurst:    cfg.UserRateLimitBurst,
+		GatewayCIDR:           cfg.GatewayCIDR,
 	})
 
 	srv := &http.Server{
