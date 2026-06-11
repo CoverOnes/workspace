@@ -8,6 +8,8 @@ build/
 # Local environment and secrets
 .env
 .env.local
+.env.*
+!.env.example
 local.yaml
 application-local.yml
 application-local.yaml
