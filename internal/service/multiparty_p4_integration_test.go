@@ -107,7 +107,7 @@ func activeContractFixture(
 	})
 	require.NoError(t, err)
 
-	submitted, err := svc.SubmitForSignatures(ctx, c.ID)
+	submitted, err := svc.SubmitForSignatures(ctx, c.ID, poster)
 	require.NoError(t, err)
 
 	v1Hash := submitted.ContentHash
@@ -228,7 +228,7 @@ func TestP4_AddPartyToInvalidStatus(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		_, err = env.svc.SubmitForSignatures(ctx, c.ID)
+		_, err = env.svc.SubmitForSignatures(ctx, c.ID, poster)
 		require.NoError(t, err)
 
 		_, _, addErr := env.svc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
@@ -459,7 +459,7 @@ func TestP4_SubmitAfterAddendum(t *testing.T) {
 		})
 		require.NoError(t, patchErr)
 
-		_, submitErr := env.svc.SubmitForSignatures(ctx, contractID)
+		_, submitErr := env.svc.SubmitForSignatures(ctx, contractID, poster)
 		require.ErrorIs(t, submitErr, domain.ErrShareSumNotFull)
 
 		// Restore vA to 6000 for next sub-test.
@@ -470,7 +470,7 @@ func TestP4_SubmitAfterAddendum(t *testing.T) {
 
 	t.Run("Σ=10000 succeeds", func(t *testing.T) {
 		// vA=6000, vB=4000, vC=0 → sum=10000.
-		resubmitted, submitErr := env.svc.SubmitForSignatures(ctx, contractID)
+		resubmitted, submitErr := env.svc.SubmitForSignatures(ctx, contractID, poster)
 		require.NoError(t, submitErr)
 		assert.Equal(t, domain.MultipartyContractStatusPendingSignatures, resubmitted.Status)
 		assert.NotEmpty(t, resubmitted.ContentHash)
@@ -533,8 +533,8 @@ func TestP4_FullReSignFlow(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Re-submit: ADDENDUM_PENDING → PENDING_SIGNATURES.
-	resubmitted, err := env.svc.SubmitForSignatures(ctx, contractID)
+	// Re-submit: ADDENDUM_PENDING → PENDING_SIGNATURES (owner-only gate).
+	resubmitted, err := env.svc.SubmitForSignatures(ctx, contractID, poster)
 	require.NoError(t, err)
 	assert.Equal(t, domain.MultipartyContractStatusPendingSignatures, resubmitted.Status)
 	assert.Equal(t, 2, resubmitted.Version)
@@ -729,8 +729,8 @@ func TestP4_UpdatePartyShare_AfterSubmit_ErrInvalidTransition(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// SubmitForSignatures transitions the contract to PENDING_SIGNATURES and freezes the digest.
-	_, err = env.svc.SubmitForSignatures(ctx, contractID)
+	// SubmitForSignatures transitions the contract to PENDING_SIGNATURES and freezes the digest (owner-only gate).
+	_, err = env.svc.SubmitForSignatures(ctx, contractID, poster)
 	require.NoError(t, err)
 
 	// Now the contract is PENDING_SIGNATURES. A subsequent UpdatePartyShare must return

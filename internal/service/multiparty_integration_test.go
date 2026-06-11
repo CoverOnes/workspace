@@ -185,6 +185,78 @@ func TestMultiparty_CreateOrAddParty_Idempotent(t *testing.T) {
 		"adding a duplicate ACTIVE vendor must return ErrConflict")
 }
 
+// TestMultiparty_SubmitForSignatures_OwnerOnly proves that SubmitForSignatures enforces
+// the owner-only gate: a non-poster caller receives ErrForbidden even when the share sum
+// is valid. The callerUserID parameter added by finding #1 closes the TOCTOU window.
+func TestMultiparty_SubmitForSignatures_OwnerOnly(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping multiparty integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	cases := []struct {
+		name        string
+		setupPoster func(posterID uuid.UUID) *uuid.UUID // nil = no posterUserID on contract
+		callerIsNot string
+		wantErr     error
+	}{
+		{
+			name:        "non-poster caller → ErrForbidden",
+			setupPoster: func(posterID uuid.UUID) *uuid.UUID { return &posterID },
+			callerIsNot: "poster",
+			wantErr:     domain.ErrForbidden,
+		},
+		{
+			name:        "contract with nil PosterUserID → ErrForbidden (legacy row guard)",
+			setupPoster: func(_ uuid.UUID) *uuid.UUID { return nil },
+			callerIsNot: "anyone",
+			wantErr:     domain.ErrForbidden,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := startMultipartyTestDB(t, ctx)
+			tenderID := uuid.New()
+			posterID := uuid.New()
+			caller := uuid.New() // a different identity from the poster
+
+			pUID := tc.setupPoster(posterID)
+
+			contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+				TenderID:     tenderID,
+				VendorUserID: uuid.New(),
+				ShareBps:     10000,
+				PosterUserID: pUID,
+			})
+			require.NoError(t, err)
+
+			_, submitErr := env.mpSvc.SubmitForSignatures(ctx, contract.ID, caller)
+			require.ErrorIs(t, submitErr, tc.wantErr,
+				"non-poster calling SubmitForSignatures must return %v", tc.wantErr)
+		})
+	}
+
+	t.Run("poster caller → succeeds when sum == 10000", func(t *testing.T) {
+		env := startMultipartyTestDB(t, ctx)
+		tenderID := uuid.New()
+		posterID := uuid.New()
+
+		contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+			TenderID:     tenderID,
+			VendorUserID: uuid.New(),
+			ShareBps:     10000,
+			PosterUserID: &posterID,
+		})
+		require.NoError(t, err)
+
+		submitted, submitErr := env.mpSvc.SubmitForSignatures(ctx, contract.ID, posterID)
+		require.NoError(t, submitErr, "poster calling SubmitForSignatures with valid sum must succeed")
+		assert.Equal(t, domain.MultipartyContractStatusPendingSignatures, submitted.Status)
+	})
+}
+
 // TestMultiparty_SubmitForSignatures_ShareSumGate proves the Σ-gate:
 // refuse if sum != 10000, accept if sum == 10000.
 func TestMultiparty_SubmitForSignatures_ShareSumGate(t *testing.T) {
@@ -197,15 +269,17 @@ func TestMultiparty_SubmitForSignatures_ShareSumGate(t *testing.T) {
 	t.Run("refuse if sum != 10000", func(t *testing.T) {
 		env := startMultipartyTestDB(t, ctx)
 		tenderID := uuid.New()
+		posterID := uuid.New()
 
 		contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
 			TenderID:     tenderID,
 			VendorUserID: uuid.New(),
 			ShareBps:     5000, // only 5000, not 10000
+			PosterUserID: &posterID,
 		})
 		require.NoError(t, err)
 
-		_, submitErr := env.mpSvc.SubmitForSignatures(ctx, contract.ID)
+		_, submitErr := env.mpSvc.SubmitForSignatures(ctx, contract.ID, posterID)
 		require.ErrorIs(t, submitErr, domain.ErrShareSumNotFull,
 			"submit with sum!=10000 must return ErrShareSumNotFull")
 	})
@@ -213,16 +287,18 @@ func TestMultiparty_SubmitForSignatures_ShareSumGate(t *testing.T) {
 	t.Run("refuse if zero parties", func(t *testing.T) {
 		env := startMultipartyTestDB(t, ctx)
 		tenderID := uuid.New()
+		posterID := uuid.New()
 
 		// Create contract with no parties by exploiting a single-party sum of 0.
 		contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
 			TenderID:     tenderID,
 			VendorUserID: uuid.New(),
 			ShareBps:     0,
+			PosterUserID: &posterID,
 		})
 		require.NoError(t, err)
 
-		_, submitErr := env.mpSvc.SubmitForSignatures(ctx, contract.ID)
+		_, submitErr := env.mpSvc.SubmitForSignatures(ctx, contract.ID, posterID)
 		require.ErrorIs(t, submitErr, domain.ErrShareSumNotFull,
 			"submit with zero sum must return ErrShareSumNotFull")
 	})
@@ -230,11 +306,13 @@ func TestMultiparty_SubmitForSignatures_ShareSumGate(t *testing.T) {
 	t.Run("accept if sum == 10000", func(t *testing.T) {
 		env := startMultipartyTestDB(t, ctx)
 		tenderID := uuid.New()
+		posterID := uuid.New()
 
 		contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
 			TenderID:     tenderID,
 			VendorUserID: uuid.New(),
 			ShareBps:     6000,
+			PosterUserID: &posterID,
 		})
 		require.NoError(t, err)
 
@@ -245,7 +323,7 @@ func TestMultiparty_SubmitForSignatures_ShareSumGate(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		submitted, submitErr := env.mpSvc.SubmitForSignatures(ctx, contract.ID)
+		submitted, submitErr := env.mpSvc.SubmitForSignatures(ctx, contract.ID, posterID)
 		require.NoError(t, submitErr, "submit with sum==10000 must succeed")
 		assert.Equal(t, domain.MultipartyContractStatusPendingSignatures, submitted.Status)
 		assert.NotEmpty(t, submitted.ContentHash, "content_hash must be set after submit")
@@ -262,6 +340,7 @@ func TestMultiparty_NPartySign_QuorumActivation(t *testing.T) {
 	env := startMultipartyTestDB(t, ctx)
 
 	tenderID := uuid.New()
+	posterID := uuid.New()
 	vendorA := uuid.New()
 	vendorB := uuid.New()
 	vendorC := uuid.New()
@@ -271,6 +350,7 @@ func TestMultiparty_NPartySign_QuorumActivation(t *testing.T) {
 		TenderID:     tenderID,
 		VendorUserID: vendorA,
 		ShareBps:     5000,
+		PosterUserID: &posterID,
 	})
 	require.NoError(t, err)
 
@@ -289,7 +369,7 @@ func TestMultiparty_NPartySign_QuorumActivation(t *testing.T) {
 	require.NoError(t, err)
 
 	// Submit for signatures.
-	submitted, err := env.mpSvc.SubmitForSignatures(ctx, contract.ID)
+	submitted, err := env.mpSvc.SubmitForSignatures(ctx, contract.ID, posterID)
 	require.NoError(t, err)
 	assert.Equal(t, domain.MultipartyContractStatusPendingSignatures, submitted.Status)
 
@@ -346,16 +426,18 @@ func TestMultiparty_Sign_WrongHash(t *testing.T) {
 	env := startMultipartyTestDB(t, ctx)
 
 	tenderID := uuid.New()
+	posterID := uuid.New()
 	vendorA := uuid.New()
 
 	contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
 		TenderID:     tenderID,
 		VendorUserID: vendorA,
 		ShareBps:     10000,
+		PosterUserID: &posterID,
 	})
 	require.NoError(t, err)
 
-	submitted, err := env.mpSvc.SubmitForSignatures(ctx, contract.ID)
+	submitted, err := env.mpSvc.SubmitForSignatures(ctx, contract.ID, posterID)
 	require.NoError(t, err)
 
 	wrongHash := "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
@@ -381,16 +463,18 @@ func TestMultiparty_Sign_StaleVersion(t *testing.T) {
 	env := startMultipartyTestDB(t, ctx)
 
 	tenderID := uuid.New()
+	posterID := uuid.New()
 	vendorA := uuid.New()
 
 	contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
 		TenderID:     tenderID,
 		VendorUserID: vendorA,
 		ShareBps:     10000,
+		PosterUserID: &posterID,
 	})
 	require.NoError(t, err)
 
-	submitted, err := env.mpSvc.SubmitForSignatures(ctx, contract.ID)
+	submitted, err := env.mpSvc.SubmitForSignatures(ctx, contract.ID, posterID)
 	require.NoError(t, err)
 
 	// Submit with version=99 (stale).
@@ -415,6 +499,7 @@ func TestMultiparty_ConcurrentSign_TOCTOU(t *testing.T) {
 	env := startMultipartyTestDB(t, ctx)
 
 	tenderID := uuid.New()
+	posterID := uuid.New()
 	vendorA := uuid.New()
 	vendorB := uuid.New()
 
@@ -422,6 +507,7 @@ func TestMultiparty_ConcurrentSign_TOCTOU(t *testing.T) {
 		TenderID:     tenderID,
 		VendorUserID: vendorA,
 		ShareBps:     5000,
+		PosterUserID: &posterID,
 	})
 	require.NoError(t, err)
 
@@ -432,7 +518,7 @@ func TestMultiparty_ConcurrentSign_TOCTOU(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	submitted, err := env.mpSvc.SubmitForSignatures(ctx, contract.ID)
+	submitted, err := env.mpSvc.SubmitForSignatures(ctx, contract.ID, posterID)
 	require.NoError(t, err)
 
 	digest := submitted.ContentHash
@@ -523,6 +609,7 @@ func TestMultiparty_Sign_NonParty_Rejected(t *testing.T) {
 	env := startMultipartyTestDB(t, ctx)
 
 	tenderID := uuid.New()
+	posterID := uuid.New()
 	vendorA := uuid.New()
 	nonParty := uuid.New() // authenticated Tier-2 user who is NOT a party
 
@@ -531,11 +618,12 @@ func TestMultiparty_Sign_NonParty_Rejected(t *testing.T) {
 		TenderID:     tenderID,
 		VendorUserID: vendorA,
 		ShareBps:     10000,
+		PosterUserID: &posterID,
 	})
 	require.NoError(t, err)
 
 	// Submit for signatures (vendorA must sign).
-	submitted, err := env.mpSvc.SubmitForSignatures(ctx, contract.ID)
+	submitted, err := env.mpSvc.SubmitForSignatures(ctx, contract.ID, posterID)
 	require.NoError(t, err)
 	assert.Equal(t, domain.MultipartyContractStatusPendingSignatures, submitted.Status)
 
@@ -569,6 +657,7 @@ func TestMultiparty_GetDetail_NonParty_Rejected(t *testing.T) {
 	env := startMultipartyTestDB(t, ctx)
 
 	tenderID := uuid.New()
+	posterID := uuid.New()
 	vendorA := uuid.New()
 	nonParty := uuid.New() // authenticated Tier-1 user who is NOT a party
 
@@ -577,10 +666,11 @@ func TestMultiparty_GetDetail_NonParty_Rejected(t *testing.T) {
 		TenderID:     tenderID,
 		VendorUserID: vendorA,
 		ShareBps:     10000,
+		PosterUserID: &posterID,
 	})
 	require.NoError(t, err)
 
-	_, err = env.mpSvc.SubmitForSignatures(ctx, contract.ID)
+	_, err = env.mpSvc.SubmitForSignatures(ctx, contract.ID, posterID)
 	require.NoError(t, err)
 
 	// Non-party calls GetDetail — MUST be rejected.
@@ -612,6 +702,7 @@ func TestMultiparty_FrozenPartyCount_QuorumNotManipulable(t *testing.T) {
 	env := startMultipartyTestDB(t, ctx)
 
 	tenderID := uuid.New()
+	posterID := uuid.New()
 	vendorA := uuid.New()
 	vendorB := uuid.New()
 
@@ -619,6 +710,7 @@ func TestMultiparty_FrozenPartyCount_QuorumNotManipulable(t *testing.T) {
 		TenderID:     tenderID,
 		VendorUserID: vendorA,
 		ShareBps:     5000,
+		PosterUserID: &posterID,
 	})
 	require.NoError(t, err)
 
@@ -630,7 +722,7 @@ func TestMultiparty_FrozenPartyCount_QuorumNotManipulable(t *testing.T) {
 	require.NoError(t, err)
 
 	// Submit: party_count is frozen at 2.
-	submitted, err := env.mpSvc.SubmitForSignatures(ctx, contract.ID)
+	submitted, err := env.mpSvc.SubmitForSignatures(ctx, contract.ID, posterID)
 	require.NoError(t, err)
 	assert.Equal(t, 2, submitted.PartyCount, "party_count must be frozen at 2 after submit")
 
@@ -720,6 +812,7 @@ func TestMultiparty_GetDetail(t *testing.T) {
 	env := startMultipartyTestDB(t, ctx)
 
 	tenderID := uuid.New()
+	posterID := uuid.New()
 	vendorA := uuid.New()
 	vendorB := uuid.New()
 
@@ -727,6 +820,7 @@ func TestMultiparty_GetDetail(t *testing.T) {
 		TenderID:     tenderID,
 		VendorUserID: vendorA,
 		ShareBps:     7000,
+		PosterUserID: &posterID,
 	})
 	require.NoError(t, err)
 
@@ -737,7 +831,7 @@ func TestMultiparty_GetDetail(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	submitted, err := env.mpSvc.SubmitForSignatures(ctx, contract.ID)
+	submitted, err := env.mpSvc.SubmitForSignatures(ctx, contract.ID, posterID)
 	require.NoError(t, err)
 
 	// Sign as vendorA only.

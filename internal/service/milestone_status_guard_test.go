@@ -12,6 +12,7 @@ package service_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/CoverOnes/workspace/internal/domain"
 	"github.com/CoverOnes/workspace/internal/service"
@@ -20,6 +21,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// Note: recordingPublisher is defined in milestone_integration_test.go (same package).
 
 // addMilestoneInput returns a minimal valid AddMilestoneInput for a given contract.
 func addMilestoneInput(contractID, posterID uuid.UUID) *service.AddMilestoneInput {
@@ -164,7 +167,14 @@ func TestCompleteMilestone_RequiresActiveContract(t *testing.T) {
 		})
 		require.NoError(t, err, "CompleteMilestone on ACTIVE contract must succeed")
 		assert.Equal(t, domain.MilestoneStatusCompleted, completed.Status)
-		assert.Len(t, env.pub.completed, 1,
+
+		// publishCompleted runs in a best-effort detached goroutine. Poll with a
+		// generous timeout so we don't flake on loaded CI.
+		require.Eventually(t, func() bool { return env.pub.count() == 1 },
+			2*time.Second, 5*time.Millisecond,
+			"CompleteMilestone on ACTIVE contract must emit exactly one disbursement event within 2 s")
+
+		assert.Equal(t, 1, env.pub.count(),
 			"CompleteMilestone on ACTIVE contract must emit exactly one disbursement event")
 	})
 }

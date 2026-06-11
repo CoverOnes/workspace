@@ -313,9 +313,13 @@ func (s *MultipartyContractService) getOrCreateContract(
 // Hard gate: Σ(ACTIVE parties' share_bps) MUST equal exactly 10000.
 // Runs inside a transaction with FOR UPDATE to prevent concurrent lost-updates.
 // Freezes the version's canonical digest (stored as content_hash).
+//
+// callerUserID MUST be the contract's PosterUserID (owner-only gate).
+// Returns ErrForbidden if the caller is not the owner.
 func (s *MultipartyContractService) SubmitForSignatures(
 	ctx context.Context,
 	contractID uuid.UUID,
+	callerUserID uuid.UUID,
 ) (*domain.MultipartyContract, error) {
 	var result *domain.MultipartyContract
 
@@ -326,7 +330,7 @@ func (s *MultipartyContractService) SubmitForSignatures(
 		_ store.MultipartySignatureStore,
 		_ store.AddendumStore,
 	) error {
-		return s.submitForSignaturesTx(ctx, txContracts, txParties, contractID, &result)
+		return s.submitForSignaturesTx(ctx, txContracts, txParties, contractID, callerUserID, &result)
 	})
 
 	if txErr != nil {
@@ -341,10 +345,17 @@ func (s *MultipartyContractService) submitForSignaturesTx(
 	txContracts store.MultipartyContractStore,
 	txParties store.MultipartyPartyStore,
 	contractID uuid.UUID,
+	callerUserID uuid.UUID,
 	result **domain.MultipartyContract,
 ) error {
 	c, err := txContracts.GetByIDForUpdate(ctx, contractID)
 	if err != nil {
+		return err
+	}
+
+	// Owner-only gate: enforce under the row lock to close the TOCTOU window between
+	// the HTTP handler's identity extraction and the DB update.
+	if err := assertLockedOwner(c, callerUserID); err != nil {
 		return err
 	}
 
@@ -562,16 +573,10 @@ func (s *MultipartyContractService) activateInTx(
 }
 
 func (s *MultipartyContractService) publishActivated(ctx context.Context, contract *domain.MultipartyContract) {
-	activeParties, listErr := s.parties.ListActiveByContract(ctx, contract.ID)
-	partyCount := 0
-
-	if listErr != nil {
-		slog.Warn("list active parties for event publish failed",
-			"contract_id", contract.ID, "err", listErr)
-	} else {
-		partyCount = len(activeParties)
-	}
-
+	// Use the frozen party_count from the committed contract struct (set at SubmitForSignatures
+	// and preserved through activateInTx). A post-commit live re-read via ListActiveByContract
+	// can race with concurrent party mutations and return a different count than was committed.
+	// publishReSigned already uses contract.PartyCount for the same reason.
 	evt := &domain.MultipartyContractActivatedEvent{
 		EventID:    uuid.New(),
 		OccurredAt: time.Now().UTC(),
@@ -579,7 +584,7 @@ func (s *MultipartyContractService) publishActivated(ctx context.Context, contra
 	}
 	evt.Data.ContractID = contract.ID
 	evt.Data.TenderID = contract.TenderID
-	evt.Data.PartyCount = partyCount
+	evt.Data.PartyCount = contract.PartyCount
 
 	if pubErr := s.publisher.PublishMultipartyContractActivated(ctx, evt); pubErr != nil {
 		slog.Warn("publish multiparty contract_activated event failed",

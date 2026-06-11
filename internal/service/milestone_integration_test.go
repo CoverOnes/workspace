@@ -16,6 +16,7 @@ package service_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,14 +40,36 @@ type milestoneTestEnv struct {
 }
 
 // recordingPublisher records published events for assertion.
+// The mu guards all access to completed because PublishMultipartyContractCompleted is
+// called from a detached goroutine (post-commit best-effort publish) while the test
+// goroutine may concurrently call count() — without the mutex this is a data race.
 type recordingPublisher struct {
 	events.NoopPublisher
+	mu        sync.Mutex
 	completed []*domain.MultipartyContractCompletedEvent
 }
 
 func (r *recordingPublisher) PublishMultipartyContractCompleted(_ context.Context, evt *domain.MultipartyContractCompletedEvent) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.completed = append(r.completed, evt)
 	return nil
+}
+
+// count returns the number of recorded events in a race-safe manner.
+func (r *recordingPublisher) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.completed)
+}
+
+// snapshot returns a copy of all recorded events under the lock.
+func (r *recordingPublisher) snapshot() []*domain.MultipartyContractCompletedEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]*domain.MultipartyContractCompletedEvent, len(r.completed))
+	copy(out, r.completed)
+	return out
 }
 
 // startMilestoneTestDB returns a populated milestoneTestEnv backed by the singleton
@@ -70,10 +93,11 @@ func startMilestoneTestDB(t *testing.T, _ context.Context) *milestoneTestEnv {
 	mpTx := postgres.NewMultipartyTxManager(pool)
 	addendaStore := postgres.NewAddendumStore(pool)
 	msStore := postgres.NewMilestoneStore(pool)
+	milestoneTx := postgres.NewMilestoneTxManager(pool)
 
 	pub := &recordingPublisher{}
 	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, addendaStore, mpTx, pub)
-	milestoneSvc := service.NewMilestoneService(mpContracts, msStore, mpParties, pub)
+	milestoneSvc := service.NewMilestoneService(mpContracts, msStore, mpParties, milestoneTx, pub)
 
 	return &milestoneTestEnv{
 		mpSvc:          mpSvc,
@@ -109,8 +133,8 @@ func setupActiveContract(
 	})
 	require.NoError(t, err)
 
-	// Submit DRAFT → PENDING_SIGNATURES.
-	submitted, err := env.mpSvc.SubmitForSignatures(ctx, c.ID)
+	// Submit DRAFT → PENDING_SIGNATURES (owner-only: callerUserID = posterID).
+	submitted, err := env.mpSvc.SubmitForSignatures(ctx, c.ID, posterID)
 	require.NoError(t, err)
 
 	// The sole vendor signs → PENDING_SIGNATURES → ACTIVE (quorum = 1/1 satisfied).
@@ -311,10 +335,18 @@ func TestMilestone_Complete(t *testing.T) {
 		assert.True(t, completed.CompletedAt.After(before) || completed.CompletedAt.Equal(before),
 			"completedAt must be set to now")
 
-		// Assert the published event shape.
-		require.Len(t, env.pub.completed, 1, "exactly one contract_completed event must be published")
+		// publishCompleted runs in a best-effort detached goroutine. Poll with a
+		// generous timeout so we don't flake on loaded CI instead of sleeping a fixed
+		// 20 ms that may not be enough.
+		require.Eventually(t, func() bool { return env.pub.count() == 1 },
+			2*time.Second, 5*time.Millisecond,
+			"exactly one contract_completed event must be published within 2 s")
 
-		evt := env.pub.completed[0]
+		// Assert the published event shape — use snapshot() for race-safe access.
+		evts := env.pub.snapshot()
+		require.Len(t, evts, 1, "exactly one contract_completed event must be published")
+
+		evt := evts[0]
 		assert.NotEqual(t, uuid.Nil, evt.EventID)
 		assert.Equal(t, 1, evt.Version)
 		assert.Equal(t, contract.ID, evt.Data.ContractID)
@@ -402,8 +434,8 @@ func TestMilestone_Complete(t *testing.T) {
 		require.NoError(t, err)
 
 		// Both contracts must be ACTIVE before milestones can be added.
-		activateSinglePartyContract(t, ctx, env.mpSvc, contractA.ID, vendorForA)
-		activateSinglePartyContract(t, ctx, env.mpSvc, contractB.ID, vendorForB)
+		activateSinglePartyContract(t, ctx, env.mpSvc, contractA.ID, vendorForA, posterID)
+		activateSinglePartyContract(t, ctx, env.mpSvc, contractB.ID, vendorForB, posterID)
 
 		// Add milestone to contract A.
 		mA, err := env.milestoneSvc.AddMilestone(ctx, &service.AddMilestoneInput{
@@ -429,16 +461,18 @@ func TestMilestone_Complete(t *testing.T) {
 // activateSinglePartyContract submits a single-party (10000 bps) contract for
 // signatures and has the sole vendor sign, producing an ACTIVE contract.
 // vendor must be the VendorUserID used in CreateOrAddParty.
+// posterID is the contract owner required by the SubmitForSignatures owner-only gate.
 func activateSinglePartyContract(
 	t *testing.T,
 	ctx context.Context,
 	svc *service.MultipartyContractService,
 	contractID uuid.UUID,
 	vendor uuid.UUID,
+	posterID uuid.UUID,
 ) {
 	t.Helper()
 
-	submitted, err := svc.SubmitForSignatures(ctx, contractID)
+	submitted, err := svc.SubmitForSignatures(ctx, contractID, posterID)
 	require.NoError(t, err)
 
 	active, err := svc.Sign(ctx, service.SignInput{
@@ -455,16 +489,18 @@ func activateSinglePartyContract(
 // activateContract submits and signs a contract through to ACTIVE status.
 // Both vendorA (6000 bps) and vendorB (4000 bps) sign; returns the final ACTIVE contract.
 // Requires that the contract already has vendorA and vendorB as parties summing to 10000 bps.
+// posterID is the contract owner required by the SubmitForSignatures owner-only gate.
 func activateContract(
 	t *testing.T,
 	ctx context.Context,
 	svc *service.MultipartyContractService,
 	contractID uuid.UUID,
 	vendorA, vendorB uuid.UUID,
+	posterID uuid.UUID,
 ) {
 	t.Helper()
 
-	submitted, err := svc.SubmitForSignatures(ctx, contractID)
+	submitted, err := svc.SubmitForSignatures(ctx, contractID, posterID)
 	require.NoError(t, err)
 
 	v1Hash := submitted.ContentHash
@@ -523,7 +559,7 @@ func TestMilestone_Roster_ReturnsActiveParties(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		activateContract(t, ctx, env.mpSvc, contract.ID, vendorA, vendorB)
+		activateContract(t, ctx, env.mpSvc, contract.ID, vendorA, vendorB, posterID)
 
 		parties, err := env.milestoneSvc.GetPartyRoster(ctx, contract.ID)
 		require.NoError(t, err)
@@ -572,7 +608,7 @@ func TestMilestone_Roster_ReturnsActiveParties(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		activateContract(t, ctx, env.mpSvc, contract.ID, vendorA, vendorB)
+		activateContract(t, ctx, env.mpSvc, contract.ID, vendorA, vendorB, posterID)
 
 		// Add a third party via addendum → ADDENDUM_PENDING with vendorC at 0 bps.
 		_, _, err = env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
