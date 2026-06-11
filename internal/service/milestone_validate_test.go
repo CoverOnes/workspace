@@ -67,6 +67,10 @@ func (f *fakeMultipartyContractStore) GetByTenderID(_ context.Context, tenderID 
 	return nil, domain.ErrMultipartyContractNotFound
 }
 
+// GetByIDForUpdate delegates to GetByID in the fake; it does NOT issue a SELECT FOR
+// UPDATE — the real Postgres implementation (postgres.MultipartyContractStore) does.
+// This is intentional for unit tests: no DB transaction exists, and the test only
+// exercises code paths that do not depend on the serialization the lock provides.
 func (f *fakeMultipartyContractStore) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*domain.MultipartyContract, error) {
 	return f.GetByID(ctx, id)
 }

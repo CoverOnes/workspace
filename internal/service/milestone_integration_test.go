@@ -16,6 +16,7 @@ package service_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,14 +40,36 @@ type milestoneTestEnv struct {
 }
 
 // recordingPublisher records published events for assertion.
+// The mu guards all access to completed because PublishMultipartyContractCompleted is
+// called from a detached goroutine (post-commit best-effort publish) while the test
+// goroutine may concurrently call count() — without the mutex this is a data race.
 type recordingPublisher struct {
 	events.NoopPublisher
+	mu        sync.Mutex
 	completed []*domain.MultipartyContractCompletedEvent
 }
 
 func (r *recordingPublisher) PublishMultipartyContractCompleted(_ context.Context, evt *domain.MultipartyContractCompletedEvent) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.completed = append(r.completed, evt)
 	return nil
+}
+
+// count returns the number of recorded events in a race-safe manner.
+func (r *recordingPublisher) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.completed)
+}
+
+// snapshot returns a copy of all recorded events under the lock.
+func (r *recordingPublisher) snapshot() []*domain.MultipartyContractCompletedEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]*domain.MultipartyContractCompletedEvent, len(r.completed))
+	copy(out, r.completed)
+	return out
 }
 
 // startMilestoneTestDB returns a populated milestoneTestEnv backed by the singleton
@@ -312,15 +335,18 @@ func TestMilestone_Complete(t *testing.T) {
 		assert.True(t, completed.CompletedAt.After(before) || completed.CompletedAt.Equal(before),
 			"completedAt must be set to now")
 
-		// publishCompleted runs in a best-effort detached goroutine (same pattern as
-		// MultipartyContractService.Sign → publishActivated). Give the goroutine a brief
-		// window to complete the in-memory append before asserting.
-		time.Sleep(20 * time.Millisecond)
+		// publishCompleted runs in a best-effort detached goroutine. Poll with a
+		// generous timeout so we don't flake on loaded CI instead of sleeping a fixed
+		// 20 ms that may not be enough.
+		require.Eventually(t, func() bool { return env.pub.count() == 1 },
+			2*time.Second, 5*time.Millisecond,
+			"exactly one contract_completed event must be published within 2 s")
 
-		// Assert the published event shape.
-		require.Len(t, env.pub.completed, 1, "exactly one contract_completed event must be published")
+		// Assert the published event shape — use snapshot() for race-safe access.
+		evts := env.pub.snapshot()
+		require.Len(t, evts, 1, "exactly one contract_completed event must be published")
 
-		evt := env.pub.completed[0]
+		evt := evts[0]
 		assert.NotEqual(t, uuid.Nil, evt.EventID)
 		assert.Equal(t, 1, evt.Version)
 		assert.Equal(t, contract.ID, evt.Data.ContractID)

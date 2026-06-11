@@ -174,7 +174,10 @@ func (s *MilestoneService) CompleteMilestone(ctx context.Context, in CompleteMil
 		return nil, domain.ErrMilestoneNotFound
 	}
 
-	var completed *domain.Milestone
+	var (
+		completed      *domain.Milestone
+		lockedContract *domain.MultipartyContract
+	)
 
 	txErr := s.tx.WithMilestoneTx(ctx, func(
 		txCtx context.Context,
@@ -210,6 +213,11 @@ func (s *MilestoneService) CompleteMilestone(ctx context.Context, in CompleteMil
 		}
 
 		completed = m
+		// Capture the LOCKED row (post-guard) for publishCompleted so TenderID and
+		// ContractID reflect the committed state. Only ContractID and TenderID are used
+		// today; capturing the locked row removes future-staleness risk if more fields
+		// are added to publishCompleted.
+		lockedContract = c
 
 		return nil
 	})
@@ -221,9 +229,9 @@ func (s *MilestoneService) CompleteMilestone(ctx context.Context, in CompleteMil
 	// Best-effort publish OUTSIDE the transaction (post-commit).
 	// context.Background() is intentional: the request context is canceled when the
 	// HTTP handler returns; the publish must outlive the request.
-	capturedContract := contract
+	capturedContract := lockedContract
 	capturedMilestone := completed
-	//nolint:contextcheck,gosec // intentional: goroutine must outlive the request context; G118 is the design intent
+	//nolint:contextcheck,gosec // G118: intentional — goroutine must outlive the request context; context.Background() is the design intent
 	go func() {
 		s.publishCompleted(context.Background(), capturedContract, capturedMilestone)
 	}()
