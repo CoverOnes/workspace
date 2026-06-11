@@ -12,6 +12,7 @@ package service_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/CoverOnes/workspace/internal/domain"
 	"github.com/CoverOnes/workspace/internal/service"
@@ -164,6 +165,11 @@ func TestCompleteMilestone_RequiresActiveContract(t *testing.T) {
 		})
 		require.NoError(t, err, "CompleteMilestone on ACTIVE contract must succeed")
 		assert.Equal(t, domain.MilestoneStatusCompleted, completed.Status)
+
+		// publishCompleted runs in a best-effort detached goroutine; give it a brief
+		// window to complete the in-memory append before asserting event count.
+		time.Sleep(20 * time.Millisecond)
+
 		assert.Len(t, env.pub.completed, 1,
 			"CompleteMilestone on ACTIVE contract must emit exactly one disbursement event")
 	})

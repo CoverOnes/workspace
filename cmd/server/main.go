@@ -150,6 +150,7 @@ func run() error {
 	multipartyTxManager := postgres.NewMultipartyTxManager(pool)
 	addendumStore := postgres.NewAddendumStore(pool)
 	milestoneStore := postgres.NewMilestoneStore(pool)
+	milestoneTxManager := postgres.NewMilestoneTxManager(pool)
 
 	// Service layer.
 	contractSvc := service.NewContractService(contractStore, signatureStore, txManager, publisher)
@@ -164,7 +165,7 @@ func run() error {
 		multipartyTxManager,
 		publisher,
 	)
-	milestoneSvc := service.NewMilestoneService(multipartyContractStore, milestoneStore, multipartyPartyStore, publisher)
+	milestoneSvc := service.NewMilestoneService(multipartyContractStore, milestoneStore, multipartyPartyStore, milestoneTxManager, publisher)
 
 	// Router.
 	r := handler.NewRouter(&handler.RouterConfig{

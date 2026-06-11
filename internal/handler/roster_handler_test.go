@@ -104,8 +104,10 @@ func startRosterTestDB(t *testing.T, ctx context.Context) *rosterTestEnv {
 	msStore := postgres.NewMilestoneStore(pool)
 	pub := events.NewNoopPublisher()
 
+	milestoneTx := postgres.NewMilestoneTxManager(pool)
+
 	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, addendaStore, mpTx, pub)
-	milestoneSvc := service.NewMilestoneService(mpContracts, msStore, mpParties, pub)
+	milestoneSvc := service.NewMilestoneService(mpContracts, msStore, mpParties, milestoneTx, pub)
 
 	contractStore := postgres.NewContractStore(pool)
 	sigStore := postgres.NewSignatureStore(pool)
@@ -164,7 +166,7 @@ func activateRosterContract(
 	})
 	require.NoError(t, err)
 
-	submitted, err := svc.SubmitForSignatures(ctx, contract.ID)
+	submitted, err := svc.SubmitForSignatures(ctx, contract.ID, posterID)
 	require.NoError(t, err)
 
 	_, err = svc.Sign(ctx, service.SignInput{

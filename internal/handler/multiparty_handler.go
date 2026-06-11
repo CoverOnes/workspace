@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/CoverOnes/workspace/internal/platform/httpx"
+	"github.com/CoverOnes/workspace/internal/platform/middleware"
 	"github.com/CoverOnes/workspace/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -113,6 +114,7 @@ func (h *MultipartyHandler) CreateOrAddParty(c *gin.Context) {
 
 // SubmitForSignatures handles POST /v1/multiparty-contracts/:id/submit-for-signature.
 // Transitions DRAFT → PENDING_SIGNATURES after validating Σ(share_bps) == 10000.
+// Owner-only: caller must be the PosterUserID of the contract.
 func (h *MultipartyHandler) SubmitForSignatures(c *gin.Context) {
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -120,7 +122,13 @@ func (h *MultipartyHandler) SubmitForSignatures(c *gin.Context) {
 		return
 	}
 
-	contract, err := h.svc.SubmitForSignatures(c.Request.Context(), id)
+	identity, ok := middleware.IdentityFromCtx(c)
+	if !ok {
+		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+		return
+	}
+
+	contract, err := h.svc.SubmitForSignatures(c.Request.Context(), id, identity.UserID)
 	if err != nil {
 		httpx.Err(c, err)
 		return
@@ -162,20 +170,18 @@ func (h *MultipartyHandler) Sign(c *gin.Context) {
 		return
 	}
 
-	// For multiparty contracts, the signer_user_id is extracted from X-User-Id header
-	// (set by RequireValidIdentity middleware). Only vendors registered as ACTIVE parties
-	// can sign — the service / store enforce this via the unique index.
-	rawUID := c.GetHeader("X-User-Id")
-
-	signerUserID, parseErr := uuid.Parse(rawUID)
-	if parseErr != nil {
+	// Signer identity is extracted from the RequireValidIdentity middleware context.
+	// Only vendors registered as ACTIVE parties can sign — the service / store enforce
+	// this via the unique index and GetActivePartyByVendor check.
+	identity, ok := middleware.IdentityFromCtx(c)
+	if !ok {
 		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
 		return
 	}
 
 	in := service.SignInput{
 		ContractID:        id,
-		SignerUserID:      signerUserID,
+		SignerUserID:      identity.UserID,
 		SignedContentHash: req.SignedContentHash,
 		Version:           req.Version,
 	}
@@ -218,10 +224,8 @@ func (h *MultipartyHandler) UpdatePartyShare(c *gin.Context) {
 		return
 	}
 
-	rawUID := c.GetHeader("X-User-Id")
-
-	callerUserID, parseErr := uuid.Parse(rawUID)
-	if parseErr != nil {
+	identity, ok := middleware.IdentityFromCtx(c)
+	if !ok {
 		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
 		return
 	}
@@ -229,7 +233,7 @@ func (h *MultipartyHandler) UpdatePartyShare(c *gin.Context) {
 	updated, svcErr := h.svc.UpdatePartyShare(c.Request.Context(), service.UpdatePartyShareInput{
 		ContractID:   contractID,
 		PartyID:      partyID,
-		CallerUserID: callerUserID,
+		CallerUserID: identity.UserID,
 		NewShareBps:  req.ShareBps,
 	})
 	if svcErr != nil {
@@ -250,15 +254,13 @@ func (h *MultipartyHandler) GetDetail(c *gin.Context) {
 		return
 	}
 
-	rawUID := c.GetHeader("X-User-Id")
-
-	callerUserID, parseErr := uuid.Parse(rawUID)
-	if parseErr != nil {
+	identity, ok := middleware.IdentityFromCtx(c)
+	if !ok {
 		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
 		return
 	}
 
-	detail, err := h.svc.GetDetail(c.Request.Context(), id, callerUserID)
+	detail, err := h.svc.GetDetail(c.Request.Context(), id, identity.UserID)
 	if err != nil {
 		httpx.Err(c, err)
 		return

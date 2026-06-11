@@ -136,6 +136,18 @@ type MultipartyTxManager interface {
 	) error
 }
 
+// MilestoneTxManager runs a function inside a single Postgres transaction that
+// provides a transaction-scoped MultipartyContractStore (for GetByIDForUpdate) and
+// MilestoneStore (for MarkCompleted). Used by CompleteMilestone to prevent a
+// concurrent CancelContract from racing between the ACTIVE-status guard and the
+// milestone write.
+type MilestoneTxManager interface {
+	WithMilestoneTx(
+		ctx context.Context,
+		fn func(ctx context.Context, contracts MultipartyContractStore, milestones MilestoneStore) error,
+	) error
+}
+
 // MilestoneStore defines persistence operations for multiparty contract milestones.
 type MilestoneStore interface {
 	// Create inserts a new milestone row.

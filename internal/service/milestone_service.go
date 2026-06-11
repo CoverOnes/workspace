@@ -22,6 +22,7 @@ type MilestoneService struct {
 	contracts  store.MultipartyContractStore
 	milestones store.MilestoneStore
 	parties    store.MultipartyPartyStore
+	tx         store.MilestoneTxManager
 	publisher  events.Publisher
 }
 
@@ -30,12 +31,14 @@ func NewMilestoneService(
 	contracts store.MultipartyContractStore,
 	milestones store.MilestoneStore,
 	parties store.MultipartyPartyStore,
+	tx store.MilestoneTxManager,
 	publisher events.Publisher,
 ) *MilestoneService {
 	return &MilestoneService{
 		contracts:  contracts,
 		milestones: milestones,
 		parties:    parties,
+		tx:         tx,
 		publisher:  publisher,
 	}
 }
@@ -136,11 +139,19 @@ type CompleteMilestoneInput struct {
 // Best-effort publish: the milestone row is committed first; a publish failure
 // is logged as a warning but does NOT roll back the completion.
 //
+// The contract-status ACTIVE guard and the MarkCompleted write execute inside a
+// single transaction with SELECT FOR UPDATE on the contract row. This prevents a
+// concurrent CancelContract (ACTIVE→CANCELED) from racing between the guard and
+// the write, which would complete a milestone on a CANCELED contract and fire a
+// disbursement event for real money. (See backend-security-design §1 / M-race fix.)
+//
 // Returns ErrNotContractOwner (404) if the caller is not the poster.
 // Returns ErrInvalidTransition if the contract is not in ACTIVE status.
 // Returns ErrMilestoneAlreadyDone if the milestone is already COMPLETED.
 // Returns ErrMilestoneNotFound if the milestone does not exist.
 func (s *MilestoneService) CompleteMilestone(ctx context.Context, in CompleteMilestoneInput) (*domain.Milestone, error) {
+	// Owner check against the non-locked read (fast path — callerID is immutable).
+	// We re-verify ownership under the lock inside the tx for defense-in-depth.
 	contract, err := s.contracts.GetByID(ctx, in.ContractID)
 	if err != nil {
 		return nil, err
@@ -150,19 +161,9 @@ func (s *MilestoneService) CompleteMilestone(ctx context.Context, in CompleteMil
 		return nil, err
 	}
 
-	// Status guard: disbursement events may only be emitted for ACTIVE contracts.
-	// A CANCELED contract can still have PENDING milestone rows (the state machine
-	// allows ACTIVE→CANCELED). Completing a milestone on a CANCELED contract would
-	// publish a workspace.contract_completed event consumed by payment for
-	// disbursement — a real money-path hole. This guard closes that gap independently
-	// of the AddMilestone guard, because a contract can be canceled while a PENDING
-	// milestone already exists.
-	if contract.Status != domain.MultipartyContractStatusActive {
-		return nil, fmt.Errorf("%w: milestone completion requires an ACTIVE contract (contract is %s)",
-			domain.ErrInvalidTransition, contract.Status)
-	}
-
-	// Verify the milestone belongs to this contract before completing it (IDOR guard).
+	// Pre-tx milestone IDOR check: verify the milestone belongs to this contract
+	// before entering the transaction (avoids holding the row lock during a separate
+	// milestone table read that is not prone to the ACTIVE-cancel race).
 	existing, err := s.milestones.GetByID(ctx, in.MilestoneID)
 	if err != nil {
 		return nil, err
@@ -173,17 +174,61 @@ func (s *MilestoneService) CompleteMilestone(ctx context.Context, in CompleteMil
 		return nil, domain.ErrMilestoneNotFound
 	}
 
-	completedAt := time.Now().UTC()
+	var completed *domain.Milestone
 
-	m, err := s.milestones.MarkCompleted(ctx, in.MilestoneID, completedAt)
-	if err != nil {
-		return nil, err
+	txErr := s.tx.WithMilestoneTx(ctx, func(
+		txCtx context.Context,
+		txContracts store.MultipartyContractStore,
+		txMilestones store.MilestoneStore,
+	) error {
+		// FOR UPDATE lock: serializes CompleteMilestone with concurrent CancelContract.
+		// Re-fetch the contract under lock so the status check and the milestone write
+		// are atomic — no concurrent CancelContract can sneak between them.
+		c, lockErr := txContracts.GetByIDForUpdate(txCtx, in.ContractID)
+		if lockErr != nil {
+			return lockErr
+		}
+
+		// Re-check ownership against the locked row (defense-in-depth).
+		if err := assertContractOwner(c, in.CallerID); err != nil {
+			return err
+		}
+
+		// Status guard under the row lock: disbursement events may only be emitted for
+		// ACTIVE contracts. This guard now runs atomically with MarkCompleted so a
+		// concurrent CancelContract cannot race between the check and the write.
+		if c.Status != domain.MultipartyContractStatusActive {
+			return fmt.Errorf("%w: milestone completion requires an ACTIVE contract (contract is %s)",
+				domain.ErrInvalidTransition, c.Status)
+		}
+
+		completedAt := time.Now().UTC()
+
+		m, markErr := txMilestones.MarkCompleted(txCtx, in.MilestoneID, completedAt)
+		if markErr != nil {
+			return markErr
+		}
+
+		completed = m
+
+		return nil
+	})
+
+	if txErr != nil {
+		return nil, txErr
 	}
 
-	// Best-effort publish: log on failure, never fail the caller.
-	s.publishCompleted(ctx, contract, m)
+	// Best-effort publish OUTSIDE the transaction (post-commit).
+	// context.Background() is intentional: the request context is canceled when the
+	// HTTP handler returns; the publish must outlive the request.
+	capturedContract := contract
+	capturedMilestone := completed
+	//nolint:contextcheck,gosec // intentional: goroutine must outlive the request context; G118 is the design intent
+	go func() {
+		s.publishCompleted(context.Background(), capturedContract, capturedMilestone)
+	}()
 
-	return m, nil
+	return completed, nil
 }
 
 // GetPartyRoster returns the frozen ACTIVE-party roster for a multiparty contract.
@@ -275,6 +320,19 @@ func validateMilestoneInput(name string, amount decimal.Decimal, currency string
 
 	if amount.LessThanOrEqual(decimal.Zero) {
 		return fmt.Errorf("%w: amount must be greater than 0", domain.ErrValidation)
+	}
+
+	// Upper bound: numeric(14,2) max is 999999999999.99. An amount exceeding this
+	// will overflow at the DB layer and produce a 500 instead of a 400.
+	if amount.GreaterThan(maxNumeric14_2) {
+		return fmt.Errorf("%w: amount exceeds maximum allowed value (numeric(14,2) overflow)", domain.ErrValidation)
+	}
+
+	// Reject more than 2 decimal places: would be silently truncated by the DB
+	// or produce a constraint violation (500 instead of 400).
+	// Exponent() returns the scale as a negative number (e.g. -3 means 3 decimal places).
+	if amount.Exponent() < -2 {
+		return fmt.Errorf("%w: amount must not have more than 2 decimal places", domain.ErrValidation)
 	}
 
 	if !iso4217Re.MatchString(currency) {
