@@ -145,7 +145,8 @@ func VerifyGatewaySignature(secret string, rdb *redis.Client) gin.HandlerFunc {
 //
 // Canonical string format (length-prefix framing):
 //
-//	{len(method)}\n{method}\n{len(path)}\n{path}\n{len(bodyHashHex)}\n{bodyHashHex}\n{userId}|{kycTier}|{accountType}|{emailVerified}|{requestId}|{ts}
+//	{len(method)}\n{method}\n{len(path)}\n{path}\n{len(bodyHashHex)}\n{bodyHashHex}\n
+//	{userId}|{kycTier}|{accountType}|{emailVerified}|{requestId}|{ts}
 //
 // Body hash: hex(SHA-256(body)); empty body → hex(SHA-256("")).
 // Length prefix prevents delimiter injection: knowing the lengths, a parser can
