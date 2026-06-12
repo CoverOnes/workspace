@@ -633,10 +633,49 @@ func (s *MultipartyContractService) publishReSigned(ctx context.Context, contrac
 	}
 }
 
+// PartyView is the read model for a party in the contract roster.
+// ShareBps is a pointer: it is nil (omitted from JSON) when the caller is not the
+// owner and this party is not the caller — i.e. each vendor can only see their own
+// share_bps; the tender owner sees everyone's.
+type PartyView struct {
+	ID           uuid.UUID                    `json:"id"`
+	ContractID   uuid.UUID                    `json:"contractId"`
+	VendorUserID uuid.UUID                    `json:"vendorUserId"`
+	RoleID       *uuid.UUID                   `json:"roleId,omitempty"`
+	ShareBps     *int                         `json:"shareBps,omitempty"`
+	Status       domain.MultipartyPartyStatus `json:"status"`
+	CreatedAt    time.Time                    `json:"createdAt"`
+	UpdatedAt    time.Time                    `json:"updatedAt"`
+}
+
+// toPartyView converts a domain party row to a PartyView.
+// showShare controls whether ShareBps is included or redacted (nil).
+func toPartyView(p *domain.MultipartyContractParty, showShare bool) *PartyView {
+	pv := &PartyView{
+		ID:           p.ID,
+		ContractID:   p.ContractID,
+		VendorUserID: p.VendorUserID,
+		RoleID:       p.RoleID,
+		Status:       p.Status,
+		CreatedAt:    p.CreatedAt,
+		UpdatedAt:    p.UpdatedAt,
+	}
+
+	if showShare {
+		bps := p.ShareBps
+		pv.ShareBps = &bps
+	}
+
+	return pv
+}
+
 // ContractDetail carries the full contract read model for the GET endpoint.
+// Parties is always populated; ShareBps within each PartyView is only non-nil
+// for the party that matches the caller (or for all parties when the caller is the
+// tender owner). This enforces per-vendor share_bps confidentiality at the service layer.
 type ContractDetail struct {
 	Contract       *domain.MultipartyContract
-	Parties        []*domain.MultipartyContractParty
+	Parties        []*PartyView
 	Signatures     []*domain.MultipartyContractSignature
 	SignedCount    int
 	TotalParties   int
@@ -644,33 +683,35 @@ type ContractDetail struct {
 	CurrentVersion int
 }
 
-// GetDetail returns the full contract detail: contract + roster + per-version
-// signature progress (signed_count / total_active_parties / version_content_hash).
+// GetDetail returns the contract detail visible to the caller.
 //
-// Access is scoped to ACTIVE parties of the contract. A non-party caller receives
-// ErrNotParty (mapped to 404 to prevent resource-existence enumeration), mirroring
-// the assertParty pattern used by the 1:1 dual-sign aggregate.
+// Access rules:
+//   - Tender owner (PosterUserID): reads the full roster with ALL share_bps values.
+//   - ACTIVE party: reads the full roster but only their OWN share_bps; every other
+//     party's ShareBps is nil (omitted from JSON) to enforce confidentiality.
+//   - Non-party / non-owner: ErrNotParty → 404 (prevents resource-existence enumeration).
 //
-// NOTE: the tender OWNER is not a party per the owner-as-party locked decision
-// (see service-level comment and SubmitForSignatures). Owner-read access would need
-// a separate owner-only endpoint or a broader identity check not in scope for this PR.
-// TODO: if owner-read is required, add GetDetailByOwner that accepts the tenderID and
-// validates ownership against marketplace claims, then grant a read-only view without
-// share_bps details.
+// The redaction is performed at the service layer, not via JSON tags on the domain
+// struct, so it applies regardless of which serialiser the handler uses.
 func (s *MultipartyContractService) GetDetail(ctx context.Context, contractID, callerUserID uuid.UUID) (*ContractDetail, error) {
 	c, err := s.contracts.GetByID(ctx, contractID)
 	if err != nil {
 		return nil, err
 	}
 
-	// M-3 authz: verify the caller is an ACTIVE party before returning the full roster
-	// (which includes share_bps and content_hash). A non-party user who knows the
-	// contract ID can otherwise read the full digest needed to exploit C-1.
-	if _, authzErr := s.parties.GetActivePartyByVendor(ctx, contractID, callerUserID); authzErr != nil {
-		return nil, authzErr // ErrNotParty → 404
+	// Owner path: the poster can read the full roster including all share_bps.
+	// PosterUserID is nil on legacy rows created before migration 000007 — those rows
+	// have no stored owner, so the owner-read path is simply not available for them.
+	isOwner := c.PosterUserID != nil && *c.PosterUserID == callerUserID
+
+	if !isOwner {
+		// M-3 authz: non-owner must be an ACTIVE party to read any roster data.
+		if _, authzErr := s.parties.GetActivePartyByVendor(ctx, contractID, callerUserID); authzErr != nil {
+			return nil, authzErr // ErrNotParty → 404
+		}
 	}
 
-	parties, err := s.parties.ListActiveByContract(ctx, contractID)
+	rawParties, err := s.parties.ListActiveByContract(ctx, contractID)
 	if err != nil {
 		return nil, fmt.Errorf("list active parties: %w", err)
 	}
@@ -680,12 +721,19 @@ func (s *MultipartyContractService) GetDetail(ctx context.Context, contractID, c
 		return nil, fmt.Errorf("list signatures for version: %w", err)
 	}
 
+	parties := make([]*PartyView, len(rawParties))
+	for i, p := range rawParties {
+		// Owner sees all; party sees only their own share.
+		showShare := isOwner || p.VendorUserID == callerUserID
+		parties[i] = toPartyView(p, showShare)
+	}
+
 	return &ContractDetail{
 		Contract:       c,
 		Parties:        parties,
 		Signatures:     sigs,
 		SignedCount:    len(sigs),
-		TotalParties:   len(parties),
+		TotalParties:   len(rawParties),
 		ContentHash:    c.ContentHash,
 		CurrentVersion: c.Version,
 	}, nil
@@ -710,11 +758,13 @@ type UpdatePartyShareInput struct {
 // with SELECT FOR UPDATE on the contract row. A concurrent SubmitForSignatures cannot
 // transition the contract to PENDING_SIGNATURES between the check and the write.
 //
-// Returns the updated party row.
+// Returns a PartyView with ShareBps set (owner always sees the share they just wrote).
+// Using PartyView keeps the serialization format consistent with GetDetail and ensures
+// no raw domain.MultipartyContractParty reaches a browser-reachable response body.
 func (s *MultipartyContractService) UpdatePartyShare(
 	ctx context.Context,
 	in UpdatePartyShareInput,
-) (*domain.MultipartyContractParty, error) {
+) (*PartyView, error) {
 	if err := validateShareBps(in.NewShareBps); err != nil {
 		return nil, err
 	}
@@ -760,7 +810,8 @@ func (s *MultipartyContractService) UpdatePartyShare(
 		return nil, txErr
 	}
 
-	return updated, nil
+	// Owner always sees the share they just wrote (showShare=true).
+	return toPartyView(updated, true), nil
 }
 
 // assertLockedOwner checks that the DB-authoritative locked contract row has a PosterUserID

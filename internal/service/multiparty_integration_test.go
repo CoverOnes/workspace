@@ -856,16 +856,172 @@ func TestMultiparty_GetDetail(t *testing.T) {
 	assert.NotEmpty(t, detail.ContentHash)
 	assert.Len(t, detail.Parties, 2)
 
-	// Verify both party shares are correct.
-	shareMap := make(map[uuid.UUID]int)
+	// Security: vendorA (the caller) sees their own ShareBps; vendorB's is redacted (nil).
+	sharePtrMap := make(map[uuid.UUID]*int)
 	for _, p := range detail.Parties {
-		shareMap[p.VendorUserID] = p.ShareBps
+		sharePtrMap[p.VendorUserID] = p.ShareBps
 	}
 
-	assert.Equal(t, 7000, shareMap[vendorA])
-	assert.Equal(t, 3000, shareMap[vendorB])
+	require.NotNil(t, sharePtrMap[vendorA], "caller must see their own ShareBps")
+	assert.Equal(t, 7000, *sharePtrMap[vendorA])
+	assert.Nil(t, sharePtrMap[vendorB], "other party's ShareBps must be redacted (nil) for a party caller")
 
 	// Log for human inspection.
 	t.Logf("detail: signed=%d / total=%d, hash=%s, version=%d",
 		detail.SignedCount, detail.TotalParties, fmt.Sprintf("%.12s...", detail.ContentHash), detail.CurrentVersion)
+}
+
+// TestMultiparty_GetDetail_ShareBpsConfidentiality verifies the per-vendor share_bps
+// confidentiality requirement:
+//   - An ACTIVE party caller sees only their own ShareBps; all other parties' ShareBps are nil.
+//   - The tender owner (PosterUserID) sees ALL parties' ShareBps.
+//   - A non-party / non-owner caller receives ErrNotParty (404).
+func TestMultiparty_GetDetail_ShareBpsConfidentiality(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping multiparty integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	t.Run("party caller sees only own ShareBps, others redacted", func(t *testing.T) {
+		env := startMultipartyTestDB(t, ctx)
+
+		posterID := uuid.New()
+		vendorA := uuid.New()
+		vendorB := uuid.New()
+		vendorC := uuid.New()
+
+		contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+			TenderID:     uuid.New(),
+			VendorUserID: vendorA,
+			ShareBps:     5000,
+			PosterUserID: &posterID,
+		})
+		require.NoError(t, err)
+
+		_, _, err = env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+			TenderID:     contract.TenderID,
+			VendorUserID: vendorB,
+			ShareBps:     3000,
+		})
+		require.NoError(t, err)
+
+		_, _, err = env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+			TenderID:     contract.TenderID,
+			VendorUserID: vendorC,
+			ShareBps:     2000,
+		})
+		require.NoError(t, err)
+
+		// Call GetDetail as vendorB (one of three parties).
+		detail, err := env.mpSvc.GetDetail(ctx, contract.ID, vendorB)
+		require.NoError(t, err)
+
+		assert.Len(t, detail.Parties, 3, "roster must contain all three parties")
+
+		for _, p := range detail.Parties {
+			if p.VendorUserID == vendorB {
+				require.NotNil(t, p.ShareBps, "caller's own ShareBps must be visible")
+				assert.Equal(t, 3000, *p.ShareBps)
+			} else {
+				assert.Nil(t, p.ShareBps,
+					"other party's ShareBps must be redacted for a party caller (vendor %s)", p.VendorUserID)
+			}
+		}
+	})
+
+	t.Run("owner sees all parties' ShareBps", func(t *testing.T) {
+		env := startMultipartyTestDB(t, ctx)
+
+		posterID := uuid.New()
+		vendorA := uuid.New()
+		vendorB := uuid.New()
+
+		contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+			TenderID:     uuid.New(),
+			VendorUserID: vendorA,
+			ShareBps:     6000,
+			PosterUserID: &posterID,
+		})
+		require.NoError(t, err)
+
+		_, _, err = env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+			TenderID:     contract.TenderID,
+			VendorUserID: vendorB,
+			ShareBps:     4000,
+		})
+		require.NoError(t, err)
+
+		// Owner (posterID) is not a party — GetDetail must succeed and show all shares.
+		detail, err := env.mpSvc.GetDetail(ctx, contract.ID, posterID)
+		require.NoError(t, err, "owner must be able to read GetDetail")
+
+		assert.Len(t, detail.Parties, 2, "owner must see the full roster")
+
+		shareMap := make(map[uuid.UUID]int)
+		for _, p := range detail.Parties {
+			require.NotNil(t, p.ShareBps,
+				"owner must see all parties' ShareBps (party %s)", p.VendorUserID)
+			shareMap[p.VendorUserID] = *p.ShareBps
+		}
+
+		assert.Equal(t, 6000, shareMap[vendorA])
+		assert.Equal(t, 4000, shareMap[vendorB])
+	})
+
+	t.Run("non-party non-owner caller receives ErrNotParty", func(t *testing.T) {
+		env := startMultipartyTestDB(t, ctx)
+
+		posterID := uuid.New()
+		vendorA := uuid.New()
+		outsider := uuid.New()
+
+		contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+			TenderID:     uuid.New(),
+			VendorUserID: vendorA,
+			ShareBps:     10000,
+			PosterUserID: &posterID,
+		})
+		require.NoError(t, err)
+
+		_, detailErr := env.mpSvc.GetDetail(ctx, contract.ID, outsider)
+		require.ErrorIs(t, detailErr, domain.ErrNotParty,
+			"non-party non-owner caller must receive ErrNotParty")
+	})
+
+	t.Run("legacy contract with nil PosterUserID: owner-read path unavailable, party-read still works", func(t *testing.T) {
+		env := startMultipartyTestDB(t, ctx)
+
+		// PosterUserID intentionally omitted (nil) to simulate a legacy row.
+		vendorA := uuid.New()
+		vendorB := uuid.New()
+
+		contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+			TenderID:     uuid.New(),
+			VendorUserID: vendorA,
+			ShareBps:     7000,
+			PosterUserID: nil, // legacy: no stored owner
+		})
+		require.NoError(t, err)
+
+		_, _, err = env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+			TenderID:     contract.TenderID,
+			VendorUserID: vendorB,
+			ShareBps:     3000,
+		})
+		require.NoError(t, err)
+
+		// Party caller can still read the detail (their own share visible, others hidden).
+		detail, err := env.mpSvc.GetDetail(ctx, contract.ID, vendorA)
+		require.NoError(t, err)
+
+		for _, p := range detail.Parties {
+			if p.VendorUserID == vendorA {
+				require.NotNil(t, p.ShareBps)
+				assert.Equal(t, 7000, *p.ShareBps)
+			} else {
+				assert.Nil(t, p.ShareBps, "other party must be redacted even on legacy contract")
+			}
+		}
+	})
 }
