@@ -124,7 +124,7 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 
 		// Public API routes — authenticated users.
 		mpAPI := r.Group("/v1/multiparty-contracts")
-		mpAPI.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret))
+		mpAPI.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret, cfg.Redis))
 		mpAPI.Use(middleware.RequireValidIdentity())
 		// Apply the shared per-user limiter to mpAPI as well so that
 		// /v1/multiparty-contracts/* cannot bypass the per-user budget.
@@ -165,7 +165,7 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	// RequireValidIdentity trusts any X-User-Id / X-Kyc-Tier / X-Account-Type /
 	// X-Email-Verified header. When the secret is empty (dev) this is a no-op
 	// passthrough, matching the gateway's dev signing-skip.
-	api.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret))
+	api.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret, cfg.Redis))
 	api.Use(middleware.RequireValidIdentity())
 	// Apply the shared per-user limiter — mounted AFTER RequireValidIdentity so the
 	// identity is already in context and the limiter key is always gateway-verified.
