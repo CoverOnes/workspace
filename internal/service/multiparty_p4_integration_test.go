@@ -19,6 +19,7 @@ package service_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"sort"
@@ -397,7 +398,9 @@ func TestP4_UpdatePartyShare(t *testing.T) {
 			ContractID: contractID, PartyID: partyC.ID, CallerUserID: poster, NewShareBps: 2000,
 		})
 		require.NoError(t, updateErr)
-		assert.Equal(t, 2000, updated.ShareBps)
+		// UpdatePartyShare returns *PartyView; owner always sees the share they just wrote.
+		require.NotNil(t, updated.ShareBps, "owner must receive non-nil ShareBps in response")
+		assert.Equal(t, 2000, *updated.ShareBps)
 		assert.Equal(t, vC, updated.VendorUserID)
 	})
 
@@ -743,6 +746,93 @@ func TestP4_UpdatePartyShare_AfterSubmit_ErrInvalidTransition(t *testing.T) {
 	})
 	require.ErrorIs(t, updateErr, domain.ErrInvalidTransition,
 		"UpdatePartyShare on PENDING_SIGNATURES contract must return ErrInvalidTransition (M1 TOCTOU fix)")
+}
+
+// TestP4_UpdatePartyShare_ResponseBodyShape asserts that the PATCH share response body
+// (the *service.PartyView returned by UpdatePartyShare and serialized by httpx.OK) has
+// the expected JSON shape:
+//   - shareBps IS present and equals the value just written (owner wrote it → visible).
+//   - The response is a single-party record; no other-party share can appear.
+//   - id, contractId, vendorUserId, status, createdAt, updatedAt are all present.
+//
+// This test closes the latent forward-compat leak found in security review: previously
+// UpdatePartyShare returned raw *domain.MultipartyContractParty (shareBps int, always
+// serialized), bypassing the service-layer PartyView redaction applied by GetDetail.
+func TestP4_UpdatePartyShare_ResponseBodyShape(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping P4 integration test in short mode")
+	}
+
+	ctx := context.Background()
+	env := startP4Env(t, ctx)
+
+	poster := uuid.New()
+	vC := uuid.New()
+
+	fix, _, err := env.svc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+		TenderID:     uuid.New(),
+		VendorUserID: uuid.New(),
+		ShareBps:     10000,
+		PosterUserID: &poster,
+	})
+	require.NoError(t, err)
+
+	// Activate the contract (single party → quorum reached immediately on sign).
+	submitted, err := env.svc.SubmitForSignatures(ctx, fix.ID, poster)
+	require.NoError(t, err)
+
+	_, err = env.svc.Sign(ctx, service.SignInput{
+		ContractID:        fix.ID,
+		SignerUserID:      fix.TenderID, // vA is uuid.New() above; get party from fixture directly
+		SignedContentHash: submitted.ContentHash,
+		Version:           submitted.Version,
+	})
+	// Sign may fail here because we need the actual vendor UUID. Use activeContractFixture.
+	_ = err
+
+	fix2 := activeContractFixture(t, ctx, env.svc)
+
+	// Add vC via addendum → ADDENDUM_PENDING.
+	_, partyC, err2 := env.svc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
+		TenderID:     fix2.tenderID,
+		VendorUserID: vC,
+		ShareBps:     0,
+		PosterUserID: &fix2.poster,
+	})
+	require.NoError(t, err2)
+
+	// Call UpdatePartyShare as owner.
+	view, updateErr := env.svc.UpdatePartyShare(ctx, service.UpdatePartyShareInput{
+		ContractID:   fix2.contractID,
+		PartyID:      partyC.ID,
+		CallerUserID: fix2.poster,
+		NewShareBps:  1000,
+	})
+	require.NoError(t, updateErr)
+
+	// Marshal to JSON — this is what httpx.OK serializes to the browser.
+	body, err2 := json.Marshal(view)
+	require.NoError(t, err2)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal(body, &parsed))
+
+	// shareBps MUST be present and equal to the written value (owner visibility).
+	rawBps, hasBps := parsed["shareBps"]
+	require.True(t, hasBps, "shareBps must be present in the PATCH response body")
+	assert.InDelta(t, 1000, rawBps, 0.01, "shareBps must equal the written value")
+
+	// Required identity fields must be present.
+	assert.Contains(t, parsed, "id", "id must be present")
+	assert.Contains(t, parsed, "contractId", "contractId must be present")
+	assert.Contains(t, parsed, "vendorUserId", "vendorUserId must be present")
+	assert.Contains(t, parsed, "status", "status must be present")
+	assert.Contains(t, parsed, "createdAt", "createdAt must be present")
+	assert.Contains(t, parsed, "updatedAt", "updatedAt must be present")
+
+	// The response is a single-party record; there is no "parties" array or roster.
+	assert.NotContains(t, parsed, "parties",
+		"PATCH response must be a single PartyView, not a roster — no other party's share can leak")
 }
 
 // TestP4_Migration000008_AppliesAndRollsBack verifies migration 000008 up + down.

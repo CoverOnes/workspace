@@ -758,11 +758,13 @@ type UpdatePartyShareInput struct {
 // with SELECT FOR UPDATE on the contract row. A concurrent SubmitForSignatures cannot
 // transition the contract to PENDING_SIGNATURES between the check and the write.
 //
-// Returns the updated party row.
+// Returns a PartyView with ShareBps set (owner always sees the share they just wrote).
+// Using PartyView keeps the serialization format consistent with GetDetail and ensures
+// no raw domain.MultipartyContractParty reaches a browser-reachable response body.
 func (s *MultipartyContractService) UpdatePartyShare(
 	ctx context.Context,
 	in UpdatePartyShareInput,
-) (*domain.MultipartyContractParty, error) {
+) (*PartyView, error) {
 	if err := validateShareBps(in.NewShareBps); err != nil {
 		return nil, err
 	}
@@ -808,7 +810,8 @@ func (s *MultipartyContractService) UpdatePartyShare(
 		return nil, txErr
 	}
 
-	return updated, nil
+	// Owner always sees the share they just wrote (showShare=true).
+	return toPartyView(updated, true), nil
 }
 
 // assertLockedOwner checks that the DB-authoritative locked contract row has a PosterUserID
