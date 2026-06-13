@@ -20,6 +20,7 @@ type RouterConfig struct {
 	WorklogSvc            *service.WorklogService
 	MultipartyContractSvc *service.MultipartyContractService
 	MilestoneSvc          *service.MilestoneService
+	AuditLogSvc           *service.AuditLogService
 	Pool                  *pgxpool.Pool
 	Redis                 *redis.Client // may be nil in dev
 	// ContractServiceToken is the pre-shared secret that the marketplace service
@@ -152,6 +153,13 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	if cfg.MilestoneSvc != nil {
 		internalPartiesH := NewInternalPartiesHandler(cfg.MilestoneSvc)
 		internal.GET("/contracts/:id/parties", internalPartiesH.GetParties)
+	}
+
+	// Audit log endpoint (§24.1 gated — S2S only, protected by RequireServiceToken).
+	// Returns the full hash-chain audit log + integrity flag for a contract.
+	if cfg.AuditLogSvc != nil {
+		auditLogH := NewAuditLogHandler(cfg.AuditLogSvc)
+		internal.GET("/contracts/:id/audit", auditLogH.GetAuditLog)
 	}
 
 	// All API routes require a valid identity (gateway-injected X-User-Id).

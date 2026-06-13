@@ -161,3 +161,17 @@ type MilestoneStore interface {
 	// Returns ErrMilestoneAlreadyDone if it is already COMPLETED.
 	MarkCompleted(ctx context.Context, id uuid.UUID, completedAt time.Time) (*domain.Milestone, error)
 }
+
+// ContractAuditLogStore defines persistence operations for contract audit logs.
+// This is an append-only store — no Update or Delete methods are intentionally exposed.
+// The advisory lock (pg_advisory_xact_lock) is acquired inside Append to serialize
+// concurrent writes for the same contract_id.
+type ContractAuditLogStore interface {
+	// Append inserts a new audit log entry, acquiring a tx-level advisory lock on the
+	// contract_id to prevent concurrent appends from breaking the hash chain.
+	// The prev_hash and hash fields MUST be pre-computed by the caller before passing
+	// the entry to this method.
+	Append(ctx context.Context, entry *domain.ContractAuditLog) error
+	// ListByContract returns all audit log entries for a contract ordered by created_at ASC.
+	ListByContract(ctx context.Context, contractID uuid.UUID) ([]*domain.ContractAuditLog, error)
+}
