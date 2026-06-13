@@ -42,6 +42,26 @@ func TestAuditEntryDigest_DifferentPrevHash(t *testing.T) {
 	assert.NotEqual(t, h1, h2, "different prev_hash must produce different hash")
 }
 
+// TestAuditEntryDigest_LengthPrefixBoundary verifies that the length-prefixed encoding
+// prevents boundary confusion between adjacent variable-length fields.
+// Without length prefixes, ("AB", "CD") and ("A", "BCD") would produce identical byte
+// streams for eventType+actorID; with length prefixes they are distinct.
+func TestAuditEntryDigest_LengthPrefixBoundary(t *testing.T) {
+	contractID := uuid.New()
+	actorID := uuid.New()
+	payload := map[string]any{}
+
+	// Two different (prevHash, eventType) pairs whose raw concatenation is identical
+	// but whose length-prefixed encoding is different.
+	h1, err := domain.AuditEntryDigest("AB", contractID, "CD", actorID, payload)
+	require.NoError(t, err)
+
+	h2, err := domain.AuditEntryDigest("A", contractID, "BCD", actorID, payload)
+	require.NoError(t, err)
+
+	assert.NotEqual(t, h1, h2, "length-prefixed encoding must distinguish boundary-ambiguous inputs")
+}
+
 // TestVerifyAuditChain_IntactChain verifies a correctly-chained sequence of 5 entries.
 func TestVerifyAuditChain_IntactChain(t *testing.T) {
 	contractID := uuid.New()
@@ -119,6 +139,7 @@ func buildChain(t *testing.T, contractID, actorID uuid.UUID, n int) []*domain.Co
 		require.NoError(t, err)
 
 		entries[i] = &domain.ContractAuditLog{
+			Seq:        int64(i + 1),
 			ID:         uuid.New(),
 			ContractID: contractID,
 			EventType:  "TEST_EVENT",

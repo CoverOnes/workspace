@@ -3,7 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
-	"time"
+	"unicode"
 
 	"github.com/CoverOnes/workspace/internal/domain"
 	"github.com/CoverOnes/workspace/internal/store"
@@ -11,7 +11,8 @@ import (
 )
 
 // AuditLogService handles business logic for the contract audit log.
-// It enforces append-only semantics and computes the hash chain automatically.
+// It enforces append-only semantics; hash computation and chain linking
+// are the responsibility of the store layer.
 type AuditLogService struct {
 	auditLogs store.ContractAuditLogStore
 }
@@ -29,20 +30,12 @@ type AppendInput struct {
 	Payload    map[string]any
 }
 
-// Append inserts a new entry into the hash chain for the given contract.
-// It fetches the latest entry for the contract, computes prev_hash and hash,
-// then delegates the insert (with advisory lock) to the store.
+// Append validates the input and delegates the atomic lock+read+compute+insert
+// operation to the store layer. The store acquires the advisory lock, reads the
+// chain tail, computes the hash, and inserts — all inside one transaction.
 func (s *AuditLogService) Append(ctx context.Context, in *AppendInput) (*domain.ContractAuditLog, error) {
 	if err := validateAppendInput(in); err != nil {
 		return nil, err
-	}
-
-	// Fetch the current tail to determine prev_hash.
-	// The advisory lock in the store layer ensures that between this read and the
-	// INSERT, no other goroutine can insert for the same contract_id.
-	prevHash, err := s.latestHash(ctx, in.ContractID)
-	if err != nil {
-		return nil, fmt.Errorf("fetch latest audit hash for contract %s: %w", in.ContractID, err)
 	}
 
 	payload := in.Payload
@@ -50,23 +43,13 @@ func (s *AuditLogService) Append(ctx context.Context, in *AppendInput) (*domain.
 		payload = map[string]any{}
 	}
 
-	hash, err := domain.AuditEntryDigest(prevHash, in.ContractID, in.EventType, in.ActorID, payload)
-	if err != nil {
-		return nil, fmt.Errorf("compute audit entry digest: %w", err)
-	}
-
-	entry := &domain.ContractAuditLog{
-		ID:         uuid.New(),
+	entry, err := s.auditLogs.Append(ctx, &store.AuditAppendInput{
 		ContractID: in.ContractID,
 		EventType:  in.EventType,
 		ActorID:    in.ActorID,
 		Payload:    payload,
-		PrevHash:   prevHash,
-		Hash:       hash,
-		CreatedAt:  time.Now().UTC(),
-	}
-
-	if err := s.auditLogs.Append(ctx, entry); err != nil {
+	})
+	if err != nil {
 		return nil, fmt.Errorf("append audit log entry: %w", err)
 	}
 
@@ -90,21 +73,7 @@ func (s *AuditLogService) GetAuditLog(ctx context.Context, contractID uuid.UUID)
 	return entries, intact, nil
 }
 
-// latestHash returns the hash of the most recent entry for the contract,
-// or the empty string if no entries exist yet (genesis entry).
-func (s *AuditLogService) latestHash(ctx context.Context, contractID uuid.UUID) (string, error) {
-	entries, err := s.auditLogs.ListByContract(ctx, contractID)
-	if err != nil {
-		return "", err
-	}
-
-	if len(entries) == 0 {
-		return "", nil
-	}
-
-	return entries[len(entries)-1].Hash, nil
-}
-
+// validateAppendInput performs client-side validation before hitting the DB.
 func validateAppendInput(in *AppendInput) error {
 	if in.ContractID == uuid.Nil {
 		return fmt.Errorf("%w: contractId is required", domain.ErrValidation)
@@ -112,6 +81,19 @@ func validateAppendInput(in *AppendInput) error {
 
 	if in.EventType == "" {
 		return fmt.Errorf("%w: eventType is required", domain.ErrValidation)
+	}
+
+	if len(in.EventType) > 100 {
+		return fmt.Errorf("%w: eventType must be at most 100 characters", domain.ErrValidation)
+	}
+
+	// eventType must contain only printable ASCII letters, digits, and underscores.
+	// This prevents control characters and Unicode that would differ between DB CHECK
+	// and Go length counting.
+	for _, r := range in.EventType {
+		if !unicode.IsPrint(r) || r > 127 {
+			return fmt.Errorf("%w: eventType must contain only printable ASCII characters", domain.ErrValidation)
+		}
 	}
 
 	if in.ActorID == uuid.Nil {

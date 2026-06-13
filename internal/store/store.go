@@ -162,16 +162,26 @@ type MilestoneStore interface {
 	MarkCompleted(ctx context.Context, id uuid.UUID, completedAt time.Time) (*domain.Milestone, error)
 }
 
+// AuditAppendInput carries the caller-supplied fields for a new audit log entry.
+// The store is responsible for acquiring the advisory lock, reading the chain tail,
+// computing prev_hash and hash, and inserting — all inside a single transaction.
+type AuditAppendInput struct {
+	ContractID uuid.UUID
+	EventType  string
+	ActorID    uuid.UUID
+	Payload    map[string]any
+}
+
 // ContractAuditLogStore defines persistence operations for contract audit logs.
 // This is an append-only store — no Update or Delete methods are intentionally exposed.
 // The advisory lock (pg_advisory_xact_lock) is acquired inside Append to serialize
-// concurrent writes for the same contract_id.
+// concurrent writes for the same contract_id, preventing hash-chain forks.
 type ContractAuditLogStore interface {
-	// Append inserts a new audit log entry, acquiring a tx-level advisory lock on the
-	// contract_id to prevent concurrent appends from breaking the hash chain.
-	// The prev_hash and hash fields MUST be pre-computed by the caller before passing
-	// the entry to this method.
-	Append(ctx context.Context, entry *domain.ContractAuditLog) error
-	// ListByContract returns all audit log entries for a contract ordered by created_at ASC.
+	// Append acquires a tx-level advisory lock on contract_id, reads the chain tail,
+	// computes prev_hash and hash, then inserts the new entry — all in one transaction.
+	// This eliminates the TOCTOU window that would allow concurrent appends to fork
+	// the chain.
+	Append(ctx context.Context, in *AuditAppendInput) (*domain.ContractAuditLog, error)
+	// ListByContract returns all audit log entries for a contract ordered by seq ASC.
 	ListByContract(ctx context.Context, contractID uuid.UUID) ([]*domain.ContractAuditLog, error)
 }

@@ -7,15 +7,21 @@ import (
 )
 
 // ContractAuditLog is a single entry in the append-only hash-chain audit log.
-// The chain is per-contract: each new entry hashes
 //
-//	SHA-256(prev_hash || contract_id || event_type || actor_id || payload)
+// # Security scope
 //
-// where prev_hash is the hash of the immediately preceding entry for the same
-// contract_id (or the empty string for the genesis entry).
+// The chain detects accidental or application-layer tampering: reordering, deletion,
+// payload modification, and partial writes. Each entry's hash covers the previous
+// entry's hash so any break in the chain is detectable by VerifyAuditChain.
+//
+// Limitation: a DB-privileged attacker who can write arbitrary rows can recompute the
+// entire chain and produce a consistent but forged history. Preventing that requires
+// an HMAC key that is never stored in the DB (e.g. an HSM or external audit anchor).
+// Whether to add HMAC is a separate product decision tracked in the GTD backlog.
 //
 // All IDs are soft refs (NO FK). Referential integrity is enforced in the service layer.
 type ContractAuditLog struct {
+	Seq        int64          `json:"seq"`
 	ID         uuid.UUID      `json:"id"`
 	ContractID uuid.UUID      `json:"contractId"`
 	EventType  string         `json:"eventType"`
