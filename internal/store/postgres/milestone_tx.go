@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/shopspring/decimal"
 )
 
 // MilestoneTxManager implements store.MilestoneTxManager using pgxpool.Pool.
@@ -86,4 +87,10 @@ func (s *txMilestoneStore) ListByContract(ctx context.Context, contractID uuid.U
 func (s *txMilestoneStore) MarkCompleted(ctx context.Context, id uuid.UUID, completedAt time.Time) (*domain.Milestone, error) {
 	ms := &MilestoneStore{q: s.q}
 	return ms.MarkCompleted(ctx, id, completedAt)
+}
+
+// SumAmountsByContract returns the sum of ALL milestone amounts within a transaction.
+func (s *txMilestoneStore) SumAmountsByContract(ctx context.Context, contractID uuid.UUID) (decimal.Decimal, error) {
+	ms := &MilestoneStore{q: s.q}
+	return ms.SumAmountsByContract(ctx, contractID)
 }

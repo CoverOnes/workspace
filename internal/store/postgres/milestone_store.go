@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/shopspring/decimal"
 )
 
 // MilestoneStore is a pool-backed store for multiparty contract milestones.
@@ -118,6 +119,30 @@ RETURNING id, multi_contract_id, name, amount, currency, sequence, status, compl
 	}
 
 	return m, nil
+}
+
+// SumAmountsByContract returns the sum of ALL milestone amounts for the given contract
+// regardless of status (PENDING + COMPLETED both included).
+// Uses COALESCE(SUM(amount),0)::text and decimal.NewFromString to avoid float64 precision loss.
+// Returns decimal.Zero (not an error) when no milestone rows exist for the contract.
+func (s *MilestoneStore) SumAmountsByContract(ctx context.Context, contractID uuid.UUID) (decimal.Decimal, error) {
+	const query = `
+SELECT COALESCE(SUM(amount), 0)::text
+FROM multiparty_milestones
+WHERE multi_contract_id = $1
+`
+
+	var amtStr string
+	if err := s.q.QueryRow(ctx, query, contractID).Scan(&amtStr); err != nil {
+		return decimal.Zero, fmt.Errorf("sum milestone amounts by contract: %w", err)
+	}
+
+	amt, parseErr := decimal.NewFromString(amtStr)
+	if parseErr != nil {
+		return decimal.Zero, fmt.Errorf("parse milestone sum %q: %w", amtStr, parseErr)
+	}
+
+	return amt, nil
 }
 
 // milestoneExists checks whether a milestone with the given id exists (any status).
