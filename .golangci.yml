@@ -55,6 +55,23 @@ linters:
     - nilerr
     - contextcheck
 
+  exclusions:
+    rules:
+      - path: .*_test\.go$
+        linters:
+          - mnd
+          - gocyclo
+          - dupl      # test functions intentionally share similar table-driven structure
+          - goconst
+          - lll
+          - noctx     # httptest.NewRequest without context is standard test pattern
+
+      - path: tests/integration/
+        linters:
+          - typecheck
+          - errcheck
+          - lll
+
   settings:
     gocyclo:
       min-complexity: 15
@@ -111,32 +128,16 @@ linters:
         - G115 # Integer overflow int->uint32 — suppressed via nolint on specific lines
 
 issues:
-  exclude-rules:
-    - path: .*_test\.go$
-      linters:
-        - mnd
-        - gocyclo
-        - dupl      # test functions intentionally share similar table-driven structure
-        - goconst
-        - lll
-        - noctx     # httptest.NewRequest without context is standard test pattern
-
-    - path: tests/integration/
-      linters:
-        - typecheck
-        - errcheck
-        - lll
-
   max-issues-per-linter: 0
   max-same-issues: 0
   uniq-by-line: false
 
 output:
   formats:
-    colored-line-number:
+    text:
       path: stdout
-  print-issued-lines: true
-  print-linter-name: true
+      print-issued-lines: true
+      print-linter-name: true
 
 severity:
-  default-severity: error
+  default: error

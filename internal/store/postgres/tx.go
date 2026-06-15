@@ -22,9 +22,10 @@ func NewTxManager(pool *pgxpool.Pool) *TxManager {
 
 // WithTx runs fn inside a single Postgres transaction.
 // If fn returns an error the transaction is rolled back; otherwise it is committed.
+// The outbox store is passed so callers can enqueue events atomically with domain writes.
 func (m *TxManager) WithTx(
 	ctx context.Context,
-	fn func(ctx context.Context, contracts store.ContractStore, signatures store.SignatureStore) error,
+	fn func(ctx context.Context, contracts store.ContractStore, signatures store.SignatureStore, outbox store.OutboxStore) error,
 ) error {
 	tx, err := m.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -39,8 +40,9 @@ func (m *TxManager) WithTx(
 
 	txContracts := &txContractStore{tx: tx}
 	txSignatures := &txSignatureStore{tx: tx}
+	txOutbox := &txOutboxStore{tx: tx}
 
-	if fnErr := fn(ctx, txContracts, txSignatures); fnErr != nil {
+	if fnErr := fn(ctx, txContracts, txSignatures, txOutbox); fnErr != nil {
 		return fnErr
 	}
 

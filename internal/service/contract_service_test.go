@@ -102,13 +102,60 @@ func (f *fakeSignatureStore) CountValidSignatures(_ context.Context, contractID 
 type fakeTxManager struct {
 	contracts store.ContractStore
 	sigs      store.SignatureStore
+	outbox    store.OutboxStore
 }
 
 func (m *fakeTxManager) WithTx(
 	ctx context.Context,
-	fn func(ctx context.Context, c store.ContractStore, s store.SignatureStore) error,
+	fn func(ctx context.Context, c store.ContractStore, s store.SignatureStore, o store.OutboxStore) error,
 ) error {
-	return fn(ctx, m.contracts, m.sigs)
+	return fn(ctx, m.contracts, m.sigs, m.outbox)
+}
+
+// noopOutboxStore is a test double for store.OutboxStore that discards all Enqueue calls.
+type noopOutboxStore struct{}
+
+func (*noopOutboxStore) Enqueue(_ context.Context, _ *store.OutboxEnqueueInput) error { return nil }
+func (*noopOutboxStore) FetchPending(_ context.Context, _ int) ([]*domain.OutboxEntry, error) {
+	return nil, nil
+}
+func (*noopOutboxStore) MarkPublished(_ context.Context, _ uuid.UUID) error { return nil }
+func (*noopOutboxStore) RecordFailure(_ context.Context, _ uuid.UUID, _ string, _ time.Time) error {
+	return nil
+}
+
+func (*noopOutboxStore) DeleteOldPublished(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
+func (*noopOutboxStore) CountStalePending(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
+// spyOutboxStore records Enqueue calls for assertion in unit tests.
+type spyOutboxStore struct {
+	enqueued []*store.OutboxEnqueueInput
+}
+
+func (s *spyOutboxStore) Enqueue(_ context.Context, in *store.OutboxEnqueueInput) error {
+	s.enqueued = append(s.enqueued, in)
+	return nil
+}
+
+func (s *spyOutboxStore) FetchPending(_ context.Context, _ int) ([]*domain.OutboxEntry, error) {
+	return nil, nil
+}
+func (s *spyOutboxStore) MarkPublished(_ context.Context, _ uuid.UUID) error { return nil }
+func (s *spyOutboxStore) RecordFailure(_ context.Context, _ uuid.UUID, _ string, _ time.Time) error {
+	return nil
+}
+
+func (s *spyOutboxStore) DeleteOldPublished(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
+func (s *spyOutboxStore) CountStalePending(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
 }
 
 type fakePublisher struct {
@@ -253,7 +300,7 @@ func TestCreateContract(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cs := newFakeContractStore()
 			ss := newFakeSignatureStore()
-			tx := &fakeTxManager{contracts: cs, sigs: ss}
+			tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 			pub := &fakePublisher{}
 
 			svc := service.NewContractService(cs, ss, tx, pub)
@@ -286,7 +333,7 @@ func TestGetContract_IDORProtection(t *testing.T) {
 
 	cs := newFakeContractStore()
 	ss := newFakeSignatureStore()
-	tx := &fakeTxManager{contracts: cs, sigs: ss}
+	tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 	pub := &fakePublisher{}
 	svc := service.NewContractService(cs, ss, tx, pub)
 
@@ -353,7 +400,7 @@ func TestSubmitContract(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cs := newFakeContractStore()
 			ss := newFakeSignatureStore()
-			tx := &fakeTxManager{contracts: cs, sigs: ss}
+			tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 			pub := &fakePublisher{}
 			svc := service.NewContractService(cs, ss, tx, pub)
 
@@ -385,7 +432,7 @@ func TestSignContract_DualSign(t *testing.T) {
 	t.Run("first sign leaves PENDING_SIGNATURE", func(t *testing.T) {
 		cs := newFakeContractStore()
 		ss := newFakeSignatureStore()
-		tx := &fakeTxManager{contracts: cs, sigs: ss}
+		tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 		pub := &fakePublisher{}
 		svc := service.NewContractService(cs, ss, tx, pub)
 
@@ -403,10 +450,11 @@ func TestSignContract_DualSign(t *testing.T) {
 		assert.Equal(t, 0, pub.published)
 	})
 
-	t.Run("dual sign activates contract and publishes event", func(t *testing.T) {
+	t.Run("dual sign activates contract and enqueues outbox event", func(t *testing.T) {
 		cs := newFakeContractStore()
 		ss := newFakeSignatureStore()
-		tx := &fakeTxManager{contracts: cs, sigs: ss}
+		spy := &spyOutboxStore{}
+		tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: spy}
 		pub := &fakePublisher{}
 		svc := service.NewContractService(cs, ss, tx, pub)
 
@@ -429,13 +477,17 @@ func TestSignContract_DualSign(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, domain.ContractStatusActive, result.Status)
 		assert.NotNil(t, result.ActivatedAt)
-		assert.Equal(t, 1, pub.published)
+		// Publisher is no longer called directly; event is enqueued in the outbox atomically.
+		assert.Equal(t, 0, pub.published)
+		assert.Len(t, spy.enqueued, 1, "expected exactly 1 outbox entry enqueued on dual-sign activation")
+		assert.Equal(t, "contract", spy.enqueued[0].AggregateType)
+		assert.Equal(t, c.ID, spy.enqueued[0].AggregateID)
 	})
 
 	t.Run("hash mismatch returns ErrHashMismatch", func(t *testing.T) {
 		cs := newFakeContractStore()
 		ss := newFakeSignatureStore()
-		tx := &fakeTxManager{contracts: cs, sigs: ss}
+		tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 		pub := &fakePublisher{}
 		svc := service.NewContractService(cs, ss, tx, pub)
 
@@ -454,7 +506,7 @@ func TestSignContract_DualSign(t *testing.T) {
 	t.Run("non-party cannot sign", func(t *testing.T) {
 		cs := newFakeContractStore()
 		ss := newFakeSignatureStore()
-		tx := &fakeTxManager{contracts: cs, sigs: ss}
+		tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 		pub := &fakePublisher{}
 		svc := service.NewContractService(cs, ss, tx, pub)
 
@@ -473,7 +525,7 @@ func TestSignContract_DualSign(t *testing.T) {
 	t.Run("body change invalidates prior signatures (new version)", func(t *testing.T) {
 		cs := newFakeContractStore()
 		ss := newFakeSignatureStore()
-		tx := &fakeTxManager{contracts: cs, sigs: ss}
+		tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 		pub := &fakePublisher{}
 		svc := service.NewContractService(cs, ss, tx, pub)
 
@@ -590,7 +642,7 @@ func TestConcurrentMutationRejection(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cs := newFakeContractStore()
 			ss := newFakeSignatureStore()
-			tx := &fakeTxManager{contracts: cs, sigs: ss}
+			tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 			pub := &fakePublisher{}
 			svc := service.NewContractService(cs, ss, tx, pub)
 
@@ -642,7 +694,7 @@ func TestCancelContract(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cs := newFakeContractStore()
 			ss := newFakeSignatureStore()
-			tx := &fakeTxManager{contracts: cs, sigs: ss}
+			tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 			pub := &fakePublisher{}
 			svc := service.NewContractService(cs, ss, tx, pub)
 

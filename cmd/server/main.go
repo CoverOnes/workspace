@@ -16,6 +16,7 @@ import (
 	"github.com/CoverOnes/workspace/internal/config"
 	"github.com/CoverOnes/workspace/internal/events"
 	"github.com/CoverOnes/workspace/internal/handler"
+	"github.com/CoverOnes/workspace/internal/outbox"
 	"github.com/CoverOnes/workspace/internal/platform/logger"
 	"github.com/CoverOnes/workspace/internal/service"
 	"github.com/CoverOnes/workspace/internal/store/postgres"
@@ -143,6 +144,7 @@ func run() error {
 	worklogStore := postgres.NewWorklogStore(pool)
 	txManager := postgres.NewTxManager(pool)
 	auditLogStore := postgres.NewAuditLogStore(pool)
+	outboxStore := postgres.NewOutboxStore(pool)
 
 	// Multiparty store layer.
 	multipartyContractStore := postgres.NewMultipartyContractStore(pool)
@@ -168,6 +170,19 @@ func run() error {
 	)
 	milestoneSvc := service.NewMilestoneService(multipartyContractStore, milestoneStore, multipartyPartyStore, milestoneTxManager, publisher)
 	auditLogSvc := service.NewAuditLogService(auditLogStore)
+
+	// Outbox poller — relay unpublished outbox entries to Redis pub/sub.
+	// When Redis is unavailable the poller runs in no-op mode (noop publisher).
+	var outboxPublisher outbox.Publisher
+	if redisClient != nil {
+		outboxPublisher = outbox.NewRedisPublisher(redisClient)
+	} else {
+		outboxPublisher = &outbox.NoopPublisher{}
+	}
+
+	outboxPoller := outbox.New(outboxStore, outboxPublisher)
+
+	go outboxPoller.Start(ctx)
 
 	// Router.
 	r := handler.NewRouter(&handler.RouterConfig{
@@ -218,6 +233,7 @@ func run() error {
 		return fmt.Errorf("server shutdown: %w", shutdownErr)
 	}
 
+	outboxPoller.Stop()
 	slog.Info("server stopped")
 
 	return nil
