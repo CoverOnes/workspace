@@ -7,6 +7,7 @@ import (
 
 	"github.com/CoverOnes/workspace/internal/domain"
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 // ContractStore defines persistence operations for contracts.
@@ -160,6 +161,11 @@ type MilestoneStore interface {
 	// Returns ErrMilestoneNotFound if the row does not exist.
 	// Returns ErrMilestoneAlreadyDone if it is already COMPLETED.
 	MarkCompleted(ctx context.Context, id uuid.UUID, completedAt time.Time) (*domain.Milestone, error)
+	// SumAmountsByContract returns the sum of ALL milestone amounts for the contract
+	// (no status filter — includes PENDING and COMPLETED milestones).
+	// Returns decimal.Zero when no milestones exist (no error).
+	// Used by the S2S escrow-cap endpoint consumed by the payment service.
+	SumAmountsByContract(ctx context.Context, contractID uuid.UUID) (decimal.Decimal, error)
 }
 
 // AuditAppendInput carries the caller-supplied fields for a new audit log entry.

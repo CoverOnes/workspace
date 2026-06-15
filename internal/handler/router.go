@@ -153,6 +153,11 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	if cfg.MilestoneSvc != nil {
 		internalPartiesH := NewInternalPartiesHandler(cfg.MilestoneSvc)
 		internal.GET("/contracts/:id/parties", internalPartiesH.GetParties)
+
+		// S2S milestone-amounts endpoint — returns Σ milestone amounts for the contract.
+		// Payment calls this at CreatePlan time to set the escrow disbursement cap.
+		milestonesH := NewInternalMilestonesHandler(cfg.MilestoneSvc)
+		internal.GET("/contracts/:id/milestones/amounts", milestonesH.GetAmountsSum)
 	}
 
 	// Audit log endpoint (§24.1 gated — S2S only, protected by RequireServiceToken).

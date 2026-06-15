@@ -274,6 +274,34 @@ func (s *MilestoneService) GetPartyRoster(ctx context.Context, contractID uuid.U
 	return parties, nil
 }
 
+// GetMilestoneAmountsSum returns the sum of ALL milestone amounts for a multiparty contract.
+// Mirrors the GetPartyRoster status guard: only ACTIVE or COMPLETED contracts are served.
+// Returns decimal.Zero (no error) when the contract has no milestones yet.
+// Returns ErrMultipartyContractNotFound (→ 404) if the contract does not exist.
+// Returns ErrInvalidTransition (→ 422) if the contract is not ACTIVE or COMPLETED.
+// No owner check — this is called by the payment service via X-Service-Token, not end users.
+func (s *MilestoneService) GetMilestoneAmountsSum(ctx context.Context, contractID uuid.UUID) (decimal.Decimal, error) {
+	// Existence check: 404 on miss.
+	contract, err := s.contracts.GetByID(ctx, contractID)
+	if err != nil {
+		return decimal.Zero, err
+	}
+
+	// Status guard: mirror GetPartyRoster — only stable, settled states.
+	if contract.Status != domain.MultipartyContractStatusActive &&
+		contract.Status != domain.MultipartyContractStatusCompleted {
+		return decimal.Zero, fmt.Errorf("%w: milestone sum not available while contract is %s",
+			domain.ErrInvalidTransition, contract.Status)
+	}
+
+	sum, err := s.milestones.SumAmountsByContract(ctx, contractID)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("sum milestone amounts: %w", err)
+	}
+
+	return sum, nil
+}
+
 // publishCompleted publishes the workspace.contract_completed event.
 // Best-effort: logs a warning on failure, does not propagate the error.
 func (s *MilestoneService) publishCompleted(ctx context.Context, contract *domain.MultipartyContract, m *domain.Milestone) {

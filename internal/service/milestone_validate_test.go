@@ -101,6 +101,10 @@ func (fakeMilestoneStore) MarkCompleted(_ context.Context, _ uuid.UUID, _ time.T
 	panic("fakeMilestoneStore.MarkCompleted should not be called in validation-only tests")
 }
 
+func (fakeMilestoneStore) SumAmountsByContract(_ context.Context, _ uuid.UUID) (decimal.Decimal, error) {
+	panic("fakeMilestoneStore.SumAmountsByContract should not be called in validation-only tests")
+}
+
 // fakeMilestonePartyStore is a no-op MultipartyPartyStore for validation unit tests.
 type fakeMilestonePartyStore struct{}
 
@@ -308,6 +312,17 @@ func (s *noopMilestoneStore) MarkCompleted(_ context.Context, id uuid.UUID, comp
 	}
 
 	return nil, domain.ErrMilestoneNotFound
+}
+
+func (s *noopMilestoneStore) SumAmountsByContract(_ context.Context, contractID uuid.UUID) (decimal.Decimal, error) {
+	sum := decimal.Zero
+	for _, m := range s.milestones {
+		if m.MultiContractID == contractID {
+			sum = sum.Add(m.Amount)
+		}
+	}
+
+	return sum, nil
 }
 
 // buildNonPanickingMilestoneSvc returns a MilestoneService whose MilestoneStore.Create
