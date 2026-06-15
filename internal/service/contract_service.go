@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"time"
 
 	"github.com/CoverOnes/workspace/internal/domain"
@@ -13,12 +12,17 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// channelContractActivated is the Redis pub/sub channel for the 1:1 dual-sign contract.
+// Kept in sync with events.channelContractActivated; duplicated here so the service
+// package can reference it without importing the events package for the channel name alone.
+const channelContractActivated = "workspace.contract_activated"
+
 // ContractService handles contract business logic.
 type ContractService struct {
 	contracts store.ContractStore
 	sigs      store.SignatureStore
 	tx        store.TxManager
-	publisher events.Publisher
+	publisher events.Publisher // retained for constructor API stability; outbox is now the publish path
 }
 
 // NewContractService returns a ContractService.
@@ -183,7 +187,7 @@ type PatchContractInput struct {
 func (s *ContractService) PatchContract(ctx context.Context, in PatchContractInput) (*domain.Contract, error) {
 	var result *domain.Contract
 
-	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, _ store.SignatureStore) error {
+	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, _ store.SignatureStore, _ store.OutboxStore) error {
 		c, err := txContracts.GetByIDForUpdate(ctx, in.ID)
 		if err != nil {
 			return err
@@ -284,7 +288,7 @@ func applyPatchFields(c *domain.Contract, in PatchContractInput) (bool, error) {
 func (s *ContractService) SubmitContract(ctx context.Context, id, callerID uuid.UUID) (*domain.Contract, error) {
 	var result *domain.Contract
 
-	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, _ store.SignatureStore) error {
+	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, _ store.SignatureStore, _ store.OutboxStore) error {
 		c, err := txContracts.GetByIDForUpdate(ctx, id)
 		if err != nil {
 			return err
@@ -335,100 +339,110 @@ type SignContractInput struct {
 func (s *ContractService) SignContract(ctx context.Context, in SignContractInput) (*domain.Contract, error) {
 	var result *domain.Contract
 
-	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, txSigs store.SignatureStore) error {
-		// FOR UPDATE lock to prevent TOCTOU races (mirrors AcceptBid pattern).
-		c, err := txContracts.GetByIDForUpdate(ctx, in.ContractID)
-		if err != nil {
-			return err
-		}
-
-		role, err := deriveSignerRole(c, in.CallerID)
-		if err != nil {
-			return err
-		}
-
-		if c.Status != domain.ContractStatusPendingSignature {
-			return fmt.Errorf("%w: contract must be in PENDING_SIGNATURE state to sign", domain.ErrInvalidTransition)
-		}
-
-		// Client-submitted hash must match server's authoritative content_hash.
-		if in.SignedContentHash != c.ContentHash {
-			return domain.ErrHashMismatch
-		}
-
-		now := time.Now().UTC()
-		sig := &domain.Signature{
-			ID:                uuid.New(),
-			ContractID:        c.ID,
-			SignerUserID:      in.CallerID,
-			SignerRole:        role,
-			ContractVersion:   c.Version,
-			SignedContentHash: in.SignedContentHash,
-			SignerIP:          in.SignerIP,
-			UserAgent:         in.UserAgent,
-			SignedAt:          now,
-			CreatedAt:         now,
-		}
-
-		if createErr := txSigs.Create(ctx, sig); createErr != nil {
-			return createErr
-		}
-
-		// Evaluate dual-sign completion: count distinct signer_roles for current version+hash.
-		count, err := txSigs.CountValidSignatures(ctx, c.ID, c.Version, c.ContentHash)
-		if err != nil {
-			return fmt.Errorf("count signatures: %w", err)
-		}
-
-		// Both parties (CLIENT + FREELANCER) have now signed.
-		// State machine: PENDING_SIGNATURE -> SIGNED -> ACTIVE (two-step, both in same tx).
-		if count >= 2 {
-			// Step 1: transition to SIGNED (validates the PENDING_SIGNATURE -> SIGNED edge).
-			if !domain.ValidContractTransition(c.Status, domain.ContractStatusSigned) {
-				return fmt.Errorf("%w: cannot transition to SIGNED", domain.ErrInvalidTransition)
+	txErr := s.tx.WithTx(ctx,
+		func(ctx context.Context, txContracts store.ContractStore, txSigs store.SignatureStore, txOutbox store.OutboxStore) error {
+			// FOR UPDATE lock to prevent TOCTOU races (mirrors AcceptBid pattern).
+			c, err := txContracts.GetByIDForUpdate(ctx, in.ContractID)
+			if err != nil {
+				return err
 			}
 
-			c.Status = domain.ContractStatusSigned
-
-			// Step 2: auto-promote SIGNED -> ACTIVE in the same tx.
-			if !domain.ValidContractTransition(c.Status, domain.ContractStatusActive) {
-				return fmt.Errorf("%w: cannot transition to ACTIVE", domain.ErrInvalidTransition)
+			role, err := deriveSignerRole(c, in.CallerID)
+			if err != nil {
+				return err
 			}
 
-			activatedAt := now
-			c.Status = domain.ContractStatusActive
-			c.ActivatedAt = &activatedAt
-
-			if updateErr := txContracts.Update(ctx, c); updateErr != nil {
-				return fmt.Errorf("activate contract: %w", updateErr)
+			if c.Status != domain.ContractStatusPendingSignature {
+				return fmt.Errorf("%w: contract must be in PENDING_SIGNATURE state to sign", domain.ErrInvalidTransition)
 			}
-		}
 
-		result = c
+			// Client-submitted hash must match server's authoritative content_hash.
+			if in.SignedContentHash != c.ContentHash {
+				return domain.ErrHashMismatch
+			}
 
-		return nil
-	})
+			now := time.Now().UTC()
+			sig := &domain.Signature{
+				ID:                uuid.New(),
+				ContractID:        c.ID,
+				SignerUserID:      in.CallerID,
+				SignerRole:        role,
+				ContractVersion:   c.Version,
+				SignedContentHash: in.SignedContentHash,
+				SignerIP:          in.SignerIP,
+				UserAgent:         in.UserAgent,
+				SignedAt:          now,
+				CreatedAt:         now,
+			}
+
+			if createErr := txSigs.Create(ctx, sig); createErr != nil {
+				return createErr
+			}
+
+			// Evaluate dual-sign completion: count distinct signer_roles for current version+hash.
+			count, err := txSigs.CountValidSignatures(ctx, c.ID, c.Version, c.ContentHash)
+			if err != nil {
+				return fmt.Errorf("count signatures: %w", err)
+			}
+
+			// Both parties (CLIENT + FREELANCER) have now signed.
+			// State machine: PENDING_SIGNATURE -> SIGNED -> ACTIVE (two-step, both in same tx).
+			if count >= 2 {
+				// Step 1: transition to SIGNED (validates the PENDING_SIGNATURE -> SIGNED edge).
+				if !domain.ValidContractTransition(c.Status, domain.ContractStatusSigned) {
+					return fmt.Errorf("%w: cannot transition to SIGNED", domain.ErrInvalidTransition)
+				}
+
+				c.Status = domain.ContractStatusSigned
+
+				// Step 2: auto-promote SIGNED -> ACTIVE in the same tx.
+				if !domain.ValidContractTransition(c.Status, domain.ContractStatusActive) {
+					return fmt.Errorf("%w: cannot transition to ACTIVE", domain.ErrInvalidTransition)
+				}
+
+				activatedAt := now
+				c.Status = domain.ContractStatusActive
+				c.ActivatedAt = &activatedAt
+
+				if updateErr := txContracts.Update(ctx, c); updateErr != nil {
+					return fmt.Errorf("activate contract: %w", updateErr)
+				}
+
+				// Enqueue event atomically with the state transition (transactional outbox).
+				evt := &domain.ContractActivatedEvent{
+					EventID:    uuid.New(),
+					OccurredAt: now,
+					Version:    1,
+				}
+				evt.Data.ContractID = c.ID
+				evt.Data.ListingID = c.ListingID
+				evt.Data.AcceptedBidID = c.AcceptedBidID
+				evt.Data.ClientUserID = c.ClientUserID
+				evt.Data.FreelancerUserID = c.FreelancerUserID
+
+				payload, marshalErr := marshalEvent(evt)
+				if marshalErr != nil {
+					return fmt.Errorf("marshal contract_activated event: %w", marshalErr)
+				}
+
+				if enqErr := txOutbox.Enqueue(ctx, &store.OutboxEnqueueInput{
+					AggregateType: "contract",
+					AggregateID:   c.ID,
+					EventID:       evt.EventID,
+					Channel:       channelContractActivated,
+					Payload:       payload,
+				}); enqErr != nil {
+					return fmt.Errorf("enqueue contract_activated event: %w", enqErr)
+				}
+			}
+
+			result = c
+
+			return nil
+		})
 
 	if txErr != nil {
 		return nil, txErr
-	}
-
-	// Best-effort: publish event after tx commit. Log failure but don't error.
-	if result != nil && result.Status == domain.ContractStatusActive {
-		evt := &domain.ContractActivatedEvent{
-			EventID:    uuid.New(),
-			OccurredAt: time.Now().UTC(),
-			Version:    1,
-		}
-		evt.Data.ContractID = result.ID
-		evt.Data.ListingID = result.ListingID
-		evt.Data.AcceptedBidID = result.AcceptedBidID
-		evt.Data.ClientUserID = result.ClientUserID
-		evt.Data.FreelancerUserID = result.FreelancerUserID
-
-		if pubErr := s.publisher.PublishContractActivated(ctx, evt); pubErr != nil {
-			slog.Warn("publish contract_activated event failed", "contract_id", result.ID, "err", pubErr)
-		}
 	}
 
 	return result, nil
@@ -439,7 +453,7 @@ func (s *ContractService) SignContract(ctx context.Context, in SignContractInput
 func (s *ContractService) CompleteContract(ctx context.Context, id, callerID uuid.UUID) (*domain.Contract, error) {
 	var result *domain.Contract
 
-	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, _ store.SignatureStore) error {
+	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, _ store.SignatureStore, _ store.OutboxStore) error {
 		c, err := txContracts.GetByIDForUpdate(ctx, id)
 		if err != nil {
 			return err
@@ -478,7 +492,7 @@ func (s *ContractService) CompleteContract(ctx context.Context, id, callerID uui
 func (s *ContractService) CancelContract(ctx context.Context, id, callerID uuid.UUID) (*domain.Contract, error) {
 	var result *domain.Contract
 
-	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, _ store.SignatureStore) error {
+	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, _ store.SignatureStore, _ store.OutboxStore) error {
 		c, err := txContracts.GetByIDForUpdate(ctx, id)
 		if err != nil {
 			return err

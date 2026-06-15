@@ -29,11 +29,13 @@ func NewMilestoneTxManager(pool *pgxpool.Pool) *MilestoneTxManager {
 }
 
 // WithMilestoneTx runs fn inside a single Postgres transaction providing
-// transaction-scoped MultipartyContractStore and MilestoneStore.
+// transaction-scoped MultipartyContractStore, MilestoneStore, and OutboxStore.
 // If fn returns an error the transaction is rolled back; otherwise it is committed.
+// The outbox OutboxStore is included so callers can enqueue events atomically
+// with the milestone write.
 func (m *MilestoneTxManager) WithMilestoneTx(
 	ctx context.Context,
-	fn func(ctx context.Context, contracts store.MultipartyContractStore, milestones store.MilestoneStore) error,
+	fn func(ctx context.Context, contracts store.MultipartyContractStore, milestones store.MilestoneStore, outbox store.OutboxStore) error,
 ) error {
 	tx, err := m.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -48,8 +50,9 @@ func (m *MilestoneTxManager) WithMilestoneTx(
 
 	txContracts := &txMultipartyContractStore{tx: tx}
 	txMilestones := &txMilestoneStore{q: tx}
+	txOutbox := &txOutboxStore{tx: tx}
 
-	if fnErr := fn(ctx, txContracts, txMilestones); fnErr != nil {
+	if fnErr := fn(ctx, txContracts, txMilestones, txOutbox); fnErr != nil {
 		return fnErr
 	}
 

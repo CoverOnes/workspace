@@ -142,7 +142,7 @@ type fakeMilestoneTxManager struct{}
 
 func (fakeMilestoneTxManager) WithMilestoneTx(
 	_ context.Context,
-	_ func(context.Context, store.MultipartyContractStore, store.MilestoneStore) error,
+	_ func(context.Context, store.MultipartyContractStore, store.MilestoneStore, store.OutboxStore) error,
 ) error {
 	panic("fakeMilestoneTxManager.WithMilestoneTx should not be called in validation-only tests")
 }

@@ -15,6 +15,7 @@ package service_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -39,6 +40,46 @@ type milestoneTestEnv struct {
 	pub            *recordingPublisher
 }
 
+// countOutboxEntries returns the number of event_outbox rows for the given
+// aggregateID and channel that are not yet published.  Uses sharedServicePool
+// directly so the assertion is isolated to the specific contract under test.
+func countOutboxEntries(ctx context.Context, t *testing.T, aggregateID, channel string) int {
+	t.Helper()
+
+	var n int
+
+	row := sharedServicePool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM event_outbox
+		 WHERE aggregate_id   = $1::uuid
+		   AND channel        = $2
+		   AND published_at   IS NULL`,
+		aggregateID, channel)
+
+	require.NoError(t, row.Scan(&n))
+
+	return n
+}
+
+// fetchOutboxPayload returns the payload of the single pending outbox entry for
+// the given aggregateID and channel.  Fails the test if the count is not 1.
+func fetchOutboxPayload(ctx context.Context, t *testing.T, aggregateID, channel string) []byte {
+	t.Helper()
+
+	var payload []byte
+
+	row := sharedServicePool.QueryRow(ctx,
+		`SELECT payload FROM event_outbox
+		 WHERE aggregate_id = $1::uuid
+		   AND channel      = $2
+		   AND published_at IS NULL
+		 LIMIT 1`,
+		aggregateID, channel)
+
+	require.NoError(t, row.Scan(&payload))
+
+	return payload
+}
+
 // recordingPublisher records published events for assertion.
 // The mu guards all access to completed because PublishMultipartyContractCompleted is
 // called from a detached goroutine (post-commit best-effort publish) while the test
@@ -54,22 +95,6 @@ func (r *recordingPublisher) PublishMultipartyContractCompleted(_ context.Contex
 	defer r.mu.Unlock()
 	r.completed = append(r.completed, evt)
 	return nil
-}
-
-// count returns the number of recorded events in a race-safe manner.
-func (r *recordingPublisher) count() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.completed)
-}
-
-// snapshot returns a copy of all recorded events under the lock.
-func (r *recordingPublisher) snapshot() []*domain.MultipartyContractCompletedEvent {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]*domain.MultipartyContractCompletedEvent, len(r.completed))
-	copy(out, r.completed)
-	return out
 }
 
 // startMilestoneTestDB returns a populated milestoneTestEnv backed by the singleton
@@ -335,25 +360,26 @@ func TestMilestone_Complete(t *testing.T) {
 		assert.True(t, completed.CompletedAt.After(before) || completed.CompletedAt.Equal(before),
 			"completedAt must be set to now")
 
-		// publishCompleted runs in a best-effort detached goroutine. Poll with a
-		// generous timeout so we don't flake on loaded CI instead of sleeping a fixed
-		// 20 ms that may not be enough.
-		require.Eventually(t, func() bool { return env.pub.count() == 1 },
-			2*time.Second, 5*time.Millisecond,
-			"exactly one contract_completed event must be published within 2 s")
+		// CompleteMilestone enqueues the event atomically in the same tx, so the
+		// outbox row is present immediately after the call — no polling needed.
+		// Query by milestone aggregate_id (the outbox uses m.ID as aggregate_id).
+		const ch = "workspace.contract_completed"
 
-		// Assert the published event shape — use snapshot() for race-safe access.
-		evts := env.pub.snapshot()
-		require.Len(t, evts, 1, "exactly one contract_completed event must be published")
+		require.Equal(t, 1, countOutboxEntries(ctx, t, m.ID.String(), ch),
+			"exactly one outbox entry must be enqueued for this milestone")
 
-		evt := evts[0]
-		assert.NotEqual(t, uuid.Nil, evt.EventID)
-		assert.Equal(t, 1, evt.Version)
-		assert.Equal(t, contract.ID, evt.Data.ContractID)
-		assert.Equal(t, contract.TenderID, evt.Data.TenderID)
-		assert.Equal(t, m.ID, evt.Data.MilestoneID)
-		assert.True(t, decimal.NewFromFloat(7500.50).Equal(evt.Data.Amount))
-		assert.Equal(t, "TWD", evt.Data.Currency)
+		// Decode the JSON payload and assert the event shape.
+		payload := fetchOutboxPayload(ctx, t, m.ID.String(), ch)
+
+		var wrapped domain.MultipartyContractCompletedEvent
+		require.NoError(t, json.Unmarshal(payload, &wrapped))
+		assert.NotEqual(t, uuid.Nil, wrapped.EventID)
+		assert.Equal(t, 1, wrapped.Version)
+		assert.Equal(t, contract.ID, wrapped.Data.ContractID)
+		assert.Equal(t, contract.TenderID, wrapped.Data.TenderID)
+		assert.Equal(t, m.ID, wrapped.Data.MilestoneID)
+		assert.True(t, decimal.NewFromFloat(7500.50).Equal(wrapped.Data.Amount))
+		assert.Equal(t, "TWD", wrapped.Data.Currency)
 	})
 
 	t.Run("non-owner cannot complete milestone (IDOR)", func(t *testing.T) {

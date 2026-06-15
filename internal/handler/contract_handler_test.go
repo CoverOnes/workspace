@@ -104,8 +104,32 @@ type stubTxH struct {
 	sigs      store.SignatureStore
 }
 
-func (m *stubTxH) WithTx(ctx context.Context, fn func(ctx context.Context, c store.ContractStore, s store.SignatureStore) error) error {
-	return fn(ctx, m.contracts, m.sigs)
+func (m *stubTxH) WithTx(
+	ctx context.Context,
+	fn func(ctx context.Context, c store.ContractStore, s store.SignatureStore, o store.OutboxStore) error,
+) error {
+	return fn(ctx, m.contracts, m.sigs, &noopOutboxStoreH{})
+}
+
+// noopOutboxStoreH is a test double for store.OutboxStore used in handler tests.
+type noopOutboxStoreH struct{}
+
+func (*noopOutboxStoreH) Enqueue(_ context.Context, _ *store.OutboxEnqueueInput) error { return nil }
+
+func (*noopOutboxStoreH) FetchPending(_ context.Context, _ int) ([]*domain.OutboxEntry, error) {
+	return nil, nil
+}
+func (*noopOutboxStoreH) MarkPublished(_ context.Context, _ uuid.UUID) error { return nil }
+func (*noopOutboxStoreH) RecordFailure(_ context.Context, _ uuid.UUID, _ string, _ time.Time) error {
+	return nil
+}
+
+func (*noopOutboxStoreH) DeleteOldPublished(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
+func (*noopOutboxStoreH) CountStalePending(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
 }
 
 const testServiceToken = "test-service-token-at-least-32-chars!!"
