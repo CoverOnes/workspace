@@ -355,8 +355,9 @@ func TestFileService_MetadataTrailingDot_Rejected(t *testing.T) {
 }
 
 // TestFileService_DecimalEncodedLoopback_Rejected verifies that 2130706433 (the decimal
-// representation of 127.0.0.1) is resolved and rejected by the loopback guard.
-// net.ParseIP("2130706433") returns nil, so without classifyHostIP the guard is bypassed.
+// representation of 127.0.0.1) is rejected as a non-canonical numeric host encoding.
+// net.ParseIP("2130706433") returns nil; isNumericHostEncoding catches it deterministically
+// (cross-platform — the OS resolver decodes decimal hosts inconsistently).
 func TestFileService_DecimalEncodedLoopback_Rejected(t *testing.T) {
 	setValidDevFileEnv(t)
 	t.Setenv("FILE_BASE_URL", "http://2130706433:9000")
@@ -369,7 +370,8 @@ func TestFileService_DecimalEncodedLoopback_Rejected(t *testing.T) {
 }
 
 // TestFileService_HexEncodedLoopback_Rejected verifies that 0x7f000001 (hex for
-// 127.0.0.1) is resolved and rejected by the loopback guard.
+// 127.0.0.1) is rejected as a non-canonical numeric host encoding (cross-platform,
+// without relying on the OS resolver).
 func TestFileService_HexEncodedLoopback_Rejected(t *testing.T) {
 	setValidDevFileEnv(t)
 	t.Setenv("FILE_BASE_URL", "http://0x7f000001:9000")

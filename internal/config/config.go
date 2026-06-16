@@ -394,27 +394,47 @@ var ssrfPrivateNets = func() []*net.IPNet {
 	return nets
 }()
 
-// classifyHostIP resolves the effective net.IP for a host string.
-//
-// net.ParseIP handles canonical dotted-decimal and IPv6 literals but returns nil for
-// alternative representations (decimal-encoded 2130706433, hex 0x7f000001, octal
-// 0177.0.0.1) that the OS resolver accepts.  When ParseIP returns nil we attempt
-// net.ResolveTCPAddr to catch those encoded forms.  The returned IP may be nil if the
-// host is a hostname that is not resolvable at config-load time — callers MUST handle
-// that case.
-func classifyHostIP(host string) net.IP {
-	if ip := net.ParseIP(host); ip != nil {
-		return ip
+// isNumericHostEncoding reports whether host is a non-standard numeric IP encoding
+// (decimal 2130706433, hex 0x7f000001, octal/dotted-numeric 0177.0.0.1) that
+// net.ParseIP rejected.  Such forms are never a legitimate file service hostname, and
+// the OS resolver decodes them inconsistently across platforms (BSD/macOS inet_aton
+// accepts them, Linux glibc getaddrinfo does not) — so we detect them deterministically
+// and fail closed rather than rely on the resolver.  A real hostname has at least one
+// label containing a non-hex character and is therefore not flagged.
+func isNumericHostEncoding(host string) bool {
+	if host == "" {
+		return false
 	}
 
-	// Attempt resolution to catch decimal/hex/octal-encoded loopback/link-local IPs
-	// (e.g. http://2130706433, http://0x7f000001).  ResolveTCPAddr needs a port.
-	addr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(host, "80"))
-	if err != nil || addr == nil {
-		return nil
+	for _, label := range strings.Split(host, ".") {
+		if label == "" {
+			return false // empty label → malformed, treat as hostname (rejected elsewhere)
+		}
+
+		l := strings.ToLower(label)
+
+		if rest, ok := strings.CutPrefix(l, "0x"); ok {
+			if rest == "" || strings.IndexFunc(rest, isNotHexDigit) >= 0 {
+				return false
+			}
+
+			continue
+		}
+
+		if strings.IndexFunc(l, isNotDecimalDigit) >= 0 {
+			return false // a label with a non-digit → real hostname
+		}
 	}
 
-	return addr.IP
+	return true
+}
+
+func isNotHexDigit(r rune) bool {
+	return (r < '0' || r > '9') && (r < 'a' || r > 'f')
+}
+
+func isNotDecimalDigit(r rune) bool {
+	return r < '0' || r > '9'
 }
 
 // isBlockedIP reports whether ip is blocked (loopback, link-local, or — when
@@ -448,7 +468,7 @@ func isBlockedIP(ip net.IP, blockPrivate bool) (blocked bool, reason string) {
 //
 // Bypass defenses:
 //   - Trailing-dot FQDN (e.g. "localhost.", "169.254.169.254.") — stripped before checks.
-//   - Decimal/hex-encoded IPs (e.g. 2130706433, 0x7f000001) — classifyHostIP resolves them.
+//   - Decimal/hex-encoded IPs (e.g. 2130706433, 0x7f000001) — rejected by isNumericHostEncoding.
 func validateFileServiceURL(rawURL string, isProd bool) string {
 	u, parseErr := url.Parse(rawURL)
 	if parseErr != nil || (u.Scheme != "http" && u.Scheme != "https") {
@@ -472,11 +492,17 @@ func validateFileServiceURL(rawURL string, isProd bool) string {
 		}
 	}
 
-	// Resolve the effective IP — handles canonical IPs AND encoded forms (decimal/hex).
-	ip := classifyHostIP(host)
+	ip := net.ParseIP(host)
 	if ip == nil {
-		// hostname not resolvable at boot (e.g. "file-svc.internal"): allow and rely on
-		// the runtime dial guard (fileclient DNS-rebinding check) for ongoing protection.
+		// Not a canonical IP literal. Reject non-standard numeric encodings deterministically
+		// (decimal/hex/octal) — these are never a valid file service host and the OS resolver
+		// decodes them inconsistently across platforms. A real hostname (e.g. "file-svc.internal")
+		// is allowed at boot; the runtime dial guard validates its resolved IP for ongoing
+		// DNS-rebinding protection.
+		if isNumericHostEncoding(host) {
+			return "FILE_BASE_URL must not use a numeric-encoded host"
+		}
+
 		return ""
 	}
 
