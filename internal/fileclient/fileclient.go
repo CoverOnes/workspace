@@ -14,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -207,4 +208,160 @@ func (c *Client) Presign(ctx context.Context, fileID, signatureID uuid.UUID) (*P
 	}
 
 	return &result, nil
+}
+
+// StoreSystemFileInput carries the parameters for storing a system-generated file.
+type StoreSystemFileInput struct {
+	// ContentType is the MIME type (e.g. "application/pdf").
+	ContentType string
+	// Filename is the suggested filename for the stored object.
+	Filename string
+	// Data is the raw file bytes to store.
+	Data []byte
+	// SystemContext is a free-form label describing what generated this file
+	// (e.g. "contract-proof/uuid/bilateral/v1.pdf"). Used as an idempotency hint;
+	// the file service may use it to deduplicate concurrent uploads at the same path.
+	SystemContext string
+}
+
+// StoreSystemFileResult is returned by StoreSystemFile on success.
+type StoreSystemFileResult struct {
+	// FileID is the UUID assigned by the file service to the stored object.
+	FileID uuid.UUID
+	// ObjectKey is the storage layer object key (e.g. S3 key or MinIO path).
+	ObjectKey string
+}
+
+// storeFileRequest is the JSON body sent to POST /internal/v1/files.
+type storeFileRequest struct {
+	ContentType   string `json:"contentType"`
+	Filename      string `json:"filename"`
+	Data          []byte `json:"data"` // base64-encoded by encoding/json
+	SystemContext string `json:"systemContext"`
+}
+
+// storeFileResponseData is the "data" field in the file service store response.
+type storeFileResponseData struct {
+	FileID    string `json:"fileId"`
+	ObjectKey string `json:"objectKey"`
+}
+
+// presignDownloadResponseData is the "data" field in the file service presign-download response.
+type presignDownloadResponseData struct {
+	URL        string `json:"url"`
+	TTLSeconds int    `json:"ttlSeconds"`
+}
+
+// maxSystemResponseBytes caps response body reads for StoreSystemFile / PresignDownload.
+// Prevents unbounded allocation if the file service returns a large error body.
+const maxSystemResponseBytes = 1 << 20 // 1 MiB
+
+// StoreSystemFile posts to <base>/internal/v1/files with X-Service-Token authentication.
+// Parses the envelope { "data": { "fileId": ..., "objectKey": ... } }.
+// Maps non-2xx to wrapped errors without leaking internal service details.
+//
+// The token is sent via X-Service-Token header — NEVER in the URL.
+func (c *Client) StoreSystemFile(ctx context.Context, in StoreSystemFileInput) (*StoreSystemFileResult, error) {
+	reqBody := storeFileRequest(in)
+
+	reqBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("fileclient store_system_file: marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/internal/v1/files", bytes.NewReader(reqBytes))
+	if err != nil {
+		return nil, fmt.Errorf("fileclient store_system_file: build request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Service-Id", c.serviceID)
+	req.Header.Set("X-Service-Token", c.token) // token in header, never in URL
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fileclient store_system_file: request: %w", err)
+	}
+
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			slog.Warn("fileclient store_system_file: close response body", "err", closeErr)
+		}
+	}()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSystemResponseBytes))
+	if err != nil {
+		return nil, fmt.Errorf("fileclient store_system_file: read response body: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, fmt.Errorf("fileclient store_system_file: file service returned %d", resp.StatusCode)
+	}
+
+	var envelope struct {
+		Data storeFileResponseData `json:"data"`
+	}
+
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, fmt.Errorf("fileclient store_system_file: parse response: %w", err)
+	}
+
+	fileID, err := uuid.Parse(envelope.Data.FileID)
+	if err != nil {
+		return nil, fmt.Errorf("fileclient store_system_file: parse file_id %q: %w", envelope.Data.FileID, err)
+	}
+
+	return &StoreSystemFileResult{
+		FileID:    fileID,
+		ObjectKey: envelope.Data.ObjectKey,
+	}, nil
+}
+
+// PresignDownload calls GET <base>/internal/v1/files/<id>/download-url to obtain a
+// short-lived / TTL-limited presigned download URL for a system-stored file.
+// Returns the URL, its TTL in seconds, or an error.
+// Non-2xx responses are mapped to wrapped errors without leaking service internals.
+//
+// The token is sent via X-Service-Token header — NEVER in the URL.
+func (c *Client) PresignDownload(ctx context.Context, fileID uuid.UUID) (presignURL string, ttlSeconds int, err error) {
+	// url.PathEscape ensures the UUID (already URL-safe) is properly encoded.
+	reqURL := c.base + "/internal/v1/files/" + url.PathEscape(fileID.String()) + "/download-url"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, http.NoBody)
+	if err != nil {
+		return "", 0, fmt.Errorf("fileclient presign_download: build request: %w", err)
+	}
+
+	req.Header.Set("X-Service-Id", c.serviceID)
+	req.Header.Set("X-Service-Token", c.token) // token in header, never in URL
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", 0, fmt.Errorf("fileclient presign_download: request: %w", err)
+	}
+
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			slog.Warn("fileclient presign_download: close response body", "err", closeErr)
+		}
+	}()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSystemResponseBytes))
+	if err != nil {
+		return "", 0, fmt.Errorf("fileclient presign_download: read response body: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return "", 0, fmt.Errorf("fileclient presign_download: file service returned %d", resp.StatusCode)
+	}
+
+	var envelope struct {
+		Data presignDownloadResponseData `json:"data"`
+	}
+
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return "", 0, fmt.Errorf("fileclient presign_download: parse response: %w", err)
+	}
+
+	return envelope.Data.URL, envelope.Data.TTLSeconds, nil
 }

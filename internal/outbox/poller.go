@@ -2,6 +2,13 @@
 // entries from the event_outbox table and publishes them to Redis pub/sub,
 // then marks them as published. On transport failure the entry is retried with
 // exponential backoff capped at 5 minutes.
+//
+// Local handlers: channels that have no external Redis subscriber can register a
+// local handler via Handle. When a local handler is registered for a channel, the
+// poller invokes the handler directly instead of publishing to Redis. Failures are
+// treated identically to publish failures (RecordFailure + exponential backoff).
+// Local handlers use a longer timeout (localHandlerTimeout) to accommodate work
+// that may take several seconds (e.g. PDF rendering + S3 upload).
 package outbox
 
 import (
@@ -28,7 +35,16 @@ const (
 	maxBackoff = 5 * time.Minute
 	// retentionInterval controls how often the janitor sweeps old rows.
 	retentionInterval = 10 * time.Minute
+	// localHandlerTimeout is the per-entry deadline for local (in-process) handlers.
+	// Longer than the 5 s Redis timeout because local handlers may include network I/O
+	// (e.g. PDF upload to the file service).
+	localHandlerTimeout = 30 * time.Second
 )
+
+// EntryHandler is the signature for a local outbox entry handler.
+// It receives a context with localHandlerTimeout and the outbox entry to process.
+// Returning a non-nil error causes the entry to be retried with exponential backoff.
+type EntryHandler func(ctx context.Context, entry *domain.OutboxEntry) error
 
 // Publisher is a thin interface over the Redis PUBLISH command so that the
 // poller can be tested without a real Redis connection.
@@ -60,22 +76,39 @@ func (*NoopPublisher) Publish(_ context.Context, _ string, _ []byte) error { ret
 
 // Poller is the in-process transactional outbox relay. Create one with New
 // and call Start in a goroutine; call Stop to drain and exit cleanly.
+//
+// For channels that have no external Redis subscriber, register a local handler
+// with Handle before calling Start. The poller will invoke the handler directly
+// for entries on that channel instead of publishing to Redis.
 type Poller struct {
 	outbox    store.OutboxStore
 	publisher Publisher
+	handlers  map[string]EntryHandler // channel → local handler; nil channels use Redis relay
 	stop      chan struct{}
 	done      chan struct{}
 }
 
 // New creates a Poller. outbox must be a pool-backed OutboxStore (not
-// transaction-scoped). publisher handles the Redis PUBLISH.
+// transaction-scoped). publisher handles the Redis PUBLISH for channels without
+// a registered local handler.
 func New(outbox store.OutboxStore, publisher Publisher) *Poller {
 	return &Poller{
 		outbox:    outbox,
 		publisher: publisher,
+		handlers:  make(map[string]EntryHandler),
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
 	}
+}
+
+// Handle registers a local EntryHandler for the given channel name.
+// Must be called before Start. Channels with a registered handler are processed
+// in-process; all other channels are relayed to Redis as usual.
+//
+// Concurrency: Handle is not safe to call concurrently with Start; register all
+// handlers before starting the poller.
+func (p *Poller) Handle(channel string, fn EntryHandler) {
+	p.handlers[channel] = fn
 }
 
 // Start runs the relay loop in the calling goroutine. It returns when Stop is
@@ -142,37 +175,70 @@ func (p *Poller) relay(ctx context.Context) {
 	}
 }
 
-// publishEntry attempts to publish a single outbox entry to Redis and then
-// marks it as published. On failure it records the error and schedules a retry
-// with exponential backoff.
+// publishEntry dispatches a single outbox entry.
+// If a local handler is registered for e.Channel, the handler is invoked instead
+// of publishing to Redis. Both paths use the same backoff-on-failure logic.
 func (p *Poller) publishEntry(ctx context.Context, e *domain.OutboxEntry) {
-	// Use a short timeout so a slow Redis does not block the whole tick.
+	if handler, ok := p.handlers[e.Channel]; ok {
+		p.runLocalHandler(ctx, e, handler)
+		return
+	}
+
+	// Redis relay path: use a short timeout so a slow Redis does not block the whole tick.
 	pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	if pubErr := p.publisher.Publish(pubCtx, e.Channel, e.Payload); pubErr != nil {
-		attempts := e.Attempts + 1
-		backoff := backoffDuration(attempts)
-		nextAttempt := time.Now().UTC().Add(backoff)
+		p.recordFailure(ctx, e, pubErr.Error())
+		return
+	}
 
-		slog.Warn(
-			"outbox: publish failed",
+	if markErr := p.outbox.MarkPublished(ctx, e.ID); markErr != nil {
+		slog.Warn("outbox: mark published failed", "id", e.ID, "err", markErr)
+	}
+}
+
+// runLocalHandler invokes a registered in-process handler for a local-only channel.
+// Uses localHandlerTimeout to accommodate work that may include network I/O.
+// On failure, the entry is retried with the same exponential backoff as Redis failures.
+func (p *Poller) runLocalHandler(ctx context.Context, e *domain.OutboxEntry, handler EntryHandler) {
+	handlerCtx, cancel := context.WithTimeout(ctx, localHandlerTimeout)
+	defer cancel()
+
+	if handlerErr := handler(handlerCtx, e); handlerErr != nil {
+		slog.Warn("outbox: local handler failed",
 			"id", e.ID,
 			"channel", e.Channel,
-			"attempt", attempts,
-			"next_attempt_at", nextAttempt,
-			"err", pubErr,
+			"attempt", e.Attempts+1,
+			"err", handlerErr,
 		)
-
-		if recErr := p.outbox.RecordFailure(ctx, e.ID, pubErr.Error(), nextAttempt); recErr != nil {
-			slog.Warn("outbox: record failure failed", "id", e.ID, "err", recErr)
-		}
+		p.recordFailure(ctx, e, handlerErr.Error())
 
 		return
 	}
 
 	if markErr := p.outbox.MarkPublished(ctx, e.ID); markErr != nil {
 		slog.Warn("outbox: mark published failed", "id", e.ID, "err", markErr)
+	}
+}
+
+// recordFailure logs a publish/handler failure and schedules a retry.
+func (p *Poller) recordFailure(ctx context.Context, e *domain.OutboxEntry, errMsg string) {
+	attempts := e.Attempts + 1
+	backoff := backoffDuration(attempts)
+	nextAttempt := time.Now().UTC().Add(backoff)
+
+	slog.Warn(
+		"outbox: dispatch failed",
+		"id", e.ID,
+		"channel", e.Channel,
+		"attempt", attempts,
+		"next_attempt_at", nextAttempt,
+		"err", errMsg,
+	)
+
+	if recErr := p.outbox.RecordFailure(ctx, e.ID, errMsg, nextAttempt); recErr != nil {
+		slog.Warn("outbox: record failure failed", "id", e.ID, "err", recErr)
 	}
 }
 
