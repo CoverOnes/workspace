@@ -3,8 +3,8 @@ package service_test
 // Integration tests for the proof service using the sharedServicePool Postgres testcontainer.
 //
 // These tests exercise the full flow:
-//   1. Bilateral: create ACTIVE contract → GenerateAndStore → GetDownloadURL (party) → 403 (non-party).
-//   2. Multiparty: create ACTIVE contract → GenerateAndStore → GetDownloadURL (party) → 403 (non-party).
+//   1. Bilateral: create ACTIVE contract → GenerateAndStore → GetDownloadURL (party) → 404 (non-party, IDOR-safe).
+//   2. Multiparty: create ACTIVE contract → GenerateAndStore → GetDownloadURL (party) → 404 (non-party, IDOR-safe).
 //   3. Idempotency: calling GenerateAndStore twice returns the same proof ID.
 //   4. Supersede: addendum re-sign to v2 → GenerateAndStore → row updated, one row only.
 //   5. Store-layer: Create duplicate returns ErrProofAlreadyExists; GetByContract returns ErrProofNotFound.
@@ -269,7 +269,7 @@ func TestProofService_Bilateral_GetDownloadURL_Party(t *testing.T) {
 	assert.Greater(t, ttl, 0, "TTL must be positive")
 }
 
-func TestProofService_Bilateral_GetDownloadURL_NonParty_Returns403(t *testing.T) {
+func TestProofService_Bilateral_GetDownloadURL_NonParty_Returns404(t *testing.T) {
 	env := newProofTestEnv(t)
 	ctx := context.Background()
 
@@ -278,12 +278,13 @@ func TestProofService_Bilateral_GetDownloadURL_NonParty_Returns403(t *testing.T)
 	_, err := env.proofSvc.GenerateAndStore(ctx, c.ID, domain.ContractKindBilateral)
 	require.NoError(t, err)
 
-	// Non-party should get ErrForbidden.
+	// Non-party must get ErrNotFound (404, IDOR guard) — not ErrForbidden (403) —
+	// so an authenticated outsider cannot probe contract existence.
 	nonPartyID := uuid.New()
 	_, _, err = env.proofSvc.GetDownloadURL(ctx, c.ID, domain.ContractKindBilateral, nonPartyID)
 
 	require.Error(t, err, "non-party must get an error")
-	assert.ErrorIs(t, err, domain.ErrForbidden, "non-party must get ErrForbidden (403), not 404")
+	assert.ErrorIs(t, err, domain.ErrNotFound, "non-party must get ErrNotFound (404, IDOR-safe), not ErrForbidden")
 }
 
 func TestProofService_Bilateral_GetDownloadURL_NoProofYet(t *testing.T) {
@@ -465,7 +466,7 @@ func TestProofService_Multiparty_GetDownloadURL_Party(t *testing.T) {
 	assert.Greater(t, ttl, 0, "TTL must be positive")
 }
 
-func TestProofService_Multiparty_GetDownloadURL_NonParty_Returns403(t *testing.T) {
+func TestProofService_Multiparty_GetDownloadURL_NonParty_Returns404(t *testing.T) {
 	env := newProofTestEnv(t)
 	ctx := context.Background()
 
@@ -475,20 +476,20 @@ func TestProofService_Multiparty_GetDownloadURL_NonParty_Returns403(t *testing.T
 	_, err := env.proofSvc.GenerateAndStore(ctx, contractID, domain.ContractKindMultiparty)
 	require.NoError(t, err)
 
-	// Non-party (random UUID) must get ErrForbidden.
+	// Non-party (random UUID) must get ErrNotFound (404, IDOR guard).
 	nonPartyID := uuid.New()
 	_, _, err = env.proofSvc.GetDownloadURL(ctx, contractID, domain.ContractKindMultiparty, nonPartyID)
 
 	require.Error(t, err, "non-party must get an error")
-	assert.ErrorIs(t, err, domain.ErrForbidden, "non-party must get ErrForbidden (403)")
+	assert.ErrorIs(t, err, domain.ErrNotFound, "non-party must get ErrNotFound (404, IDOR-safe)")
 }
 
 // TestProofService_Multiparty_GetDownloadURL_Poster_Allowed verifies that the contract
 // poster (multiparty_contracts.poster_user_id) can obtain a download URL even though
 // the poster does not appear in multiparty_parties (which stores only vendor rows).
 //
-// This is a regression test for the A3 finding: before the fix, the poster received
-// ErrForbidden because only GetActivePartyByVendor was checked.
+// This is a regression test for the A3 finding: before the fix, the poster was
+// rejected (non-party) because only GetActivePartyByVendor was checked.
 func TestProofService_Multiparty_GetDownloadURL_Poster_Allowed(t *testing.T) {
 	env := newProofTestEnv(t)
 	ctx := context.Background()
@@ -506,12 +507,12 @@ func TestProofService_Multiparty_GetDownloadURL_Poster_Allowed(t *testing.T) {
 	assert.NotEmpty(t, url, "download URL must not be empty for poster")
 	assert.Greater(t, ttl, 0, "TTL must be positive")
 
-	// A random non-party still receives ErrForbidden.
+	// A random non-party still receives ErrNotFound (404, IDOR-safe).
 	trueNonPartyID := uuid.New()
 	_, _, nonPartyErr := env.proofSvc.GetDownloadURL(ctx, contractID, domain.ContractKindMultiparty, trueNonPartyID)
 
 	require.Error(t, nonPartyErr, "non-party must still get an error")
-	assert.ErrorIs(t, nonPartyErr, domain.ErrForbidden, "non-party must get ErrForbidden (403)")
+	assert.ErrorIs(t, nonPartyErr, domain.ErrNotFound, "non-party must get ErrNotFound (404, IDOR-safe)")
 }
 
 // ---- Supersede test (item 1: addendum re-sign produces stale proof fix) -----

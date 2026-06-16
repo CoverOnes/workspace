@@ -446,6 +446,12 @@ func isBlockedIP(ip net.IP, blockPrivate bool) (blocked bool, reason string) {
 		return true, "loopback address"
 	}
 
+	if ip.IsUnspecified() {
+		// 0.0.0.0 / :: — the OS routes a connect() to the unspecified address to
+		// localhost, so it must be treated the same as loopback for SSRF defense.
+		return true, "unspecified address"
+	}
+
 	if ip.IsLinkLocalUnicast() {
 		return true, "link-local address"
 	}

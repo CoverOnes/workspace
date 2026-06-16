@@ -268,7 +268,8 @@ func (s *ProofService) renderUpload(
 }
 
 // GetDownloadURL returns a short-lived / TTL-limited presigned download URL for a contract proof.
-// Authz: the caller MUST be a party to the contract; non-parties receive domain.ErrForbidden.
+// Authz: the caller MUST be a party to the contract; non-parties receive domain.ErrNotFound
+// (collapsed to 404, IDOR guard — see assertProofParty).
 //
 // Parameters:
 //   - ctx: request context.
@@ -315,20 +316,21 @@ func (s *ProofService) GetDownloadURL(
 }
 
 // assertProofParty verifies that callerID is a party to the given contract.
-// Returns domain.ErrForbidden for non-parties.
-// The proof endpoint uses ErrForbidden (not ErrNotFound) because the contract ID
-// is already known to the caller (they navigated to /contracts/:id/proof).
+// Returns domain.ErrNotFound for non-parties (NOT ErrForbidden): a non-party is
+// collapsed to 404 to match the codebase IDOR convention (httpx/errors.go maps
+// ErrNotParty/ErrNotContractOwner → 404) so an authenticated outsider cannot
+// distinguish "contract exists but I'm not a party" (would-be 403) from
+// "contract does not exist" (404) — preventing resource-existence enumeration.
 //
 // Bilateral: allows the two contract parties (client + freelancer).
 //
 // Multiparty: allows any active vendor-party (GetActivePartyByVendor) AND the
 // contract poster (multiparty_contracts.poster_user_id). The poster is the user
 // who created the contract; they do not appear in multiparty_parties so they
-// would receive ErrForbidden without this explicit check.
+// would receive ErrNotFound without this explicit check.
 //
-// Note on bilateral vs multiparty divergence: bilateral proof returns ErrForbidden
-// (not ErrNotFound) for non-parties — this is intentional (both kinds use 403 so
-// callers cannot probe contract existence via the proof endpoint).
+// Note on bilateral vs multiparty: both branches return ErrNotFound for non-parties
+// so callers cannot probe contract existence via the proof endpoint.
 func (s *ProofService) assertProofParty(
 	ctx context.Context,
 	contractID uuid.UUID,
@@ -343,7 +345,10 @@ func (s *ProofService) assertProofParty(
 		}
 
 		if callerID != c.ClientUserID && callerID != c.FreelancerUserID {
-			return domain.ErrForbidden
+			// Collapse non-party to 404 (not 403) to prevent resource-existence
+			// enumeration — matches the codebase IDOR convention (httpx/errors.go,
+			// ErrNotParty/ErrNotContractOwner → 404).
+			return domain.ErrNotFound
 		}
 
 		return nil
@@ -362,10 +367,12 @@ func (s *ProofService) assertProofParty(
 
 		_, partyErr := s.mpParties.GetActivePartyByVendor(ctx, contractID, callerID)
 		if partyErr != nil {
-			// Only ErrNotParty from the party store maps to 403.
+			// Only ErrNotParty from the party store maps to 404 — collapse non-party
+			// to 404 (not 403) to prevent resource-existence enumeration (IDOR guard,
+			// matches the codebase convention in httpx/errors.go).
 			// All other errors (DB failure, context cancel) propagate unchanged.
 			if errors.Is(partyErr, domain.ErrNotParty) {
-				return domain.ErrForbidden
+				return domain.ErrNotFound
 			}
 
 			return partyErr
