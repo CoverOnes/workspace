@@ -26,8 +26,8 @@ func buildSignatureRouter(cs *stubContractStoreH) *gin.Engine {
 	tx := &stubTxH{contracts: cs, sigs: ss}
 	pub := events.NewNoopPublisher()
 
-	contractSvc := service.NewContractService(cs, ss, tx, pub)
-	signatureSvc := service.NewSignatureService(cs, ss)
+	contractSvc := service.NewContractService(cs, ss, tx, pub, nil)
+	signatureSvc := service.NewSignatureService(cs, ss, nil)
 	signatureH := handler.NewSignatureHandler(contractSvc, signatureSvc)
 
 	r := gin.New()
@@ -40,6 +40,7 @@ func buildSignatureRouter(cs *stubContractStoreH) *gin.Engine {
 
 	api.POST("/contracts/:id/sign", middleware.RequireTier(2), signatureH.Sign)
 	api.GET("/contracts/:id/signatures", middleware.RequireTier(1), signatureH.ListSignatures)
+	api.GET("/contracts/:id/signatures/:sigId/attachment/download-url", middleware.RequireTier(1), signatureH.GetAttachmentDownloadURL)
 
 	return r
 }

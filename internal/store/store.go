@@ -32,10 +32,16 @@ type ContractFilter struct {
 // SignatureStore defines persistence operations for contract signatures.
 type SignatureStore interface {
 	Create(ctx context.Context, s *domain.Signature) error
+	// GetByID fetches a signature by its primary key.
+	// Returns ErrSignatureNotFound when no row exists.
+	GetByID(ctx context.Context, id uuid.UUID) (*domain.Signature, error)
 	ListByContract(ctx context.Context, contractID uuid.UUID) ([]*domain.Signature, error)
 	// CountValidSignatures returns the count of distinct valid signatures for the
 	// current (contractID, version, contentHash) combination.
 	CountValidSignatures(ctx context.Context, contractID uuid.UUID, version int, contentHash string) (int, error)
+	// SetFileID persists the file_id for an existing signature row.
+	// Used after a successful S2S register call to record the attachment.
+	SetFileID(ctx context.Context, id, fileID uuid.UUID) error
 }
 
 // TaskStore defines persistence operations for tasks.

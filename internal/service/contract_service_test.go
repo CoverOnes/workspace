@@ -87,6 +87,18 @@ func (f *fakeSignatureStore) ListByContract(_ context.Context, contractID uuid.U
 	return f.sigs[contractID], nil
 }
 
+func (f *fakeSignatureStore) GetByID(_ context.Context, id uuid.UUID) (*domain.Signature, error) {
+	for _, sigs := range f.sigs {
+		for _, s := range sigs {
+			if s.ID == id {
+				return s, nil
+			}
+		}
+	}
+
+	return nil, domain.ErrSignatureNotFound
+}
+
 func (f *fakeSignatureStore) CountValidSignatures(_ context.Context, contractID uuid.UUID, version int, contentHash string) (int, error) {
 	roles := make(map[domain.SignerRole]bool)
 
@@ -97,6 +109,20 @@ func (f *fakeSignatureStore) CountValidSignatures(_ context.Context, contractID 
 	}
 
 	return len(roles), nil
+}
+
+func (f *fakeSignatureStore) SetFileID(_ context.Context, id, fileID uuid.UUID) error {
+	for _, sigs := range f.sigs {
+		for _, s := range sigs {
+			if s.ID == id {
+				s.FileID = &fileID
+
+				return nil
+			}
+		}
+	}
+
+	return domain.ErrSignatureNotFound
 }
 
 type fakeTxManager struct {
@@ -303,7 +329,7 @@ func TestCreateContract(t *testing.T) {
 			tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 			pub := &fakePublisher{}
 
-			svc := service.NewContractService(cs, ss, tx, pub)
+			svc := service.NewContractService(cs, ss, tx, pub, nil)
 
 			result, err := svc.CreateContract(context.Background(), tc.in)
 
@@ -335,7 +361,7 @@ func TestGetContract_IDORProtection(t *testing.T) {
 	ss := newFakeSignatureStore()
 	tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 	pub := &fakePublisher{}
-	svc := service.NewContractService(cs, ss, tx, pub)
+	svc := service.NewContractService(cs, ss, tx, pub, nil)
 
 	c := makeContract(clientID, freelancerID, domain.ContractStatusDraft)
 	require.NoError(t, cs.Create(context.Background(), c))
@@ -402,7 +428,7 @@ func TestSubmitContract(t *testing.T) {
 			ss := newFakeSignatureStore()
 			tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 			pub := &fakePublisher{}
-			svc := service.NewContractService(cs, ss, tx, pub)
+			svc := service.NewContractService(cs, ss, tx, pub, nil)
 
 			c := makeContract(clientID, freelancerID, tc.status)
 			require.NoError(t, cs.Create(context.Background(), c))
@@ -434,7 +460,7 @@ func TestSignContract_DualSign(t *testing.T) {
 		ss := newFakeSignatureStore()
 		tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 		pub := &fakePublisher{}
-		svc := service.NewContractService(cs, ss, tx, pub)
+		svc := service.NewContractService(cs, ss, tx, pub, nil)
 
 		c := makeContract(clientID, freelancerID, domain.ContractStatusPendingSignature)
 		require.NoError(t, cs.Create(context.Background(), c))
@@ -456,7 +482,7 @@ func TestSignContract_DualSign(t *testing.T) {
 		spy := &spyOutboxStore{}
 		tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: spy}
 		pub := &fakePublisher{}
-		svc := service.NewContractService(cs, ss, tx, pub)
+		svc := service.NewContractService(cs, ss, tx, pub, nil)
 
 		c := makeContract(clientID, freelancerID, domain.ContractStatusPendingSignature)
 		require.NoError(t, cs.Create(context.Background(), c))
@@ -489,7 +515,7 @@ func TestSignContract_DualSign(t *testing.T) {
 		ss := newFakeSignatureStore()
 		tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 		pub := &fakePublisher{}
-		svc := service.NewContractService(cs, ss, tx, pub)
+		svc := service.NewContractService(cs, ss, tx, pub, nil)
 
 		c := makeContract(clientID, freelancerID, domain.ContractStatusPendingSignature)
 		require.NoError(t, cs.Create(context.Background(), c))
@@ -508,7 +534,7 @@ func TestSignContract_DualSign(t *testing.T) {
 		ss := newFakeSignatureStore()
 		tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 		pub := &fakePublisher{}
-		svc := service.NewContractService(cs, ss, tx, pub)
+		svc := service.NewContractService(cs, ss, tx, pub, nil)
 
 		c := makeContract(clientID, freelancerID, domain.ContractStatusPendingSignature)
 		require.NoError(t, cs.Create(context.Background(), c))
@@ -527,7 +553,7 @@ func TestSignContract_DualSign(t *testing.T) {
 		ss := newFakeSignatureStore()
 		tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 		pub := &fakePublisher{}
-		svc := service.NewContractService(cs, ss, tx, pub)
+		svc := service.NewContractService(cs, ss, tx, pub, nil)
 
 		c := makeContract(clientID, freelancerID, domain.ContractStatusPendingSignature)
 		require.NoError(t, cs.Create(context.Background(), c))
@@ -644,7 +670,7 @@ func TestConcurrentMutationRejection(t *testing.T) {
 			ss := newFakeSignatureStore()
 			tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 			pub := &fakePublisher{}
-			svc := service.NewContractService(cs, ss, tx, pub)
+			svc := service.NewContractService(cs, ss, tx, pub, nil)
 
 			c := makeContract(clientID, freelancerID, domain.ContractStatusDraft)
 			require.NoError(t, cs.Create(context.Background(), c))
@@ -696,7 +722,7 @@ func TestCancelContract(t *testing.T) {
 			ss := newFakeSignatureStore()
 			tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 			pub := &fakePublisher{}
-			svc := service.NewContractService(cs, ss, tx, pub)
+			svc := service.NewContractService(cs, ss, tx, pub, nil)
 
 			c := makeContract(clientID, freelancerID, tc.status)
 			require.NoError(t, cs.Create(context.Background(), c))

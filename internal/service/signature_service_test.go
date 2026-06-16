@@ -19,7 +19,7 @@ func TestListSignatures(t *testing.T) {
 	t.Run("party can list signatures", func(t *testing.T) {
 		cs := newFakeContractStore()
 		ss := newFakeSignatureStore()
-		svc := service.NewSignatureService(cs, ss)
+		svc := service.NewSignatureService(cs, ss, nil)
 
 		c := makeContract(clientID, freelancerID, domain.ContractStatusPendingSignature)
 		require.NoError(t, cs.Create(context.Background(), c))
@@ -32,7 +32,7 @@ func TestListSignatures(t *testing.T) {
 	t.Run("non-party gets 404", func(t *testing.T) {
 		cs := newFakeContractStore()
 		ss := newFakeSignatureStore()
-		svc := service.NewSignatureService(cs, ss)
+		svc := service.NewSignatureService(cs, ss, nil)
 
 		c := makeContract(clientID, freelancerID, domain.ContractStatusActive)
 		require.NoError(t, cs.Create(context.Background(), c))
@@ -44,7 +44,7 @@ func TestListSignatures(t *testing.T) {
 	t.Run("non-existent contract returns error", func(t *testing.T) {
 		cs := newFakeContractStore()
 		ss := newFakeSignatureStore()
-		svc := service.NewSignatureService(cs, ss)
+		svc := service.NewSignatureService(cs, ss, nil)
 
 		_, err := svc.ListSignatures(context.Background(), uuid.New(), clientID)
 		require.ErrorIs(t, err, domain.ErrContractNotFound)

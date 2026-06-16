@@ -28,4 +28,7 @@ type Signature struct {
 	UserAgent         *string    `json:"userAgent,omitempty"`
 	SignedAt          time.Time  `json:"signedAt"`
 	CreatedAt         time.Time  `json:"createdAt"`
+	// FileID is an optional reference to an attachment registered with the file service.
+	// nil when no document is attached to this signature.
+	FileID *uuid.UUID `json:"fileId,omitempty"`
 }
