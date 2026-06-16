@@ -91,6 +91,23 @@ type Config struct {
 	// (safe fallback; use when gateway forwards no X-Forwarded-For).
 	// Env: WORKSPACE_GATEWAY_CIDR
 	GatewayCIDR string `mapstructure:"gateway_cidr"`
+
+	// FileBaseURL is the base URL of the CoverOnes file service used for S2S
+	// attachment registration and presign requests.
+	// Required in non-development environments when signature attachments are used.
+	// Env: FILE_BASE_URL
+	FileBaseURL string `mapstructure:"file_base_url"`
+
+	// FileS2SServiceID is the service-ID sent in X-Service-Id when calling the
+	// file service. Defaults to "workspace".
+	// Env: FILE_S2S_SERVICE_ID
+	FileS2SServiceID string `mapstructure:"file_s2s_service_id"`
+
+	// FileS2SToken is the pre-shared token sent in X-Service-Token when calling
+	// the file service. NEVER logged or included in URLs.
+	// Required in non-development environments (≥32 chars enforced).
+	// Env: WORKSPACE_FILE_S2S_TOKEN
+	FileS2SToken string `mapstructure:"file_s2s_token"`
 }
 
 // Load reads configuration from environment variables (prefix WORKSPACE_).
@@ -104,6 +121,8 @@ func Load() (*Config, error) {
 	v.AutomaticEnv()
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
+	//nolint:gosec // G101 false positive: map keys are viper config key names (e.g. "file_s2s_token"),
+	// not actual credential values; the values are env-var name strings (e.g. "WORKSPACE_FILE_S2S_TOKEN").
 	bindings := map[string]string{
 		"port":                    "WORKSPACE_PORT",
 		"postgres_dsn":            "WORKSPACE_POSTGRES_DSN",
@@ -119,6 +138,9 @@ func Load() (*Config, error) {
 		"user_rate_limit_per_min": "WORKSPACE_USER_RATE_LIMIT_PER_MIN",
 		"user_rate_limit_burst":   "WORKSPACE_USER_RATE_LIMIT_BURST",
 		"gateway_cidr":            "WORKSPACE_GATEWAY_CIDR",
+		"file_base_url":           "FILE_BASE_URL",
+		"file_s2s_service_id":     "FILE_S2S_SERVICE_ID",
+		"file_s2s_token":          "WORKSPACE_FILE_S2S_TOKEN",
 	}
 
 	for key, envKey := range bindings {
@@ -139,6 +161,7 @@ func Load() (*Config, error) {
 	// explicitly.
 	v.SetDefault("env", "production")
 	v.SetDefault("db_max_conns", 10)
+	v.SetDefault("file_s2s_service_id", "workspace")
 	v.SetDefault("db_min_conns", 2)
 	v.SetDefault("user_rate_limit_per_min", 120)
 	v.SetDefault("user_rate_limit_burst", 20)
@@ -206,6 +229,8 @@ func (c *Config) validate() error {
 	errs = append(errs, c.validateGatewayHMAC()...)
 
 	errs = append(errs, c.validateGatewayCIDR()...)
+
+	errs = append(errs, c.validateFileS2SToken()...)
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
@@ -333,6 +358,33 @@ func (c *Config) validateGatewayCIDR() []string {
 	}
 
 	return nil
+}
+
+// validateFileS2SToken validates WORKSPACE_FILE_S2S_TOKEN.
+// In non-development environments it is required when FileBaseURL is set,
+// and must be at least 32 characters to enforce adequate entropy.
+func (c *Config) validateFileS2SToken() []string {
+	const minFileTokenLen = 32
+
+	if c.FileBaseURL == "" {
+		// No file service configured — token not required.
+		return nil
+	}
+
+	switch {
+	case c.IsDev() && c.FileS2SToken == "":
+		return nil // allowed in dev when file service is not exercised
+	case c.FileS2SToken == "":
+		return []string{
+			"WORKSPACE_FILE_S2S_TOKEN is required when FILE_BASE_URL is set in non-development environments",
+		}
+	case len(c.FileS2SToken) < minFileTokenLen:
+		return []string{
+			fmt.Sprintf("WORKSPACE_FILE_S2S_TOKEN must be at least %d characters", minFileTokenLen),
+		}
+	default:
+		return nil
+	}
 }
 
 // IsDev reports whether the service is running in development mode.

@@ -15,6 +15,7 @@ import (
 
 	"github.com/CoverOnes/workspace/internal/config"
 	"github.com/CoverOnes/workspace/internal/events"
+	"github.com/CoverOnes/workspace/internal/fileclient"
 	"github.com/CoverOnes/workspace/internal/handler"
 	"github.com/CoverOnes/workspace/internal/outbox"
 	"github.com/CoverOnes/workspace/internal/platform/logger"
@@ -155,9 +156,22 @@ func run() error {
 	milestoneStore := postgres.NewMilestoneStore(pool)
 	milestoneTxManager := postgres.NewMilestoneTxManager(pool)
 
+	// File S2S client (optional — nil when FILE_BASE_URL is not set or dev mode without token).
+	var fileClient *fileclient.Client
+	if cfg.FileBaseURL != "" && cfg.FileS2SToken != "" {
+		fileClient = fileclient.New(fileclient.Config{
+			BaseURL:   cfg.FileBaseURL,
+			ServiceID: cfg.FileS2SServiceID,
+			Token:     cfg.FileS2SToken,
+		})
+		slog.Info("file S2S client configured", "base_url", cfg.FileBaseURL, "service_id", cfg.FileS2SServiceID)
+	} else {
+		slog.Info("file S2S client not configured; signature attachments disabled")
+	}
+
 	// Service layer.
-	contractSvc := service.NewContractService(contractStore, signatureStore, txManager, publisher)
-	signatureSvc := service.NewSignatureService(contractStore, signatureStore)
+	contractSvc := service.NewContractService(contractStore, signatureStore, txManager, publisher, fileClient)
+	signatureSvc := service.NewSignatureService(contractStore, signatureStore, fileClient)
 	taskSvc := service.NewTaskService(contractStore, taskStore)
 	worklogSvc := service.NewWorklogService(contractStore, worklogStore)
 	multipartyContractSvc := service.NewMultipartyContractService(

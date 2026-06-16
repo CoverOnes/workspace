@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/CoverOnes/workspace/internal/domain"
@@ -23,20 +24,30 @@ type ContractService struct {
 	sigs      store.SignatureStore
 	tx        store.TxManager
 	publisher events.Publisher // retained for constructor API stability; outbox is now the publish path
+	files     fileRegistrar    // may be nil when file service is not configured
+}
+
+// fileRegistrar is the subset of fileclient.Client needed by ContractService.
+// Using the interface (not the concrete type) keeps ContractService testable without HTTP.
+type fileRegistrar interface {
+	Register(ctx context.Context, ownerUserID, fileID, signatureID uuid.UUID) error
 }
 
 // NewContractService returns a ContractService.
+// files may be nil when the file service is not configured (dev environments).
 func NewContractService(
 	contracts store.ContractStore,
 	sigs store.SignatureStore,
 	tx store.TxManager,
 	publisher events.Publisher,
+	files fileRegistrar,
 ) *ContractService {
 	return &ContractService{
 		contracts: contracts,
 		sigs:      sigs,
 		tx:        tx,
 		publisher: publisher,
+		files:     files,
 	}
 }
 
@@ -331,6 +342,10 @@ type SignContractInput struct {
 	SignedContentHash string
 	SignerIP          *string
 	UserAgent         *string
+	// FileID is the optional UUID of a document already present in the file service.
+	// When non-nil, the signature service will call fileclient.Register after the
+	// signature row is created and persist file_id on it.
+	FileID *uuid.UUID
 }
 
 // SignContract records a party's signature. Inside one tx: when both parties have
@@ -338,6 +353,8 @@ type SignContractInput struct {
 // -> SIGNED -> ACTIVE atomically.
 func (s *ContractService) SignContract(ctx context.Context, in SignContractInput) (*domain.Contract, error) {
 	var result *domain.Contract
+
+	var createdSigID uuid.UUID // captured for post-tx file registration
 
 	txErr := s.tx.WithTx(ctx,
 		func(ctx context.Context, txContracts store.ContractStore, txSigs store.SignatureStore, txOutbox store.OutboxStore) error {
@@ -378,6 +395,8 @@ func (s *ContractService) SignContract(ctx context.Context, in SignContractInput
 			if createErr := txSigs.Create(ctx, sig); createErr != nil {
 				return createErr
 			}
+
+			createdSigID = sig.ID // captured for post-tx file attachment registration
 
 			// Evaluate dual-sign completion: count distinct signer_roles for current version+hash.
 			count, err := txSigs.CountValidSignatures(ctx, c.ID, c.Version, c.ContentHash)
@@ -445,7 +464,42 @@ func (s *ContractService) SignContract(ctx context.Context, in SignContractInput
 		return nil, txErr
 	}
 
+	s.registerAttachmentBestEffort(ctx, in.CallerID, in.FileID, createdSigID)
+
 	return result, nil
+}
+
+// registerAttachmentBestEffort calls the file service to associate a document with a
+// signature after the signature transaction has committed. It is best-effort: failures
+// are logged but do not affect the already-committed signature row.
+//
+// A fresh context.Background() is used intentionally so a dropped caller connection
+// does not cancel the S2S call.
+//
+//nolint:contextcheck // intentional: independent background context survives request cancellation.
+func (s *ContractService) registerAttachmentBestEffort(
+	requestCtx context.Context,
+	ownerID uuid.UUID,
+	fileID *uuid.UUID,
+	sigID uuid.UUID,
+) {
+	if fileID == nil || s.files == nil || sigID == uuid.Nil {
+		return
+	}
+
+	bgCtx := context.Background()
+
+	if regErr := s.files.Register(bgCtx, ownerID, *fileID, sigID); regErr != nil {
+		slog.Warn("fileclient register attachment failed; file_id not persisted",
+			"signature_id", sigID, "file_id", *fileID, "err", regErr)
+
+		return
+	}
+
+	if setErr := s.sigs.SetFileID(requestCtx, sigID, *fileID); setErr != nil {
+		slog.Warn("set signature file_id failed after successful register",
+			"signature_id", sigID, "file_id", *fileID, "err", setErr)
+	}
 }
 
 // CompleteContract transitions ACTIVE -> COMPLETED (client only).

@@ -31,6 +31,10 @@ func (s *txSignatureStore) Create(ctx context.Context, sig *domain.Signature) er
 	return createSignature(ctx, s.tx, sig)
 }
 
+func (s *txSignatureStore) GetByID(ctx context.Context, id uuid.UUID) (*domain.Signature, error) {
+	return getSignatureByID(ctx, s.tx, id)
+}
+
 func (s *txSignatureStore) ListByContract(ctx context.Context, contractID uuid.UUID) ([]*domain.Signature, error) {
 	return listSignaturesByContract(ctx, s.tx, contractID)
 }
@@ -39,9 +43,18 @@ func (s *txSignatureStore) CountValidSignatures(ctx context.Context, contractID 
 	return countValidSignatures(ctx, s.tx, contractID, version, contentHash)
 }
 
+func (s *txSignatureStore) SetFileID(ctx context.Context, id, fileID uuid.UUID) error {
+	return setSignatureFileID(ctx, s.tx, id, fileID)
+}
+
 // Create inserts a new signature record.
 func (s *SignatureStore) Create(ctx context.Context, sig *domain.Signature) error {
 	return createSignature(ctx, s.q, sig)
+}
+
+// GetByID fetches a signature by its primary key.
+func (s *SignatureStore) GetByID(ctx context.Context, id uuid.UUID) (*domain.Signature, error) {
+	return getSignatureByID(ctx, s.q, id)
 }
 
 // ListByContract returns all signatures for a contract (newest signed_at first).
@@ -52,6 +65,11 @@ func (s *SignatureStore) ListByContract(ctx context.Context, contractID uuid.UUI
 // CountValidSignatures counts distinct signatures matching current version+hash.
 func (s *SignatureStore) CountValidSignatures(ctx context.Context, contractID uuid.UUID, version int, contentHash string) (int, error) {
 	return countValidSignatures(ctx, s.q, contractID, version, contentHash)
+}
+
+// SetFileID persists the file_id for an existing signature row.
+func (s *SignatureStore) SetFileID(ctx context.Context, id, fileID uuid.UUID) error {
+	return setSignatureFileID(ctx, s.q, id, fileID)
 }
 
 // --- helpers ---
@@ -82,12 +100,34 @@ VALUES
 	return nil
 }
 
+func getSignatureByID(ctx context.Context, q querier, id uuid.UUID) (*domain.Signature, error) {
+	const query = `
+SELECT id, contract_id, signer_user_id, signer_role, contract_version,
+       signed_content_hash, signer_ip::text, user_agent, signed_at, created_at, file_id
+FROM contract_signatures
+WHERE id = $1
+`
+
+	row := q.QueryRow(ctx, query, id)
+
+	sig, err := scanSignature(row)
+	if err != nil {
+		if errors.Is(err, domain.ErrSignatureNotFound) {
+			return nil, domain.ErrSignatureNotFound
+		}
+
+		return nil, fmt.Errorf("get signature by id: %w", err)
+	}
+
+	return sig, nil
+}
+
 func listSignaturesByContract(ctx context.Context, q querier, contractID uuid.UUID) ([]*domain.Signature, error) {
 	// signer_ip is Postgres inet (OID 869); pgx v5 binary mode cannot scan inet
 	// directly into *string. Cast to text so it scans cleanly (NULL stays NULL).
 	const query = `
 SELECT id, contract_id, signer_user_id, signer_role, contract_version,
-       signed_content_hash, signer_ip::text, user_agent, signed_at, created_at
+       signed_content_hash, signer_ip::text, user_agent, signed_at, created_at, file_id
 FROM contract_signatures
 WHERE contract_id = $1
 ORDER BY signed_at DESC
@@ -137,6 +177,21 @@ WHERE contract_id = $1
 	return count, nil
 }
 
+func setSignatureFileID(ctx context.Context, q querier, id, fileID uuid.UUID) error {
+	const query = `UPDATE contract_signatures SET file_id = $1 WHERE id = $2`
+
+	tag, err := q.Exec(ctx, query, fileID, id)
+	if err != nil {
+		return fmt.Errorf("set signature file_id: %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return domain.ErrSignatureNotFound
+	}
+
+	return nil
+}
+
 func scanSignature(row rowScanner) (*domain.Signature, error) {
 	var (
 		sig  domain.Signature
@@ -146,6 +201,7 @@ func scanSignature(row rowScanner) (*domain.Signature, error) {
 	err := row.Scan(
 		&sig.ID, &sig.ContractID, &sig.SignerUserID, &role, &sig.ContractVersion,
 		&sig.SignedContentHash, &sig.SignerIP, &sig.UserAgent, &sig.SignedAt, &sig.CreatedAt,
+		&sig.FileID,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

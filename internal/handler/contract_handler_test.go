@@ -87,9 +87,32 @@ func (s *stubContractStoreH) Update(_ context.Context, c *domain.Contract) error
 	return nil
 }
 
-type stubSigStoreH struct{}
+type stubSigStoreH struct {
+	sigs map[uuid.UUID]*domain.Signature
+}
 
-func (s *stubSigStoreH) Create(_ context.Context, _ *domain.Signature) error { return nil }
+func (s *stubSigStoreH) Create(_ context.Context, sig *domain.Signature) error {
+	if s.sigs == nil {
+		s.sigs = make(map[uuid.UUID]*domain.Signature)
+	}
+
+	s.sigs[sig.ID] = sig
+
+	return nil
+}
+
+func (s *stubSigStoreH) GetByID(_ context.Context, id uuid.UUID) (*domain.Signature, error) {
+	if s.sigs == nil {
+		return nil, domain.ErrSignatureNotFound
+	}
+
+	sig, ok := s.sigs[id]
+	if !ok {
+		return nil, domain.ErrSignatureNotFound
+	}
+
+	return sig, nil
+}
 
 func (s *stubSigStoreH) ListByContract(_ context.Context, _ uuid.UUID) ([]*domain.Signature, error) {
 	return nil, nil
@@ -97,6 +120,21 @@ func (s *stubSigStoreH) ListByContract(_ context.Context, _ uuid.UUID) ([]*domai
 
 func (s *stubSigStoreH) CountValidSignatures(_ context.Context, _ uuid.UUID, _ int, _ string) (int, error) {
 	return 0, nil
+}
+
+func (s *stubSigStoreH) SetFileID(_ context.Context, id, fileID uuid.UUID) error {
+	if s.sigs == nil {
+		return domain.ErrSignatureNotFound
+	}
+
+	sig, ok := s.sigs[id]
+	if !ok {
+		return domain.ErrSignatureNotFound
+	}
+
+	sig.FileID = &fileID
+
+	return nil
 }
 
 type stubTxH struct {
@@ -143,7 +181,7 @@ func buildContractRouter(cs *stubContractStoreH) *gin.Engine {
 	tx := &stubTxH{contracts: cs, sigs: ss}
 	pub := events.NewNoopPublisher()
 
-	svc := service.NewContractService(cs, ss, tx, pub)
+	svc := service.NewContractService(cs, ss, tx, pub, nil)
 	h := handler.NewContractHandler(svc)
 	internalH := handler.NewInternalContractHandler(svc)
 
