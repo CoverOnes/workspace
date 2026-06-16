@@ -26,7 +26,7 @@ func buildSignatureRouter(cs *stubContractStoreH) *gin.Engine {
 	tx := &stubTxH{contracts: cs, sigs: ss}
 	pub := events.NewNoopPublisher()
 
-	contractSvc := service.NewContractService(cs, ss, tx, pub, nil)
+	contractSvc := service.NewContractService(cs, ss, tx, pub, nil, false)
 	signatureSvc := service.NewSignatureService(cs, ss, nil)
 	signatureH := handler.NewSignatureHandler(contractSvc, signatureSvc)
 

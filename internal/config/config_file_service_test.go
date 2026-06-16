@@ -312,3 +312,97 @@ func TestFileService_RFC1918_Dev_Allowed(t *testing.T) {
 
 	require.NoError(t, err, "RFC1918 URL must be allowed in dev")
 }
+
+// TestFileService_Localhost_Rejected verifies that "localhost" (hostname string, not an IP)
+// is blocked by the loopback guard. net.ParseIP("localhost") returns nil, so without an
+// explicit string check the loopback block was bypassed — regression test for that fix.
+func TestFileService_Localhost_Rejected(t *testing.T) {
+	setValidDevFileEnv(t)
+	t.Setenv("FILE_BASE_URL", "http://localhost:9000")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", validFileToken)
+
+	_, err := config.Load()
+
+	require.Error(t, err, "localhost URL must be rejected (loopback guard)")
+	assert.Contains(t, err.Error(), "FILE_BASE_URL")
+}
+
+// TestFileService_LocalhostTrailingDot_Rejected verifies that "localhost." (trailing dot
+// in FQDN notation, preserved by url.Hostname()) is also blocked by the explicit string check.
+func TestFileService_LocalhostTrailingDot_Rejected(t *testing.T) {
+	setValidDevFileEnv(t)
+	t.Setenv("FILE_BASE_URL", "http://localhost.:9000")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", validFileToken)
+
+	_, err := config.Load()
+
+	require.Error(t, err, "localhost. (trailing dot) URL must be rejected (loopback guard)")
+	assert.Contains(t, err.Error(), "FILE_BASE_URL")
+}
+
+// TestFileService_MetadataTrailingDot_Rejected verifies that the SSRF metadata-host
+// blocklist is applied AFTER stripping the trailing dot so "169.254.169.254." is blocked
+// the same as "169.254.169.254".
+func TestFileService_MetadataTrailingDot_Rejected(t *testing.T) {
+	setValidDevFileEnv(t)
+	t.Setenv("FILE_BASE_URL", "http://169.254.169.254./latest/meta-data")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", validFileToken)
+
+	_, err := config.Load()
+
+	require.Error(t, err, "169.254.169.254. (trailing-dot FQDN) must be rejected as metadata host")
+	assert.Contains(t, err.Error(), "FILE_BASE_URL")
+}
+
+// TestFileService_DecimalEncodedLoopback_Rejected verifies that 2130706433 (the decimal
+// representation of 127.0.0.1) is resolved and rejected by the loopback guard.
+// net.ParseIP("2130706433") returns nil, so without classifyHostIP the guard is bypassed.
+func TestFileService_DecimalEncodedLoopback_Rejected(t *testing.T) {
+	setValidDevFileEnv(t)
+	t.Setenv("FILE_BASE_URL", "http://2130706433:9000")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", validFileToken)
+
+	_, err := config.Load()
+
+	require.Error(t, err, "decimal-encoded loopback 2130706433 must be rejected")
+	assert.Contains(t, err.Error(), "FILE_BASE_URL")
+}
+
+// TestFileService_HexEncodedLoopback_Rejected verifies that 0x7f000001 (hex for
+// 127.0.0.1) is resolved and rejected by the loopback guard.
+func TestFileService_HexEncodedLoopback_Rejected(t *testing.T) {
+	setValidDevFileEnv(t)
+	t.Setenv("FILE_BASE_URL", "http://0x7f000001:9000")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", validFileToken)
+
+	_, err := config.Load()
+
+	require.Error(t, err, "hex-encoded loopback 0x7f000001 must be rejected")
+	assert.Contains(t, err.Error(), "FILE_BASE_URL")
+}
+
+// TestFileService_RFC1918TrailingDot_Prod_Rejected verifies that "10.0.0.1." (trailing
+// dot) in production is caught by the private-IP guard after the trailing dot is stripped.
+func TestFileService_RFC1918TrailingDot_Prod_Rejected(t *testing.T) {
+	setValidProdFileEnv(t)
+	t.Setenv("FILE_BASE_URL", "http://10.0.0.1.:9000")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", validFileToken)
+
+	_, err := config.Load()
+
+	require.Error(t, err, "10.0.0.1. (trailing-dot RFC1918) must be rejected in production")
+	assert.Contains(t, err.Error(), "FILE_BASE_URL")
+}
+
+// TestFileService_LOCALHOST_CaseInsensitive_Rejected verifies that uppercase LOCALHOST
+// is also rejected by the case-insensitive string check.
+func TestFileService_LOCALHOST_CaseInsensitive_Rejected(t *testing.T) {
+	setValidDevFileEnv(t)
+	t.Setenv("FILE_BASE_URL", "http://LOCALHOST:9000")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", validFileToken)
+
+	_, err := config.Load()
+
+	require.Error(t, err, "LOCALHOST (uppercase) must be rejected (case-insensitive loopback guard)")
+	assert.Contains(t, err.Error(), "FILE_BASE_URL")
+}

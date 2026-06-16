@@ -13,21 +13,17 @@ import (
 // for tests and local development. It stores bytes keyed by FileID and returns
 // deterministic presign URLs. Thread-safe for use across goroutines in parallel tests.
 type fakeFileClient struct {
-	mu      sync.Mutex
-	files   map[uuid.UUID][]byte
-	keys    map[uuid.UUID]string
-	presign func(id uuid.UUID) (string, int)
+	mu    sync.Mutex
+	files map[uuid.UUID][]byte
+	keys  map[uuid.UUID]string
 }
 
-// newFakeFileClient returns a fakeFileClient with an optional custom presign function.
-//
-//   - presign: optional; if non-nil, called by PresignDownload to produce (url, ttlSeconds).
-//     If nil, a deterministic default URL scheme is used.
-func newFakeFileClient(presignFn func(id uuid.UUID) (string, int)) *fakeFileClient {
+// newFakeFileClient returns a fakeFileClient backed by an in-memory store.
+// PresignDownload returns a deterministic fake URL using the default scheme.
+func newFakeFileClient() *fakeFileClient {
 	return &fakeFileClient{
-		files:   make(map[uuid.UUID][]byte),
-		keys:    make(map[uuid.UUID]string),
-		presign: presignFn,
+		files: make(map[uuid.UUID][]byte),
+		keys:  make(map[uuid.UUID]string),
 	}
 }
 
@@ -57,11 +53,6 @@ func (f *fakeFileClient) PresignDownload(_ context.Context, fileID uuid.UUID) (p
 
 	if !ok {
 		return "", 0, fmt.Errorf("fake file client: file %s not found", fileID)
-	}
-
-	if f.presign != nil {
-		u, ttl := f.presign(fileID)
-		return u, ttl, nil
 	}
 
 	return fmt.Sprintf("https://fake-file-svc.test/download/%s?sig=deterministic", fileID), 300, nil

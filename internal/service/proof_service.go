@@ -318,6 +318,17 @@ func (s *ProofService) GetDownloadURL(
 // Returns domain.ErrForbidden for non-parties.
 // The proof endpoint uses ErrForbidden (not ErrNotFound) because the contract ID
 // is already known to the caller (they navigated to /contracts/:id/proof).
+//
+// Bilateral: allows the two contract parties (client + freelancer).
+//
+// Multiparty: allows any active vendor-party (GetActivePartyByVendor) AND the
+// contract poster (multiparty_contracts.poster_user_id). The poster is the user
+// who created the contract; they do not appear in multiparty_parties so they
+// would receive ErrForbidden without this explicit check.
+//
+// Note on bilateral vs multiparty divergence: bilateral proof returns ErrForbidden
+// (not ErrNotFound) for non-parties — this is intentional (both kinds use 403 so
+// callers cannot probe contract existence via the proof endpoint).
 func (s *ProofService) assertProofParty(
 	ctx context.Context,
 	contractID uuid.UUID,
@@ -338,15 +349,26 @@ func (s *ProofService) assertProofParty(
 		return nil
 
 	case domain.ContractKindMultiparty:
-		_, err := s.mpParties.GetActivePartyByVendor(ctx, contractID, callerID)
+		// Allow the contract poster explicitly — they do not appear in multiparty_parties
+		// (which only stores vendor rows) so GetActivePartyByVendor would return ErrNotParty.
+		mc, err := s.mpContracts.GetByID(ctx, contractID)
 		if err != nil {
+			return err
+		}
+
+		if mc.PosterUserID != nil && callerID == *mc.PosterUserID {
+			return nil // poster is authorized
+		}
+
+		_, partyErr := s.mpParties.GetActivePartyByVendor(ctx, contractID, callerID)
+		if partyErr != nil {
 			// Only ErrNotParty from the party store maps to 403.
 			// All other errors (DB failure, context cancel) propagate unchanged.
-			if errors.Is(err, domain.ErrNotParty) {
+			if errors.Is(partyErr, domain.ErrNotParty) {
 				return domain.ErrForbidden
 			}
 
-			return err
+			return partyErr
 		}
 
 		return nil

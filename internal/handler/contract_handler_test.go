@@ -181,7 +181,7 @@ func buildContractRouter(cs *stubContractStoreH) *gin.Engine {
 	tx := &stubTxH{contracts: cs, sigs: ss}
 	pub := events.NewNoopPublisher()
 
-	svc := service.NewContractService(cs, ss, tx, pub, nil)
+	svc := service.NewContractService(cs, ss, tx, pub, nil, false)
 	h := handler.NewContractHandler(svc)
 	internalH := handler.NewInternalContractHandler(svc)
 

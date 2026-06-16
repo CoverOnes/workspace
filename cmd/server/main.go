@@ -138,9 +138,10 @@ func run() error {
 	var fileClient *fileclient.Client
 	if cfg.FileBaseURL != "" && cfg.FileS2SToken != "" {
 		fileClient = fileclient.New(fileclient.Config{
-			BaseURL:   cfg.FileBaseURL,
-			ServiceID: cfg.FileS2SServiceID,
-			Token:     cfg.FileS2SToken,
+			BaseURL:         cfg.FileBaseURL,
+			ServiceID:       cfg.FileS2SServiceID,
+			Token:           cfg.FileS2SToken,
+			BlockPrivateIPs: !cfg.IsDev(), // block RFC1918 in prod/staging; allow in dev (local MinIO)
 		})
 		slog.Info("file S2S client configured", "base_url", cfg.FileBaseURL, "service_id", cfg.FileS2SServiceID)
 	} else {
@@ -148,7 +149,7 @@ func run() error {
 	}
 
 	// Service layer.
-	contractSvc := service.NewContractService(contractStore, signatureStore, txManager, publisher, fileClient)
+	contractSvc := service.NewContractService(contractStore, signatureStore, txManager, publisher, fileClient, cfg.FileServiceEnabled())
 	signatureSvc := service.NewSignatureService(contractStore, signatureStore, fileClient)
 	taskSvc := service.NewTaskService(contractStore, taskStore)
 	worklogSvc := service.NewWorklogService(contractStore, worklogStore)
@@ -159,6 +160,7 @@ func run() error {
 		addendumStore,
 		multipartyTxManager,
 		publisher,
+		cfg.FileServiceEnabled(),
 	)
 	milestoneSvc := service.NewMilestoneService(multipartyContractStore, milestoneStore, multipartyPartyStore, milestoneTxManager, publisher)
 	auditLogSvc := service.NewAuditLogService(auditLogStore)

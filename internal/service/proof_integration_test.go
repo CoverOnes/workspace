@@ -67,11 +67,11 @@ func newProofTestEnv(t *testing.T) *proofTestEnv {
 
 	// Service layer.
 	pub := events.NewNoopPublisher()
-	contractSvc := service.NewContractService(contractStore, sigStore, txMgr, pub, nil)
-	mpSvc := service.NewMultipartyContractService(mpContractStore, mpPartyStore, mpSigStore, addendaStore, mpTxMgr, pub)
+	contractSvc := service.NewContractService(contractStore, sigStore, txMgr, pub, nil, false)
+	mpSvc := service.NewMultipartyContractService(mpContractStore, mpPartyStore, mpSigStore, addendaStore, mpTxMgr, pub, false)
 
 	// fakeFileClient — no external HTTP dependency.
-	fakeFC := newFakeFileClient(nil)
+	fakeFC := newFakeFileClient()
 
 	proofSvc, err := service.NewProofService(&service.ProofServiceConfig{
 		ProofStore:               proofStore,
@@ -483,6 +483,37 @@ func TestProofService_Multiparty_GetDownloadURL_NonParty_Returns403(t *testing.T
 	assert.ErrorIs(t, err, domain.ErrForbidden, "non-party must get ErrForbidden (403)")
 }
 
+// TestProofService_Multiparty_GetDownloadURL_Poster_Allowed verifies that the contract
+// poster (multiparty_contracts.poster_user_id) can obtain a download URL even though
+// the poster does not appear in multiparty_parties (which stores only vendor rows).
+//
+// This is a regression test for the A3 finding: before the fix, the poster received
+// ErrForbidden because only GetActivePartyByVendor was checked.
+func TestProofService_Multiparty_GetDownloadURL_Poster_Allowed(t *testing.T) {
+	env := newProofTestEnv(t)
+	ctx := context.Background()
+
+	contractID, posterID, _, _ := createActiveMultipartyContract(t, env)
+
+	// Generate proof first.
+	_, err := env.proofSvc.GenerateAndStore(ctx, contractID, domain.ContractKindMultiparty)
+	require.NoError(t, err)
+
+	// Poster MUST be able to download their own contract's proof.
+	url, ttl, err := env.proofSvc.GetDownloadURL(ctx, contractID, domain.ContractKindMultiparty, posterID)
+
+	require.NoError(t, err, "poster must be authorized to get a download URL")
+	assert.NotEmpty(t, url, "download URL must not be empty for poster")
+	assert.Greater(t, ttl, 0, "TTL must be positive")
+
+	// A random non-party still receives ErrForbidden.
+	trueNonPartyID := uuid.New()
+	_, _, nonPartyErr := env.proofSvc.GetDownloadURL(ctx, contractID, domain.ContractKindMultiparty, trueNonPartyID)
+
+	require.Error(t, nonPartyErr, "non-party must still get an error")
+	assert.ErrorIs(t, nonPartyErr, domain.ErrForbidden, "non-party must get ErrForbidden (403)")
+}
+
 // ---- Supersede test (item 1: addendum re-sign produces stale proof fix) -----
 
 // TestProofService_Supersede_AddendumResign verifies that when a multiparty contract
@@ -597,7 +628,7 @@ func TestNewProofService_NilDependencies_ReturnError(t *testing.T) {
 		MultipartyContractStore:  postgres.NewMultipartyContractStore(pool),
 		MultipartyPartyStore:     postgres.NewMultipartyPartyStore(pool),
 		MultipartySignatureStore: postgres.NewMultipartySignatureStore(pool),
-		FileClient:               newFakeFileClient(nil),
+		FileClient:               newFakeFileClient(),
 	}
 
 	tests := []struct {

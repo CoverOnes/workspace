@@ -329,7 +329,7 @@ func TestCreateContract(t *testing.T) {
 			tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 			pub := &fakePublisher{}
 
-			svc := service.NewContractService(cs, ss, tx, pub, nil)
+			svc := service.NewContractService(cs, ss, tx, pub, nil, false)
 
 			result, err := svc.CreateContract(context.Background(), tc.in)
 
@@ -361,7 +361,7 @@ func TestGetContract_IDORProtection(t *testing.T) {
 	ss := newFakeSignatureStore()
 	tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 	pub := &fakePublisher{}
-	svc := service.NewContractService(cs, ss, tx, pub, nil)
+	svc := service.NewContractService(cs, ss, tx, pub, nil, false)
 
 	c := makeContract(clientID, freelancerID, domain.ContractStatusDraft)
 	require.NoError(t, cs.Create(context.Background(), c))
@@ -428,7 +428,7 @@ func TestSubmitContract(t *testing.T) {
 			ss := newFakeSignatureStore()
 			tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 			pub := &fakePublisher{}
-			svc := service.NewContractService(cs, ss, tx, pub, nil)
+			svc := service.NewContractService(cs, ss, tx, pub, nil, false)
 
 			c := makeContract(clientID, freelancerID, tc.status)
 			require.NoError(t, cs.Create(context.Background(), c))
@@ -460,7 +460,7 @@ func TestSignContract_DualSign(t *testing.T) {
 		ss := newFakeSignatureStore()
 		tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 		pub := &fakePublisher{}
-		svc := service.NewContractService(cs, ss, tx, pub, nil)
+		svc := service.NewContractService(cs, ss, tx, pub, nil, false)
 
 		c := makeContract(clientID, freelancerID, domain.ContractStatusPendingSignature)
 		require.NoError(t, cs.Create(context.Background(), c))
@@ -476,13 +476,14 @@ func TestSignContract_DualSign(t *testing.T) {
 		assert.Equal(t, 0, pub.published)
 	})
 
-	t.Run("dual sign activates contract and enqueues outbox event", func(t *testing.T) {
+	t.Run("dual sign activates contract and enqueues outbox event (proof disabled)", func(t *testing.T) {
 		cs := newFakeContractStore()
 		ss := newFakeSignatureStore()
 		spy := &spyOutboxStore{}
 		tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: spy}
 		pub := &fakePublisher{}
-		svc := service.NewContractService(cs, ss, tx, pub, nil)
+		// proofEnabled=false: only contract_activated should be enqueued.
+		svc := service.NewContractService(cs, ss, tx, pub, nil, false)
 
 		c := makeContract(clientID, freelancerID, domain.ContractStatusPendingSignature)
 		require.NoError(t, cs.Create(context.Background(), c))
@@ -503,12 +504,46 @@ func TestSignContract_DualSign(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, domain.ContractStatusActive, result.Status)
 		assert.NotNil(t, result.ActivatedAt)
-		// Publisher is no longer called directly; events are enqueued in the outbox atomically.
+		assert.Equal(t, 0, pub.published)
+		require.Len(t, spy.enqueued, 1, "proof disabled: only contract_activated enqueued")
+		assert.Equal(t, "contract", spy.enqueued[0].AggregateType)
+		assert.Equal(t, c.ID, spy.enqueued[0].AggregateID)
+		assert.Equal(t, "workspace.contract_activated", spy.enqueued[0].Channel)
+	})
+
+	t.Run("dual sign activates contract and enqueues proof entry when proof enabled", func(t *testing.T) {
+		cs := newFakeContractStore()
+		ss := newFakeSignatureStore()
+		spy := &spyOutboxStore{}
+		tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: spy}
+		pub := &fakePublisher{}
+		// proofEnabled=true: both contract_activated and proof_generation_required enqueued.
+		svc := service.NewContractService(cs, ss, tx, pub, nil, true)
+
+		c := makeContract(clientID, freelancerID, domain.ContractStatusPendingSignature)
+		require.NoError(t, cs.Create(context.Background(), c))
+
+		_, err := svc.SignContract(context.Background(), service.SignContractInput{
+			ContractID:        c.ID,
+			CallerID:          clientID,
+			SignedContentHash: c.ContentHash,
+		})
+		require.NoError(t, err)
+
+		result, err := svc.SignContract(context.Background(), service.SignContractInput{
+			ContractID:        c.ID,
+			CallerID:          freelancerID,
+			SignedContentHash: c.ContentHash,
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, domain.ContractStatusActive, result.Status)
+		assert.NotNil(t, result.ActivatedAt)
 		assert.Equal(t, 0, pub.published)
 		// Dual-sign activation enqueues two outbox entries:
 		//   [0] contract_activated  — notifies downstream consumers via Redis relay
 		//   [1] proof_generation_required — handled in-process by the outbox poller
-		require.Len(t, spy.enqueued, 2, "expected 2 outbox entries on dual-sign activation (contract_activated + proof_generation_required)")
+		require.Len(t, spy.enqueued, 2, "proof enabled: contract_activated + proof_generation_required enqueued")
 		assert.Equal(t, "contract", spy.enqueued[0].AggregateType)
 		assert.Equal(t, c.ID, spy.enqueued[0].AggregateID)
 		assert.Equal(t, "workspace.contract_activated", spy.enqueued[0].Channel)
@@ -522,7 +557,7 @@ func TestSignContract_DualSign(t *testing.T) {
 		ss := newFakeSignatureStore()
 		tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 		pub := &fakePublisher{}
-		svc := service.NewContractService(cs, ss, tx, pub, nil)
+		svc := service.NewContractService(cs, ss, tx, pub, nil, false)
 
 		c := makeContract(clientID, freelancerID, domain.ContractStatusPendingSignature)
 		require.NoError(t, cs.Create(context.Background(), c))
@@ -541,7 +576,7 @@ func TestSignContract_DualSign(t *testing.T) {
 		ss := newFakeSignatureStore()
 		tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 		pub := &fakePublisher{}
-		svc := service.NewContractService(cs, ss, tx, pub, nil)
+		svc := service.NewContractService(cs, ss, tx, pub, nil, false)
 
 		c := makeContract(clientID, freelancerID, domain.ContractStatusPendingSignature)
 		require.NoError(t, cs.Create(context.Background(), c))
@@ -560,7 +595,7 @@ func TestSignContract_DualSign(t *testing.T) {
 		ss := newFakeSignatureStore()
 		tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 		pub := &fakePublisher{}
-		svc := service.NewContractService(cs, ss, tx, pub, nil)
+		svc := service.NewContractService(cs, ss, tx, pub, nil, false)
 
 		c := makeContract(clientID, freelancerID, domain.ContractStatusPendingSignature)
 		require.NoError(t, cs.Create(context.Background(), c))
@@ -677,7 +712,7 @@ func TestConcurrentMutationRejection(t *testing.T) {
 			ss := newFakeSignatureStore()
 			tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 			pub := &fakePublisher{}
-			svc := service.NewContractService(cs, ss, tx, pub, nil)
+			svc := service.NewContractService(cs, ss, tx, pub, nil, false)
 
 			c := makeContract(clientID, freelancerID, domain.ContractStatusDraft)
 			require.NoError(t, cs.Create(context.Background(), c))
@@ -729,7 +764,7 @@ func TestCancelContract(t *testing.T) {
 			ss := newFakeSignatureStore()
 			tx := &fakeTxManager{contracts: cs, sigs: ss, outbox: &noopOutboxStore{}}
 			pub := &fakePublisher{}
-			svc := service.NewContractService(cs, ss, tx, pub, nil)
+			svc := service.NewContractService(cs, ss, tx, pub, nil, false)
 
 			c := makeContract(clientID, freelancerID, tc.status)
 			require.NoError(t, cs.Create(context.Background(), c))

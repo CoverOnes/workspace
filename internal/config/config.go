@@ -394,42 +394,94 @@ var ssrfPrivateNets = func() []*net.IPNet {
 	return nets
 }()
 
+// classifyHostIP resolves the effective net.IP for a host string.
+//
+// net.ParseIP handles canonical dotted-decimal and IPv6 literals but returns nil for
+// alternative representations (decimal-encoded 2130706433, hex 0x7f000001, octal
+// 0177.0.0.1) that the OS resolver accepts.  When ParseIP returns nil we attempt
+// net.ResolveTCPAddr to catch those encoded forms.  The returned IP may be nil if the
+// host is a hostname that is not resolvable at config-load time — callers MUST handle
+// that case.
+func classifyHostIP(host string) net.IP {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip
+	}
+
+	// Attempt resolution to catch decimal/hex/octal-encoded loopback/link-local IPs
+	// (e.g. http://2130706433, http://0x7f000001).  ResolveTCPAddr needs a port.
+	addr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(host, "80"))
+	if err != nil || addr == nil {
+		return nil
+	}
+
+	return addr.IP
+}
+
+// isBlockedIP reports whether ip is blocked (loopback, link-local, or — when
+// blockPrivate is true — RFC1918/ULA).  Also returns a human-readable reason.
+// Used by both the boot-time config validator and the runtime dial guard so that
+// the same block rules are applied in both places without duplication.
+func isBlockedIP(ip net.IP, blockPrivate bool) (blocked bool, reason string) {
+	if ip.IsLoopback() {
+		return true, "loopback address"
+	}
+
+	if ip.IsLinkLocalUnicast() {
+		return true, "link-local address"
+	}
+
+	if blockPrivate {
+		for _, privateNet := range ssrfPrivateNets {
+			if privateNet.Contains(ip) {
+				return true, "private/RFC1918 address in production"
+			}
+		}
+	}
+
+	return false, ""
+}
+
 // validateFileServiceURL validates the parsed URL for SSRF risk.
 // Returns an error string if the URL is unsafe, or "" if safe.
 // Unconditionally rejects loopback, link-local, and known metadata endpoints.
 // In production/staging, also rejects RFC1918 and ULA IPv6 ranges.
+//
+// Bypass defenses:
+//   - Trailing-dot FQDN (e.g. "localhost.", "169.254.169.254.") — stripped before checks.
+//   - Decimal/hex-encoded IPs (e.g. 2130706433, 0x7f000001) — classifyHostIP resolves them.
 func validateFileServiceURL(rawURL string, isProd bool) string {
 	u, parseErr := url.Parse(rawURL)
 	if parseErr != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		return "FILE_BASE_URL must be a valid http or https URL"
 	}
 
-	host := u.Hostname()
+	// Strip trailing dot from FQDN notation (e.g. "localhost." → "localhost",
+	// "169.254.169.254." → "169.254.169.254") BEFORE any string or IP comparisons.
+	host := strings.TrimSuffix(u.Hostname(), ".")
 
-	// Unconditionally block loopback — the file service should never be localhost.
-	ip := net.ParseIP(host)
-	if ip != nil && ip.IsLoopback() {
+	// Unconditionally block "localhost" by name — net.ParseIP("localhost") returns nil
+	// so we must check the string explicitly before the IP path.
+	if strings.EqualFold(host, "localhost") {
 		return "FILE_BASE_URL must not point to a loopback address"
 	}
 
-	// Unconditionally block link-local and metadata endpoints.
-	if ip != nil && ip.IsLinkLocalUnicast() {
-		return "FILE_BASE_URL must not point to a link-local address"
-	}
-
+	// Block known metadata hostnames unconditionally (checked before IP resolution).
 	for _, blocked := range ssrfBlockedHosts {
 		if strings.EqualFold(host, blocked) {
 			return "FILE_BASE_URL must not point to a metadata/SSRF-risk host"
 		}
 	}
 
-	// In production and staging: also reject RFC1918 + ULA (no internal IP routing expected).
-	if isProd && ip != nil {
-		for _, privateNet := range ssrfPrivateNets {
-			if privateNet.Contains(ip) {
-				return "FILE_BASE_URL must not point to a private/RFC1918 address in production"
-			}
-		}
+	// Resolve the effective IP — handles canonical IPs AND encoded forms (decimal/hex).
+	ip := classifyHostIP(host)
+	if ip == nil {
+		// hostname not resolvable at boot (e.g. "file-svc.internal"): allow and rely on
+		// the runtime dial guard (fileclient DNS-rebinding check) for ongoing protection.
+		return ""
+	}
+
+	if blocked, reason := isBlockedIP(ip, isProd); blocked {
+		return "FILE_BASE_URL must not point to a " + reason
 	}
 
 	return ""

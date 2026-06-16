@@ -110,12 +110,12 @@ func startMilestoneAmountsTestDB(t *testing.T, ctx context.Context) *milestoneAm
 
 	milestoneTx := postgres.NewMilestoneTxManager(pool)
 
-	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, addendaStore, mpTx, pub)
+	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, addendaStore, mpTx, pub, false)
 	milestoneSvc := service.NewMilestoneService(mpContracts, msStore, mpParties, milestoneTx, pub)
 
 	contractStore := postgres.NewContractStore(pool)
 	sigStore := postgres.NewSignatureStore(pool)
-	contractSvc := service.NewContractService(contractStore, sigStore, postgres.NewTxManager(pool), pub, nil)
+	contractSvc := service.NewContractService(contractStore, sigStore, postgres.NewTxManager(pool), pub, nil, false)
 	signatureSvc := service.NewSignatureService(contractStore, sigStore, nil)
 	taskSvc := service.NewTaskService(contractStore, postgres.NewTaskStore(pool))
 	worklogSvc := service.NewWorklogService(contractStore, postgres.NewWorklogStore(pool))

@@ -31,15 +31,18 @@ const (
 // The owner acts as initiator / governance (owner-only governance per Phase 0 locked decisions).
 // This is documented here as the canonical decision record.
 type MultipartyContractService struct {
-	contracts store.MultipartyContractStore
-	parties   store.MultipartyPartyStore
-	sigs      store.MultipartySignatureStore
-	addenda   store.AddendumStore
-	tx        store.MultipartyTxManager
-	publisher events.Publisher
+	contracts    store.MultipartyContractStore
+	parties      store.MultipartyPartyStore
+	sigs         store.MultipartySignatureStore
+	addenda      store.AddendumStore
+	tx           store.MultipartyTxManager
+	publisher    events.Publisher
+	proofEnabled bool // true when the file service is configured; gates proof enqueue in activateInTx
 }
 
 // NewMultipartyContractService returns a MultipartyContractService.
+// proofEnabled should be cfg.FileServiceEnabled(): when false the activation path skips
+// the proof_generation_required outbox enqueue, preventing silent phantom entries.
 func NewMultipartyContractService(
 	contracts store.MultipartyContractStore,
 	parties store.MultipartyPartyStore,
@@ -47,14 +50,16 @@ func NewMultipartyContractService(
 	addenda store.AddendumStore,
 	tx store.MultipartyTxManager,
 	publisher events.Publisher,
+	proofEnabled bool,
 ) *MultipartyContractService {
 	return &MultipartyContractService{
-		contracts: contracts,
-		parties:   parties,
-		sigs:      sigs,
-		addenda:   addenda,
-		tx:        tx,
-		publisher: publisher,
+		contracts:    contracts,
+		parties:      parties,
+		sigs:         sigs,
+		addenda:      addenda,
+		tx:           tx,
+		publisher:    publisher,
+		proofEnabled: proofEnabled,
 	}
 }
 
@@ -625,10 +630,13 @@ func (s *MultipartyContractService) activateInTx(
 			return fmt.Errorf("enqueue contract_re_signed event: %w", enqErr)
 		}
 
-		// Enqueue proof generation atomically with re-sign activation.
-		// At-least-once delivery is safe: GenerateAndStore supersedes an older version in place.
-		if proofErr := enqueueProofGeneration(ctx, txOutbox, c.ID, domain.ContractKindMultiparty); proofErr != nil {
-			return proofErr
+		// Enqueue proof generation atomically with re-sign activation — only when the file
+		// service is configured (s.proofEnabled). Without a handler registered the entry
+		// would be silently consumed by NoopPublisher, never generating the proof.
+		if s.proofEnabled {
+			if proofErr := enqueueProofGeneration(ctx, txOutbox, c.ID, domain.ContractKindMultiparty); proofErr != nil {
+				return proofErr
+			}
 		}
 	} else {
 		evt := &domain.MultipartyContractActivatedEvent{
@@ -655,10 +663,13 @@ func (s *MultipartyContractService) activateInTx(
 			return fmt.Errorf("enqueue contract_activated event: %w", enqErr)
 		}
 
-		// Enqueue proof generation atomically with initial activation.
-		// At-least-once delivery is safe: GenerateAndStore is idempotent (same version = skip).
-		if proofErr := enqueueProofGeneration(ctx, txOutbox, c.ID, domain.ContractKindMultiparty); proofErr != nil {
-			return proofErr
+		// Enqueue proof generation atomically with initial activation — only when the file
+		// service is configured (s.proofEnabled). Without a handler registered the entry
+		// would be silently consumed by NoopPublisher, never generating the proof.
+		if s.proofEnabled {
+			if proofErr := enqueueProofGeneration(ctx, txOutbox, c.ID, domain.ContractKindMultiparty); proofErr != nil {
+				return proofErr
+			}
 		}
 	}
 

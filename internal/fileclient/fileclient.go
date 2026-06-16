@@ -4,6 +4,8 @@
 //   - Token is NEVER logged or included in URLs.
 //   - Token is transmitted only via X-Service-Token request header.
 //   - HTTP client timeout is enforced so callers cannot block indefinitely.
+//   - DNS-rebinding guard: every dial resolves the hostname and validates each
+//     resolved IP against loopback/link-local/RFC1918 (in prod) before connecting.
 package fileclient
 
 import (
@@ -13,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -50,21 +53,150 @@ type Config struct {
 	// Token is the pre-shared S2S token sent in X-Service-Token. Required.
 	// NEVER included in URL query strings or log output.
 	Token string
+	// BlockPrivateIPs controls whether RFC1918 and ULA IPv6 addresses are blocked
+	// in addition to loopback and link-local.  Set true in production/staging to
+	// prevent SSRF via DNS rebinding to internal services.  May be false in
+	// development where the file service runs on a private network address.
+	BlockPrivateIPs bool
+	// HTTPClient overrides the HTTP client used for all requests. Intended for
+	// testing only (e.g. pointing at an httptest.Server). When non-nil, the SSRF
+	// guard transport is NOT installed — callers are responsible for any transport
+	// security they require.
+	HTTPClient *http.Client
 }
+
+// ssrfDialer is the net.Dialer used by the DNS-rebinding guard transport.
+// It is package-level so the timeout and keep-alive match Go's net/http defaults.
+var ssrfDialer = &net.Dialer{
+	Timeout:   30 * time.Second,
+	KeepAlive: 30 * time.Second,
+}
+
+// newSSRFGuardTransport returns an *http.Transport whose DialContext resolves
+// every host, validates each resolved IP against block rules (loopback, link-local,
+// and — when blockPrivate is true — RFC1918/ULA), then dials the validated IP
+// directly to prevent TOCTOU re-resolution (DNS rebinding).
+//
+// The IP-block predicate (isBlockedIP) is shared with the boot-time config
+// validator so that the same rules apply in both places.
+func newSSRFGuardTransport(blockPrivate bool) *http.Transport {
+	dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("ssrf guard: split host/port %q: %w", addr, err)
+		}
+
+		// Resolve the hostname to its IP address(es).
+		addrs, err := net.DefaultResolver.LookupHost(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("ssrf guard: resolve %q: %w", host, err)
+		}
+
+		if len(addrs) == 0 {
+			return nil, fmt.Errorf("ssrf guard: no addresses for %q", host)
+		}
+
+		// Use the first resolved address; validate it before dialing.
+		// Pinning the IP avoids TOCTOU — we dial exactly what we validated.
+		resolvedIP := net.ParseIP(addrs[0])
+		if resolvedIP == nil {
+			return nil, fmt.Errorf("ssrf guard: could not parse resolved address %q", addrs[0])
+		}
+
+		if blocked, reason := isBlockedIP(resolvedIP, blockPrivate); blocked {
+			return nil, fmt.Errorf("ssrf guard: host %q resolves to blocked %s (%s)", host, resolvedIP, reason)
+		}
+
+		// Dial the validated IP directly (pinned — bypasses OS resolver a second time).
+		pinnedAddr := net.JoinHostPort(resolvedIP.String(), port)
+
+		return ssrfDialer.DialContext(ctx, network, pinnedAddr)
+	}
+
+	return &http.Transport{
+		DialContext:           dialFn,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+}
+
+// isBlockedIP reports whether ip is a blocked address (loopback, link-local, or
+// RFC1918/ULA when blockPrivate is true). Returns a human-readable reason on block.
+// This predicate is shared with the boot-time config.validateFileServiceURL path
+// (via config.isBlockedIP in the config package) so that both gates use the same rules.
+// It is duplicated here rather than imported from config to avoid a circular dependency
+// (config → fileclient → config).
+func isBlockedIP(ip net.IP, blockPrivate bool) (blocked bool, reason string) {
+	if ip.IsLoopback() {
+		return true, "loopback address"
+	}
+
+	if ip.IsLinkLocalUnicast() {
+		return true, "link-local address"
+	}
+
+	if blockPrivate {
+		for _, privateNet := range privateNets {
+			if privateNet.Contains(ip) {
+				return true, "private/RFC1918 address"
+			}
+		}
+	}
+
+	return false, ""
+}
+
+// privateNets mirrors the config package's ssrfPrivateNets without importing config
+// (would create a cycle). Values are the same RFC1918 + ULA ranges.
+var privateNets = func() []*net.IPNet {
+	cidrs := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"fc00::/7", // IPv6 ULA
+	}
+
+	nets := make([]*net.IPNet, 0, len(cidrs))
+
+	for _, cidr := range cidrs {
+		_, ipNet, parseErr := net.ParseCIDR(cidr)
+		if parseErr == nil {
+			nets = append(nets, ipNet)
+		}
+	}
+
+	return nets
+}()
 
 // New returns a Client configured from cfg.
 // Callers should validate cfg with config.Config.validate() before calling New.
+// The returned Client's HTTP transport includes a DNS-rebinding guard that validates
+// every resolved IP against loopback/link-local (always) and RFC1918/ULA (when
+// cfg.BlockPrivateIPs is true) before dialing.
+//
+// Pass cfg.HTTPClient to override the HTTP client (testing only — SSRF guard bypassed).
 func New(cfg Config) *Client {
 	sid := cfg.ServiceID
 	if sid == "" {
 		sid = "workspace"
 	}
 
+	httpClient := cfg.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{
+			Timeout:   defaultHTTPTimeout,
+			Transport: newSSRFGuardTransport(cfg.BlockPrivateIPs),
+		}
+	}
+
 	return &Client{
 		base:      cfg.BaseURL,
 		serviceID: sid,
 		token:     cfg.Token,
-		http:      &http.Client{Timeout: defaultHTTPTimeout},
+		http:      httpClient,
 	}
 }
 
@@ -361,6 +493,13 @@ func (c *Client) PresignDownload(ctx context.Context, fileID uuid.UUID) (presign
 
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return "", 0, fmt.Errorf("fileclient presign_download: parse response: %w", err)
+	}
+
+	// Validate that the returned URL uses https — same guard as Presign.
+	// A non-https URL would expose the presigned path over plain HTTP.
+	parsedURL, parseErr := url.Parse(envelope.Data.URL)
+	if parseErr != nil || parsedURL.Scheme != "https" {
+		return "", 0, fmt.Errorf("fileclient presign_download: returned URL must use https scheme, got %q", envelope.Data.URL)
 	}
 
 	return envelope.Data.URL, envelope.Data.TTLSeconds, nil

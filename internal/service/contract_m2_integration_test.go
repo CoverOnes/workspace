@@ -56,7 +56,7 @@ func buildM2Router(contractStore *postgres.ContractStore) *gin.Engine {
 	txMgr := postgres.NewTxManager(contractStore.Pool())
 	pub := events.NewNoopPublisher()
 
-	svc := service.NewContractService(contractStore, sigStore, txMgr, pub, nil)
+	svc := service.NewContractService(contractStore, sigStore, txMgr, pub, nil, false)
 	sigSvc := service.NewSignatureService(contractStore, sigStore, nil)
 	contractH := handler.NewContractHandler(svc)
 	signatureH := handler.NewSignatureHandler(svc, sigSvc)

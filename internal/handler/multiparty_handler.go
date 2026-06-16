@@ -255,7 +255,7 @@ func (h *MultipartyHandler) UpdatePartyShare(c *gin.Context) {
 }
 
 // GetProof handles GET /v1/multiparty-contracts/:id/proof.
-// Returns a single-use presigned download URL for the signed-contract proof PDF.
+// Returns a short-lived / TTL-limited presigned download URL for the signed-contract proof PDF.
 // Only ACTIVE parties of the contract may download; non-parties receive 403.
 func (h *MultipartyHandler) GetProof(c *gin.Context) {
 	identity, ok := middleware.IdentityFromCtx(c)

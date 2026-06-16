@@ -211,7 +211,7 @@ func (h *ContractHandler) Complete(c *gin.Context) {
 }
 
 // GetProof handles GET /v1/contracts/:id/proof.
-// Returns a single-use presigned download URL for the signed-contract proof PDF.
+// Returns a short-lived / TTL-limited presigned download URL for the signed-contract proof PDF.
 // Only parties (client or freelancer) may download; non-parties receive 403.
 func (h *ContractHandler) GetProof(c *gin.Context) {
 	identity, ok := middleware.IdentityFromCtx(c)

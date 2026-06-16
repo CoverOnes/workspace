@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 
 	"github.com/CoverOnes/workspace/internal/domain"
 	"github.com/google/uuid"
@@ -30,30 +31,47 @@ type ProofGenerationPayload struct {
 // At-least-once delivery is safe because GenerateAndStore is version-aware and idempotent:
 // same version → skip (return existing); older version → supersede (overwrite) in place.
 //
+// Error handling policy:
+//   - Programmer-error conditions (malformed JSON, nil ContractID, unknown kind): these
+//     cannot be corrected by retrying, so the handler logs a warning and returns nil.
+//     Returning nil causes the poller to call MarkPublished and stop retrying.
+//   - Transient errors from GenerateAndStore (network, DB, file service unavailable):
+//     these are returned as non-nil so the poller records a failure and applies backoff.
+//
 // Parameters:
 //   - ctx: caller context with localHandlerTimeout applied by the poller.
 //   - svc: the ProofService instance captured at server startup.
 //   - entry: the outbox entry carrying a JSON-encoded ProofGenerationPayload.
-//
-// Returns a non-nil error to cause the entry to be retried with exponential backoff.
 func HandleProofOutboxEntry(ctx context.Context, svc *ProofService, entry *domain.OutboxEntry) error {
 	var payload ProofGenerationPayload
 
 	if err := json.Unmarshal(entry.Payload, &payload); err != nil {
-		// Malformed payload: returning an error would retry forever. Log and return nil
-		// so the entry is marked published and not retried (un-parseable = programmer error).
-		return fmt.Errorf("proof outbox handler: unmarshal payload: %w", err)
+		// Malformed payload: not retryable — programmer error in the enqueue path.
+		// Log, mark published (return nil), and move on.
+		slog.Warn("proof outbox handler: malformed payload; dropping entry",
+			"entry_id", entry.ID, "err", err)
+
+		return nil
 	}
 
 	if payload.ContractID == uuid.Nil {
-		return fmt.Errorf("proof outbox handler: contractId is nil in entry %s", entry.ID)
+		// Nil contractId is a programmer error — cannot be fixed by retrying.
+		slog.Warn("proof outbox handler: contractId is nil; dropping entry", "entry_id", entry.ID)
+
+		return nil
 	}
 
 	kind := domain.ContractKind(payload.Kind)
 	if kind != domain.ContractKindBilateral && kind != domain.ContractKindMultiparty {
-		return fmt.Errorf("proof outbox handler: unknown contract kind %q in entry %s", payload.Kind, entry.ID)
+		// Unknown kind is a programmer error — cannot be fixed by retrying.
+		slog.Warn("proof outbox handler: unknown contract kind; dropping entry",
+			"entry_id", entry.ID, "kind", payload.Kind)
+
+		return nil
 	}
 
+	// GenerateAndStore errors (network, DB, file service) are transient — return the error
+	// so the poller records a failure and retries with exponential backoff.
 	if _, err := svc.GenerateAndStore(ctx, payload.ContractID, kind); err != nil {
 		return fmt.Errorf("proof outbox handler: generate and store for contract %s: %w", payload.ContractID, err)
 	}

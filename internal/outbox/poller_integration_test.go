@@ -558,6 +558,173 @@ func TestOutbox_Retention(t *testing.T) {
 	assert.True(t, rows2.Next(), "unpublished entry must not be deleted by retention")
 }
 
+// TestOutbox_LocalHandler_Success verifies that an outbox entry on a channel with a
+// registered local handler is dispatched to the handler (not Redis) and marked
+// published after the handler returns nil.
+func TestOutbox_LocalHandler_Success(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	ctx := context.Background()
+	ob := pgstore.NewOutboxStore(sharedOutboxPool)
+
+	const channel = "workspace.local_handler_success"
+	payload := []byte(`{"event_id":"local-handler-ok"}`)
+
+	enqueueEntry(t, ctx, ob, channel, payload)
+
+	// Use a NoopPublisher — the entry must NOT be published to Redis.
+	pub := &outbox.NoopPublisher{}
+	poller := outbox.New(ob, pub)
+
+	// Register a local handler that records what it received.
+	handlerCalled := make(chan *domain.OutboxEntry, 1)
+
+	poller.Handle(channel, func(_ context.Context, e *domain.OutboxEntry) error {
+		handlerCalled <- e
+		return nil
+	})
+
+	pollCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		poller.Start(pollCtx)
+	}()
+
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+
+	var receivedEntry *domain.OutboxEntry
+
+	select {
+	case receivedEntry = <-handlerCalled:
+	case <-timer.C:
+		t.Fatal("timed out waiting for local handler to be called")
+	}
+
+	assert.Equal(t, channel, receivedEntry.Channel)
+	assert.Equal(t, payload, receivedEntry.Payload)
+
+	// After success the entry must be marked published (not in pending).
+	time.Sleep(200 * time.Millisecond)
+
+	pending, err := ob.FetchPending(ctx, 100)
+	require.NoError(t, err)
+
+	for _, e := range pending {
+		assert.NotEqual(t, channel, e.Channel,
+			"successfully handled entry must not remain in pending")
+	}
+}
+
+// TestOutbox_LocalHandler_Failure_Backoff verifies that when a local handler returns
+// an error, the entry is NOT marked published but is retried after exponential backoff.
+// After the backoff window elapses the poller dispatches the handler again and on the
+// second attempt the handler succeeds.
+func TestOutbox_LocalHandler_Failure_Backoff(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	ctx := context.Background()
+	ob := pgstore.NewOutboxStore(sharedOutboxPool)
+
+	const channel = "workspace.local_handler_failure_backoff"
+	payload := []byte(`{"event_id":"local-handler-fail"}`)
+
+	enqueueEntry(t, ctx, ob, channel, payload)
+
+	// Use NoopPublisher — the entry must NOT be relayed to Redis.
+	pub := &outbox.NoopPublisher{}
+	poller := outbox.New(ob, pub)
+
+	var callCount int
+	var callCountMu sync.Mutex
+	successCh := make(chan struct{}, 1)
+
+	// Handler fails once, then succeeds.
+	poller.Handle(channel, func(_ context.Context, _ *domain.OutboxEntry) error {
+		callCountMu.Lock()
+		callCount++
+		n := callCount
+		callCountMu.Unlock()
+
+		if n == 1 {
+			return fmt.Errorf("simulated local handler failure")
+		}
+
+		successCh <- struct{}{}
+		return nil
+	})
+
+	pollCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		poller.Start(pollCtx)
+	}()
+
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	// Wait for the first failure to be recorded (RecordFailure sets next_attempt_at into
+	// the future). Then fast-forward by updating next_attempt_at to the past.
+	time.Sleep(500 * time.Millisecond)
+
+	// Force next_attempt_at to the past so the retry fires on the next tick.
+	_, err := sharedOutboxPool.Exec(
+		ctx,
+		`UPDATE event_outbox
+		 SET next_attempt_at = now() - interval '1 second'
+		 WHERE channel = $1 AND published_at IS NULL`,
+		channel,
+	)
+	require.NoError(t, err)
+
+	// Wait for the successful retry.
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+
+	select {
+	case <-successCh:
+		// Handler was retried and succeeded.
+	case <-timer.C:
+		callCountMu.Lock()
+		n := callCount
+		callCountMu.Unlock()
+		t.Fatalf("timed out waiting for local handler retry; call count = %d", n)
+	}
+
+	callCountMu.Lock()
+	finalCount := callCount
+	callCountMu.Unlock()
+
+	assert.GreaterOrEqual(t, finalCount, 2,
+		"handler must have been called at least twice (1 failure + 1 success)")
+
+	// After success the entry must be marked published.
+	time.Sleep(200 * time.Millisecond)
+
+	pending, err := ob.FetchPending(ctx, 100)
+	require.NoError(t, err)
+
+	for _, e := range pending {
+		assert.NotEqual(t, channel, e.Channel,
+			"successfully retried entry must not remain in pending")
+	}
+}
+
 // countingPublisher is a test double that fails on the first failUntil publishes.
 type countingPublisher struct {
 	mu        sync.Mutex
