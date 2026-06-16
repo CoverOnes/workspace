@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"regexp"
 	"strings"
 
@@ -369,6 +370,15 @@ func (c *Config) validateFileS2SToken() []string {
 	if c.FileBaseURL == "" {
 		// No file service configured — token not required.
 		return nil
+	}
+
+	// Validate FileBaseURL is a well-formed absolute URL with a scheme (e.g. https://...).
+	// A misconfigured value like "file-service" (no scheme) would fail silently at runtime
+	// on the first S2S call rather than at boot, giving a poor operator experience.
+	if _, parseErr := url.ParseRequestURI(c.FileBaseURL); parseErr != nil {
+		return []string{
+			fmt.Sprintf("FILE_BASE_URL must be a valid absolute URL (e.g. https://file-service): %v", parseErr),
+		}
 	}
 
 	switch {

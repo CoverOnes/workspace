@@ -14,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -197,6 +198,12 @@ func (c *Client) Presign(ctx context.Context, fileID, signatureID uuid.UUID) (*P
 
 	if decodeErr := json.NewDecoder(limited).Decode(&result); decodeErr != nil {
 		return nil, fmt.Errorf("fileclient presign: decode response: %w", decodeErr)
+	}
+
+	// Validate the returned URL uses HTTPS. A non-HTTPS URL indicates a misconfigured
+	// or compromised file service and must not be returned to callers.
+	if !strings.HasPrefix(result.URL, "https://") {
+		return nil, fmt.Errorf("fileclient presign: response URL is not HTTPS (got %q); rejecting", result.URL)
 	}
 
 	return &result, nil

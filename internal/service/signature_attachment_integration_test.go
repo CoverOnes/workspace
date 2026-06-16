@@ -115,9 +115,7 @@ func TestSignatureAttachment_Integration_RegisterAndPresign(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		// Give the background registration a moment to complete.
-		time.Sleep(100 * time.Millisecond)
-
+		// registerAttachmentBestEffort is called synchronously; no sleep needed.
 		assert.Equal(t, 1, stub.registerCalled, "file service Register must be called once")
 
 		// Verify file_id is persisted on the signature row.

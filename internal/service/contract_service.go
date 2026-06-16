@@ -464,7 +464,10 @@ func (s *ContractService) SignContract(ctx context.Context, in SignContractInput
 		return nil, txErr
 	}
 
-	s.registerAttachmentBestEffort(ctx, in.CallerID, in.FileID, createdSigID)
+	//nolint:contextcheck // intentional: registerAttachmentBestEffort uses context.Background()
+	// internally for both Register and SetFileID calls so that a canceled request context
+	// does not leave the file service with a registered attachment but nil file_id on the row.
+	s.registerAttachmentBestEffort(in.CallerID, in.FileID, createdSigID)
 
 	return result, nil
 }
@@ -473,12 +476,13 @@ func (s *ContractService) SignContract(ctx context.Context, in SignContractInput
 // signature after the signature transaction has committed. It is best-effort: failures
 // are logged but do not affect the already-committed signature row.
 //
-// A fresh context.Background() is used intentionally so a dropped caller connection
-// does not cancel the S2S call.
-//
-//nolint:contextcheck // intentional: independent background context survives request cancellation.
+// Both Register and SetFileID use context.Background() intentionally: the caller's
+// request context may be canceled before or during the up-to-10s Register call (TCP
+// drop, client timeout). Using bgCtx for both calls ensures that a successful Register
+// is always followed by SetFileID — preventing the inconsistency where the file service
+// has the attachment but the signature row still has nil file_id (which causes permanent
+// 404 from GetAttachmentDownloadURL).
 func (s *ContractService) registerAttachmentBestEffort(
-	requestCtx context.Context,
 	ownerID uuid.UUID,
 	fileID *uuid.UUID,
 	sigID uuid.UUID,
@@ -496,7 +500,7 @@ func (s *ContractService) registerAttachmentBestEffort(
 		return
 	}
 
-	if setErr := s.sigs.SetFileID(requestCtx, sigID, *fileID); setErr != nil {
+	if setErr := s.sigs.SetFileID(bgCtx, sigID, *fileID); setErr != nil {
 		slog.Warn("set signature file_id failed after successful register",
 			"signature_id", sigID, "file_id", *fileID, "err", setErr)
 	}
