@@ -157,7 +157,7 @@ func activateContractForMilestones(
 	poster := uuid.New()
 	vendorA := uuid.New()
 	vendorB := uuid.New()
-	currency := "TWD"
+	currency := testCurrencyTWD
 
 	contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
 		TenderID:     tenderID,
@@ -215,7 +215,7 @@ func TestMilestoneAmounts_GetAmountsSum(t *testing.T) {
 		CallerID:   act.posterID,
 		Name:       "Milestone 1",
 		Amount:     decimal.NewFromInt(1000),
-		Currency:   "TWD",
+		Currency:   testCurrencyTWD,
 		Sequence:   1,
 	})
 	require.NoError(t, err)
@@ -225,7 +225,7 @@ func TestMilestoneAmounts_GetAmountsSum(t *testing.T) {
 		CallerID:   act.posterID,
 		Name:       "Milestone 2",
 		Amount:     decimal.RequireFromString("500.50"),
-		Currency:   "TWD",
+		Currency:   testCurrencyTWD,
 		Sequence:   2,
 	})
 	require.NoError(t, err)

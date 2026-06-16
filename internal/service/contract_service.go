@@ -19,6 +19,7 @@ type ContractService struct {
 	sigs      store.SignatureStore
 	tx        store.TxManager
 	publisher events.Publisher
+	proofGen  ProofGenerator // optional; nil = skip proof generation
 }
 
 // NewContractService returns a ContractService.
@@ -34,6 +35,13 @@ func NewContractService(
 		tx:        tx,
 		publisher: publisher,
 	}
+}
+
+// WithProofGenerator sets the optional ProofGenerator on the ContractService.
+// When non-nil, a proof PDF is generated best-effort after a contract activates.
+// Call this after NewContractService to wire the proof pipeline without circular imports.
+func (s *ContractService) WithProofGenerator(pg ProofGenerator) {
+	s.proofGen = pg
 }
 
 // CreateContractInput carries validated input for creating a contract.
@@ -429,9 +437,32 @@ func (s *ContractService) SignContract(ctx context.Context, in SignContractInput
 		if pubErr := s.publisher.PublishContractActivated(ctx, evt); pubErr != nil {
 			slog.Warn("publish contract_activated event failed", "contract_id", result.ID, "err", pubErr)
 		}
+
+		s.triggerBilateralProof(result.ID) //nolint:contextcheck // intentional: best-effort goroutine must outlive request context
 	}
 
 	return result, nil
+}
+
+// triggerBilateralProof launches a best-effort goroutine to generate a proof PDF for
+// the given bilateral contract. The goroutine uses context.Background() so it outlives
+// the HTTP request context.
+func (s *ContractService) triggerBilateralProof(contractID uuid.UUID) {
+	// Capture proofGen synchronously (in the caller's goroutine) so the background
+	// goroutine never reads the mutable s.proofGen field concurrently with a
+	// WithProofGenerator setter (race-free).
+	proofGen := s.proofGen
+	if proofGen == nil {
+		return
+	}
+
+	go func() {
+		bgCtx := context.Background()
+		if _, genErr := proofGen.GenerateAndStore(bgCtx, contractID, domain.ContractKindBilateral); genErr != nil {
+			slog.Warn("bilateral proof generation failed (best-effort)",
+				"contract_id", contractID, "err", genErr)
+		}
+	}()
 }
 
 // CompleteContract transitions ACTIVE -> COMPLETED (client only).

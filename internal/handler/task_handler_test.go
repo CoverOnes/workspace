@@ -122,7 +122,7 @@ func TestTaskHandler_CreateTask(t *testing.T) {
 			tier:       "2",
 			title:      "Task",
 			wantStatus: http.StatusNotFound,
-			wantCode:   "NOT_FOUND",
+			wantCode:   testErrCodeNotFound,
 		},
 		{
 			name:       "empty title returns 400",
@@ -130,7 +130,7 @@ func TestTaskHandler_CreateTask(t *testing.T) {
 			tier:       "2",
 			title:      "",
 			wantStatus: http.StatusBadRequest,
-			wantCode:   "VALIDATION_ERROR",
+			wantCode:   testErrCodeValidation,
 		},
 	}
 
@@ -138,7 +138,7 @@ func TestTaskHandler_CreateTask(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			body, _ := json.Marshal(map[string]any{"title": tc.title})
+			body, _ := json.Marshal(map[string]any{testKeyTitle: tc.title})
 			req := httptest.NewRequestWithContext(context.Background(), http.MethodPost,
 				"/v1/contracts/"+contract.ID.String()+"/tasks", bytes.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
@@ -173,7 +173,7 @@ func TestTaskHandler_DeleteTask_Returns204(t *testing.T) {
 	r := buildTaskRouter(cs, ts)
 
 	// Create task via API.
-	createBody, _ := json.Marshal(map[string]any{"title": "Delete me"})
+	createBody, _ := json.Marshal(map[string]any{testKeyTitle: "Delete me"})
 	createReq := httptest.NewRequestWithContext(context.Background(), http.MethodPost,
 		"/v1/contracts/"+contract.ID.String()+"/tasks", bytes.NewReader(createBody))
 	createReq.Header.Set("Content-Type", "application/json")

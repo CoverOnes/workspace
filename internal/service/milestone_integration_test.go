@@ -194,7 +194,7 @@ func TestMilestone_Add_OwnerOnly(t *testing.T) {
 			CallerID:   posterID,
 			Name:       "Milestone 1",
 			Amount:     decimal.NewFromInt(5000),
-			Currency:   "TWD",
+			Currency:   testCurrencyTWD,
 			Sequence:   1,
 		})
 		require.NoError(t, err)
@@ -214,7 +214,7 @@ func TestMilestone_Add_OwnerOnly(t *testing.T) {
 			CallerID:   nonOwner,
 			Name:       "Should Fail",
 			Amount:     decimal.NewFromInt(1000),
-			Currency:   "TWD",
+			Currency:   testCurrencyTWD,
 			Sequence:   1,
 		})
 		require.ErrorIs(t, err, domain.ErrNotContractOwner,
@@ -238,7 +238,7 @@ func TestMilestone_Add_OwnerOnly(t *testing.T) {
 			CallerID:   uuid.New(), // any caller
 			Name:       "No poster",
 			Amount:     decimal.NewFromInt(100),
-			Currency:   "TWD",
+			Currency:   testCurrencyTWD,
 		})
 		require.ErrorIs(t, addErr, domain.ErrNotContractOwner,
 			"contract with nil PosterUserID must reject all milestone management")
@@ -264,7 +264,7 @@ func TestMilestone_List_OwnerOnly(t *testing.T) {
 				CallerID:   posterID,
 				Name:       fmt.Sprintf("M%d", seq),
 				Amount:     decimal.NewFromInt(int64(seq * 1000)),
-				Currency:   "TWD",
+				Currency:   testCurrencyTWD,
 				Sequence:   seq,
 			})
 			require.NoError(t, err)
@@ -317,7 +317,7 @@ func TestMilestone_Complete(t *testing.T) {
 			CallerID:   posterID,
 			Name:       "Deliverable 1",
 			Amount:     decimal.NewFromFloat(7500.50),
-			Currency:   "TWD",
+			Currency:   testCurrencyTWD,
 			Sequence:   1,
 		})
 		require.NoError(t, err)
@@ -353,7 +353,7 @@ func TestMilestone_Complete(t *testing.T) {
 		assert.Equal(t, contract.TenderID, evt.Data.TenderID)
 		assert.Equal(t, m.ID, evt.Data.MilestoneID)
 		assert.True(t, decimal.NewFromFloat(7500.50).Equal(evt.Data.Amount))
-		assert.Equal(t, "TWD", evt.Data.Currency)
+		assert.Equal(t, testCurrencyTWD, evt.Data.Currency)
 	})
 
 	t.Run("non-owner cannot complete milestone (IDOR)", func(t *testing.T) {
@@ -365,7 +365,7 @@ func TestMilestone_Complete(t *testing.T) {
 			CallerID:   posterID,
 			Name:       "M1",
 			Amount:     decimal.NewFromInt(1000),
-			Currency:   "TWD",
+			Currency:   testCurrencyTWD,
 		})
 		require.NoError(t, err)
 
@@ -387,7 +387,7 @@ func TestMilestone_Complete(t *testing.T) {
 			CallerID:   posterID,
 			Name:       "M1",
 			Amount:     decimal.NewFromInt(1000),
-			Currency:   "TWD",
+			Currency:   testCurrencyTWD,
 		})
 		require.NoError(t, err)
 
@@ -443,7 +443,7 @@ func TestMilestone_Complete(t *testing.T) {
 			CallerID:   posterID,
 			Name:       "M-A",
 			Amount:     decimal.NewFromInt(500),
-			Currency:   "TWD",
+			Currency:   testCurrencyTWD,
 		})
 		require.NoError(t, err)
 
@@ -646,7 +646,7 @@ func TestMilestone_SumInvariant_NotEnforced(t *testing.T) {
 			CallerID:   posterID,
 			Name:       fmt.Sprintf("M%d", i+1),
 			Amount:     decimal.NewFromInt(amt),
-			Currency:   "TWD",
+			Currency:   testCurrencyTWD,
 			Sequence:   i + 1,
 		})
 		require.NoError(t, err, "adding milestone with amount %d must succeed (no sum constraint)", amt)

@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/CoverOnes/workspace/internal/client"
 	"github.com/CoverOnes/workspace/internal/config"
 	"github.com/CoverOnes/workspace/internal/events"
 	"github.com/CoverOnes/workspace/internal/handler"
@@ -51,9 +52,9 @@ func runHealthCheck() error {
 
 	url := fmt.Sprintf("http://127.0.0.1:%s/healthz", port)
 
-	client := &http.Client{Timeout: 2 * time.Second}
+	httpClient := &http.Client{Timeout: 2 * time.Second}
 
-	resp, err := client.Get(url) //nolint:noctx // healthcheck is a one-shot process; no request context needed
+	resp, err := httpClient.Get(url) //nolint:noctx // healthcheck is a one-shot process; no request context needed
 	if err != nil {
 		return fmt.Errorf("GET %s: %w", url, err)
 	}
@@ -169,6 +170,42 @@ func run() error {
 	milestoneSvc := service.NewMilestoneService(multipartyContractStore, milestoneStore, multipartyPartyStore, milestoneTxManager, publisher)
 	auditLogSvc := service.NewAuditLogService(auditLogStore)
 
+	// Contract proof service (optional — disabled when file service is not configured).
+	// Both services are wired after construction to avoid circular dependencies.
+	var proofSvc *service.ProofService
+	if cfg.FileServiceEnabled() {
+		proofStore := postgres.NewContractProofStore(pool)
+		fileClient := client.NewHTTPFileClient(
+			cfg.FileServiceBaseURL,
+			cfg.FileServiceToken,
+			&http.Client{Timeout: 15 * time.Second},
+		)
+
+		var proofErr error
+
+		proofSvc, proofErr = service.NewProofService(&service.ProofServiceConfig{
+			ProofStore:               proofStore,
+			AuditStore:               auditLogStore,
+			ContractStore:            contractStore,
+			SignatureStore:           signatureStore,
+			MultipartyContractStore:  multipartyContractStore,
+			MultipartyPartyStore:     multipartyPartyStore,
+			MultipartySignatureStore: multipartySignatureStore,
+			FileClient:               fileClient,
+		})
+		if proofErr != nil {
+			return fmt.Errorf("construct proof service: %w", proofErr)
+		}
+
+		// Wire proof generation into the contract services (best-effort post-activation hook).
+		contractSvc.WithProofGenerator(proofSvc)
+		multipartyContractSvc.WithProofGenerator(proofSvc)
+
+		slog.Info("contract proof service enabled")
+	} else {
+		slog.Info("contract proof service disabled (WORKSPACE_FILE_SERVICE_BASE_URL not set)")
+	}
+
 	// Router.
 	r := handler.NewRouter(&handler.RouterConfig{
 		ContractSvc:           contractSvc,
@@ -178,6 +215,7 @@ func run() error {
 		MultipartyContractSvc: multipartyContractSvc,
 		MilestoneSvc:          milestoneSvc,
 		AuditLogSvc:           auditLogSvc,
+		ProofSvc:              proofSvc,
 		Pool:                  pool,
 		Redis:                 redisClient,
 		ContractServiceToken:  cfg.ContractServiceToken,

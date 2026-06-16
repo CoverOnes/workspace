@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"regexp"
 	"strings"
 
@@ -91,6 +92,19 @@ type Config struct {
 	// (safe fallback; use when gateway forwards no X-Forwarded-For).
 	// Env: WORKSPACE_GATEWAY_CIDR
 	GatewayCIDR string `mapstructure:"gateway_cidr"`
+
+	// FileServiceBaseURL is the base URL of the internal file service used for
+	// storing contract proof PDFs (e.g. "https://file-svc.internal").
+	// Required in non-development environments when proof generation is enabled.
+	// Dev may omit (proof generation is then disabled).
+	// Env: WORKSPACE_FILE_SERVICE_BASE_URL
+	FileServiceBaseURL string `mapstructure:"file_service_base_url"`
+
+	// FileServiceToken is the S2S shared secret sent as X-Service-Token when
+	// calling the file service internal API. Must be at least 32 characters in
+	// non-development environments. Treated as a credential — never logged.
+	// Env: WORKSPACE_FILE_SERVICE_TOKEN
+	FileServiceToken string `mapstructure:"file_service_token"`
 }
 
 // Load reads configuration from environment variables (prefix WORKSPACE_).
@@ -104,6 +118,7 @@ func Load() (*Config, error) {
 	v.AutomaticEnv()
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
+	//nolint:gosec // G101 false-positive: these are viper key→env-var name mappings, not credential values
 	bindings := map[string]string{
 		"port":                    "WORKSPACE_PORT",
 		"postgres_dsn":            "WORKSPACE_POSTGRES_DSN",
@@ -119,6 +134,8 @@ func Load() (*Config, error) {
 		"user_rate_limit_per_min": "WORKSPACE_USER_RATE_LIMIT_PER_MIN",
 		"user_rate_limit_burst":   "WORKSPACE_USER_RATE_LIMIT_BURST",
 		"gateway_cidr":            "WORKSPACE_GATEWAY_CIDR",
+		"file_service_base_url":   "WORKSPACE_FILE_SERVICE_BASE_URL",
+		"file_service_token":      "WORKSPACE_FILE_SERVICE_TOKEN",
 	}
 
 	for key, envKey := range bindings {
@@ -206,6 +223,8 @@ func (c *Config) validate() error {
 	errs = append(errs, c.validateGatewayHMAC()...)
 
 	errs = append(errs, c.validateGatewayCIDR()...)
+
+	errs = append(errs, c.validateFileService()...)
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
@@ -335,7 +354,129 @@ func (c *Config) validateGatewayCIDR() []string {
 	return nil
 }
 
+// minFileTokenLen is the minimum length for the file service S2S token.
+// Mirrors validateServiceToken (§24 token entropy floor).
+const minFileTokenLen = 32
+
+// ssrfBlockedHosts lists hostname patterns that must be rejected unconditionally to
+// prevent SSRF attacks via the file service base URL. Checked before RFC1918 blocks.
+var ssrfBlockedHosts = []string{
+	"169.254.169.254",          // AWS/GCP/Azure instance metadata endpoint
+	"metadata.google.internal", // GCP metadata endpoint alternate hostname
+}
+
+// ssrfPrivateNets are RFC1918 + ULA IPv6 ranges rejected in production/staging.
+// In dev they are allowed to support local MinIO / file-service containers.
+var ssrfPrivateNets = func() []*net.IPNet {
+	cidrs := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"fc00::/7", // IPv6 ULA
+	}
+
+	nets := make([]*net.IPNet, 0, len(cidrs))
+
+	for _, cidr := range cidrs {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err == nil {
+			nets = append(nets, ipNet)
+		}
+	}
+
+	return nets
+}()
+
+// validateFileServiceURL validates the parsed URL for SSRF risk.
+// Returns an error string if the URL is unsafe, or "" if safe.
+func validateFileServiceURL(rawURL string, isProd bool) string {
+	u, parseErr := url.Parse(rawURL)
+	if parseErr != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return "WORKSPACE_FILE_SERVICE_BASE_URL must be a valid http or https URL"
+	}
+
+	host := u.Hostname()
+
+	// Unconditionally block loopback — the file service should never be localhost.
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsLoopback() {
+		return "WORKSPACE_FILE_SERVICE_BASE_URL must not point to a loopback address"
+	}
+
+	// Unconditionally block link-local and metadata endpoints.
+	if ip != nil && ip.IsLinkLocalUnicast() {
+		return "WORKSPACE_FILE_SERVICE_BASE_URL must not point to a link-local address"
+	}
+
+	for _, blocked := range ssrfBlockedHosts {
+		if strings.EqualFold(host, blocked) {
+			return "WORKSPACE_FILE_SERVICE_BASE_URL must not point to a metadata/SSRF-risk host"
+		}
+	}
+
+	// In production and staging: also reject RFC1918 + ULA (no internal IP routing expected).
+	if isProd && ip != nil {
+		for _, privateNet := range ssrfPrivateNets {
+			if privateNet.Contains(ip) {
+				return "WORKSPACE_FILE_SERVICE_BASE_URL must not point to a private/RFC1918 address in production"
+			}
+		}
+	}
+
+	return ""
+}
+
+// validateFileService validates WORKSPACE_FILE_SERVICE_BASE_URL and
+// WORKSPACE_FILE_SERVICE_TOKEN.
+//
+// Rules:
+//   - In non-dev: if FileServiceBaseURL is set, FileServiceToken is REQUIRED and
+//     must be >= 32 non-whitespace chars. If neither is set, proof generation is disabled.
+//   - In dev: both may be omitted (proof generation disabled); if either is set,
+//     both must be valid.
+//   - FileServiceBaseURL, when set, must parse as http or https and must not point to
+//     link-local, metadata, loopback, or (in prod/staging) RFC1918 addresses (SSRF guard).
+//   - FileServiceToken, when set, must be >= 32 non-whitespace chars (entropy floor).
+func (c *Config) validateFileService() []string {
+	var errs []string
+
+	urlSet := c.FileServiceBaseURL != ""
+	tokenSet := c.FileServiceToken != ""
+
+	// If neither is set: proof generation is disabled — valid in dev; warn in non-dev.
+	if !urlSet && !tokenSet {
+		return nil
+	}
+
+	// If URL is set, validate it parses as http/https and passes SSRF checks.
+	if urlSet {
+		isProd := !c.IsDev()
+		if msg := validateFileServiceURL(c.FileServiceBaseURL, isProd); msg != "" {
+			errs = append(errs, msg)
+		}
+	}
+
+	// Token validation: required when URL is set in non-dev; entropy floor always.
+	if urlSet && !tokenSet && !c.IsDev() {
+		const tokenRequiredMsg = "WORKSPACE_FILE_SERVICE_TOKEN is required when " +
+			"WORKSPACE_FILE_SERVICE_BASE_URL is set in non-development environments"
+		errs = append(errs, tokenRequiredMsg)
+	}
+
+	if tokenSet && len(strings.TrimSpace(c.FileServiceToken)) < minFileTokenLen {
+		errs = append(errs, "WORKSPACE_FILE_SERVICE_TOKEN must be at least 32 non-whitespace characters")
+	}
+
+	return errs
+}
+
 // IsDev reports whether the service is running in development mode.
 func (c *Config) IsDev() bool {
 	return strings.EqualFold(c.Env, "development")
+}
+
+// FileServiceEnabled reports whether both base URL and token are configured,
+// meaning proof generation and download are operational.
+func (c *Config) FileServiceEnabled() bool {
+	return c.FileServiceBaseURL != "" && c.FileServiceToken != ""
 }

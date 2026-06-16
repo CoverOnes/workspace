@@ -21,8 +21,12 @@ type RouterConfig struct {
 	MultipartyContractSvc *service.MultipartyContractService
 	MilestoneSvc          *service.MilestoneService
 	AuditLogSvc           *service.AuditLogService
-	Pool                  *pgxpool.Pool
-	Redis                 *redis.Client // may be nil in dev
+	// ProofSvc is optional. When non-nil, proof download endpoints are registered
+	// for both bilateral (/v1/contracts/:id/proof) and multiparty
+	// (/v1/multiparty-contracts/:id/proof) contracts.
+	ProofSvc *service.ProofService
+	Pool     *pgxpool.Pool
+	Redis    *redis.Client // may be nil in dev
 	// ContractServiceToken is the pre-shared secret that the marketplace service
 	// must supply in X-Service-Token to reach the internal contract-create endpoint.
 	ContractServiceToken string
@@ -118,7 +122,7 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	// Multi-party routes (both S2S internal and authenticated public) share a single
 	// handler instance to avoid double-construction.
 	if cfg.MultipartyContractSvc != nil {
-		multipartyH := NewMultipartyHandler(cfg.MultipartyContractSvc)
+		multipartyH := NewMultipartyHandlerWithProof(cfg.MultipartyContractSvc, cfg.ProofSvc)
 
 		// S2S: create-or-add-party (marketplace calls this when a collaborator is APPROVED).
 		internal.POST("/multiparty-contracts", multipartyH.CreateOrAddParty)
@@ -133,6 +137,7 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 			mpAPI.Use(userRL.Handler())
 		}
 		mpAPI.GET("/:id", middleware.RequireTier(1), multipartyH.GetDetail)
+		mpAPI.GET("/:id/proof", middleware.RequireTier(1), multipartyH.GetProof)
 		mpAPI.POST("/:id/submit-for-signature", middleware.RequireTier(2), multipartyH.SubmitForSignatures)
 		mpAPI.POST("/:id/sign", middleware.RequireTier(2), multipartyH.Sign)
 		mpAPI.PATCH("/:id/parties/:partyId/share", middleware.RequireTier(2), multipartyH.UpdatePartyShare)
@@ -168,7 +173,7 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	}
 
 	// All API routes require a valid identity (gateway-injected X-User-Id).
-	contractH := NewContractHandler(cfg.ContractSvc)
+	contractH := NewContractHandlerWithProof(cfg.ContractSvc, cfg.ProofSvc)
 	signatureH := NewSignatureHandler(cfg.ContractSvc, cfg.SignatureSvc)
 	taskH := NewTaskHandler(cfg.TaskSvc)
 	worklogH := NewWorklogHandler(cfg.WorklogSvc)
@@ -194,6 +199,7 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	// contracts with arbitrary freelancer/amount values (CWE-915 / CWE-639).
 	api.GET("/contracts", middleware.RequireTier(1), contractH.List)
 	api.GET("/contracts/:id", middleware.RequireTier(1), contractH.GetByID)
+	api.GET("/contracts/:id/proof", middleware.RequireTier(1), contractH.GetProof)
 	api.PATCH("/contracts/:id", middleware.RequireTier(2), contractH.Patch)
 	// DRAFT -> PENDING_SIGNATURE (client-only). submit-for-signature is the
 	// canonical route the web-app calls for the "送出簽署 / Submit for signature"

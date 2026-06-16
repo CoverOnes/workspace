@@ -113,21 +113,21 @@ func TestWorklogHandler_CreateWorklog(t *testing.T) {
 			callerID:   thirdPartyID,
 			minutes:    60,
 			wantStatus: http.StatusNotFound,
-			wantCode:   "NOT_FOUND",
+			wantCode:   testErrCodeNotFound,
 		},
 		{
 			name:       "minutes 0 returns 400",
 			callerID:   clientID,
 			minutes:    0,
 			wantStatus: http.StatusBadRequest,
-			wantCode:   "VALIDATION_ERROR",
+			wantCode:   testErrCodeValidation,
 		},
 		{
 			name:       "minutes > 1440 returns 400",
 			callerID:   clientID,
 			minutes:    1441,
 			wantStatus: http.StatusBadRequest,
-			wantCode:   "VALIDATION_ERROR",
+			wantCode:   testErrCodeValidation,
 		},
 	}
 

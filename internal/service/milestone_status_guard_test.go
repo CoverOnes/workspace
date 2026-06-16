@@ -29,9 +29,9 @@ func addMilestoneInput(contractID, posterID uuid.UUID) *service.AddMilestoneInpu
 	return &service.AddMilestoneInput{
 		ContractID: contractID,
 		CallerID:   posterID,
-		Name:       "Test Milestone",
+		Name:       testValTestMilestone,
 		Amount:     decimal.NewFromInt(1000),
-		Currency:   "TWD",
+		Currency:   testCurrencyTWD,
 		Sequence:   1,
 	}
 }

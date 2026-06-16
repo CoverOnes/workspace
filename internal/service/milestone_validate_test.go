@@ -212,9 +212,9 @@ func TestValidateMilestoneInput_ErrorCases(t *testing.T) {
 			_, err := svc.AddMilestone(context.Background(), &service.AddMilestoneInput{
 				ContractID: contract.ID,
 				CallerID:   posterID,
-				Name:       "Test Milestone",
+				Name:       testValTestMilestone,
 				Amount:     tc.amount,
-				Currency:   "TWD",
+				Currency:   testCurrencyTWD,
 				Sequence:   1,
 			})
 
@@ -257,9 +257,9 @@ func TestValidateMilestoneInput_HappyCases(t *testing.T) {
 			_, err := svc.AddMilestone(context.Background(), &service.AddMilestoneInput{
 				ContractID: contract.ID,
 				CallerID:   posterID,
-				Name:       "Test Milestone",
+				Name:       testValTestMilestone,
 				Amount:     tc.amount,
-				Currency:   "TWD",
+				Currency:   testCurrencyTWD,
 				Sequence:   1,
 			})
 			require.NoError(t, err, "amount %s should not return an error", tc.amount)

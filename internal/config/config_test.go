@@ -15,12 +15,22 @@ const validServiceToken = "00000000-0000-0000-0000-000000000000"
 // testHMACSecret is a 32-char placeholder HMAC secret used in tests only — not a real secret.
 const testHMACSecret = "0123456789abcdef0123456789abcdef"
 
+// testEnvDevelopment and testEnvProduction are the canonical env values used in tests.
+const (
+	testEnvDevelopment = "development"
+	testEnvProduction  = "production"
+
+	testEnvVarDBSchema    = "WORKSPACE_DB_SCHEMA"
+	testEnvVarGatewayCIDR = "WORKSPACE_GATEWAY_CIDR"
+	testErrHMACNonDev     = "WORKSPACE_GATEWAY_HMAC_SECRET must be at least 32 characters in non-dev"
+)
+
 func setValidEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("WORKSPACE_POSTGRES_DSN", "postgres://u:p@localhost:5432/db")
 	t.Setenv("WORKSPACE_PORT", "8082")
 	t.Setenv("WORKSPACE_LOG_LEVEL", "INFO")
-	t.Setenv("WORKSPACE_ENV", "development")
+	t.Setenv("WORKSPACE_ENV", testEnvDevelopment)
 	t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
 }
 
@@ -78,7 +88,7 @@ func TestLoad_Success_ParsedValues(t *testing.T) {
 	t.Setenv("WORKSPACE_POSTGRES_DSN", "postgres://user:pass@db:5432/workspace")
 	t.Setenv("WORKSPACE_PORT", "9090")
 	t.Setenv("WORKSPACE_LOG_LEVEL", "DEBUG")
-	t.Setenv("WORKSPACE_ENV", "production")
+	t.Setenv("WORKSPACE_ENV", testEnvProduction)
 	t.Setenv("WORKSPACE_REDIS_URL", "redis://localhost:6379")
 	t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
 	t.Setenv("WORKSPACE_GATEWAY_HMAC_SECRET", testHMACSecret)
@@ -88,7 +98,7 @@ func TestLoad_Success_ParsedValues(t *testing.T) {
 	assert.Equal(t, "postgres://user:pass@db:5432/workspace", cfg.PostgresDSN)
 	assert.Equal(t, 9090, cfg.Port)
 	assert.Equal(t, "DEBUG", cfg.LogLevel)
-	assert.Equal(t, "production", cfg.Env)
+	assert.Equal(t, testEnvProduction, cfg.Env)
 	assert.Equal(t, "redis://localhost:6379", cfg.RedisURL)
 }
 
@@ -107,7 +117,7 @@ func TestLoad_Defaults_Applied(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 8082, cfg.Port)
 	assert.Equal(t, strings.ToUpper("INFO"), strings.ToUpper(cfg.LogLevel))
-	assert.Equal(t, "production", cfg.Env)
+	assert.Equal(t, testEnvProduction, cfg.Env)
 }
 
 // TestLoad_DefaultEnv_IsFailSafeProduction is load-bearing: it directly pins the
@@ -127,7 +137,7 @@ func TestLoad_DefaultEnv_IsFailSafeProduction(t *testing.T) {
 
 		cfg, err := config.Load()
 		require.NoError(t, err)
-		assert.Equal(t, "production", cfg.Env, "unset WORKSPACE_ENV must default to production")
+		assert.Equal(t, testEnvProduction, cfg.Env, "unset WORKSPACE_ENV must default to production")
 		assert.False(t, cfg.IsDev(), "unset WORKSPACE_ENV must NOT be treated as development")
 	})
 
@@ -149,9 +159,9 @@ func TestIsDev(t *testing.T) {
 		env   string
 		isDev bool
 	}{
-		{"development", true},
+		{testEnvDevelopment, true},
 		{"DEVELOPMENT", true},
-		{"production", false},
+		{testEnvProduction, false},
 		{"test", false},
 	}
 
@@ -182,25 +192,25 @@ func TestLoad_ContractServiceToken(t *testing.T) {
 	}{
 		{
 			name:    "valid 36-char UUID token in development",
-			env:     "development",
+			env:     testEnvDevelopment,
 			token:   validServiceToken,
 			wantErr: false,
 		},
 		{
 			name:    "valid token in production",
-			env:     "production",
+			env:     testEnvProduction,
 			token:   validServiceToken,
 			wantErr: false,
 		},
 		{
 			name:    "empty token allowed in development (service may boot for local UI work)",
-			env:     "development",
+			env:     testEnvDevelopment,
 			token:   "",
 			wantErr: false,
 		},
 		{
 			name:      "empty token rejected in production (S2S endpoint cannot start)",
-			env:       "production",
+			env:       testEnvProduction,
 			token:     "",
 			wantErr:   true,
 			errSubstr: "WORKSPACE_CONTRACT_SERVICE_TOKEN is required in non-development",
@@ -214,14 +224,14 @@ func TestLoad_ContractServiceToken(t *testing.T) {
 		},
 		{
 			name:      "token too short (31 chars) rejected in development",
-			env:       "development",
+			env:       testEnvDevelopment,
 			token:     "1234567890123456789012345678901",
 			wantErr:   true,
 			errSubstr: "must be at least 32 characters",
 		},
 		{
 			name:      "token too short rejected in production",
-			env:       "production",
+			env:       testEnvProduction,
 			token:     "1234567890123456789012345678901",
 			wantErr:   true,
 			errSubstr: "must be at least 32 characters",
@@ -274,25 +284,25 @@ func TestLoad_PostgresSchema(t *testing.T) {
 			name:      "schema with hyphen rejected",
 			schema:    "my-schema",
 			wantErr:   true,
-			errSubstr: "WORKSPACE_DB_SCHEMA",
+			errSubstr: testEnvVarDBSchema,
 		},
 		{
 			name:      "schema with dot rejected",
 			schema:    "public.contracts",
 			wantErr:   true,
-			errSubstr: "WORKSPACE_DB_SCHEMA",
+			errSubstr: testEnvVarDBSchema,
 		},
 		{
 			name:      "schema with semicolon rejected (SQL injection attempt)",
 			schema:    "workspace;DROP TABLE contracts",
 			wantErr:   true,
-			errSubstr: "WORKSPACE_DB_SCHEMA",
+			errSubstr: testEnvVarDBSchema,
 		},
 		{
 			name:      "schema with leading digit rejected (invalid PG identifier)",
 			schema:    "1workspace",
 			wantErr:   true,
-			errSubstr: "WORKSPACE_DB_SCHEMA",
+			errSubstr: testEnvVarDBSchema,
 		},
 	}
 
@@ -413,19 +423,19 @@ func TestLoad_GatewayCIDR(t *testing.T) {
 			name:      "bare IP address without prefix is rejected",
 			cidr:      "10.0.0.1",
 			wantErr:   true,
-			errSubstr: "WORKSPACE_GATEWAY_CIDR",
+			errSubstr: testEnvVarGatewayCIDR,
 		},
 		{
 			name:      "garbage string is rejected",
 			cidr:      "not-a-cidr",
 			wantErr:   true,
-			errSubstr: "WORKSPACE_GATEWAY_CIDR",
+			errSubstr: testEnvVarGatewayCIDR,
 		},
 		{
 			name:      "CIDR with out-of-range octet is rejected",
 			cidr:      "256.0.0.0/8",
 			wantErr:   true,
-			errSubstr: "WORKSPACE_GATEWAY_CIDR",
+			errSubstr: testEnvVarGatewayCIDR,
 		},
 		{
 			name:      "IPv4 wildcard 0.0.0.0/0 is rejected (IP spoof risk)",
@@ -468,43 +478,43 @@ func TestLoad_GatewayHMAC(t *testing.T) {
 		{
 			// §24.1: dev may omit the secret (verification disabled, gateway also skips in dev).
 			name:    "dev with empty secret is allowed",
-			env:     "development",
+			env:     testEnvDevelopment,
 			secret:  "",
 			wantErr: false,
 		},
 		{
 			// §24.1: non-dev MUST have a ≥32-char secret.
 			name:      "production without gateway secret fails (fail-closed)",
-			env:       "production",
+			env:       testEnvProduction,
 			secret:    "",
 			wantErr:   true,
-			errSubstr: "WORKSPACE_GATEWAY_HMAC_SECRET must be at least 32 characters in non-dev",
+			errSubstr: testErrHMACNonDev,
 		},
 		{
 			name:      "staging without gateway secret fails (fail-closed)",
 			env:       "staging",
 			secret:    "",
 			wantErr:   true,
-			errSubstr: "WORKSPACE_GATEWAY_HMAC_SECRET must be at least 32 characters in non-dev",
+			errSubstr: testErrHMACNonDev,
 		},
 		{
 			// Even in dev a too-short secret is an error (catches typos).
 			name:      "dev with too-short secret is rejected",
-			env:       "development",
+			env:       testEnvDevelopment,
 			secret:    "tooshort",
 			wantErr:   true,
 			errSubstr: "WORKSPACE_GATEWAY_HMAC_SECRET, when set, must be at least 32 characters",
 		},
 		{
 			name:      "production with too-short secret is rejected",
-			env:       "production",
+			env:       testEnvProduction,
 			secret:    "tooshort",
 			wantErr:   true,
-			errSubstr: "WORKSPACE_GATEWAY_HMAC_SECRET must be at least 32 characters in non-dev",
+			errSubstr: testErrHMACNonDev,
 		},
 		{
 			name:    "production with valid 32-char secret passes",
-			env:     "production",
+			env:     testEnvProduction,
 			secret:  testHMACSecret,
 			wantErr: false,
 		},
@@ -516,7 +526,7 @@ func TestLoad_GatewayHMAC(t *testing.T) {
 		},
 		{
 			name:    "dev with valid 32-char secret passes",
-			env:     "development",
+			env:     testEnvDevelopment,
 			secret:  testHMACSecret,
 			wantErr: false,
 		},

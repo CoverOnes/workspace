@@ -148,7 +148,7 @@ func activateRosterContract(
 
 	tenderID := uuid.New()
 	posterID := uuid.New()
-	currency := "TWD"
+	currency := testCurrencyTWD
 
 	contract, _, err := svc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
 		TenderID:     tenderID,

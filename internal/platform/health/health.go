@@ -11,6 +11,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// statusKey is the JSON response key used in all health check responses.
+const statusKey = "status"
+
 // Handler provides /healthz and /readyz gin handler functions.
 type Handler struct {
 	pool *pgxpool.Pool
@@ -23,7 +26,7 @@ func NewHandler(pool *pgxpool.Pool) *Handler {
 
 // Liveness always returns 200 if the process is serving.
 func (h *Handler) Liveness(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	c.JSON(http.StatusOK, gin.H{statusKey: "ok"})
 }
 
 // Readiness pings Postgres; returns 503 if any dependency is down.
@@ -43,9 +46,9 @@ func (h *Handler) Readiness(c *gin.Context) {
 	}
 
 	if allOK {
-		c.JSON(http.StatusOK, gin.H{"status": "ready", "checks": checks})
+		c.JSON(http.StatusOK, gin.H{statusKey: "ready", "checks": checks})
 		return
 	}
 
-	c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not_ready", "checks": checks})
+	c.JSON(http.StatusServiceUnavailable, gin.H{statusKey: "not_ready", "checks": checks})
 }

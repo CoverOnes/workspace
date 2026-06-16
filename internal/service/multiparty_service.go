@@ -27,6 +27,7 @@ type MultipartyContractService struct {
 	addenda   store.AddendumStore
 	tx        store.MultipartyTxManager
 	publisher events.Publisher
+	proofGen  ProofGenerator // optional; nil = skip proof generation
 }
 
 // NewMultipartyContractService returns a MultipartyContractService.
@@ -46,6 +47,12 @@ func NewMultipartyContractService(
 		tx:        tx,
 		publisher: publisher,
 	}
+}
+
+// WithProofGenerator sets the optional ProofGenerator on the MultipartyContractService.
+// When non-nil, a proof PDF is generated best-effort after a multiparty contract activates.
+func (s *MultipartyContractService) WithProofGenerator(pg ProofGenerator) {
+	s.proofGen = pg
 }
 
 // CreateOrAddPartyInput carries S2S-validated input for idempotent contract creation
@@ -455,13 +462,18 @@ func (s *MultipartyContractService) Sign(ctx context.Context, in SignInput) (*do
 	if result != nil && result.Status == domain.MultipartyContractStatusActive {
 		capturedResult := result
 		capturedStatus := preSignStatus
+		// Capture proofGen synchronously (before spawning the goroutine) so the field
+		// read is ordered before any later WithProofGenerator setter call in the same
+		// goroutine; the background goroutine then uses only this captured value and
+		// never reads the mutable s.proofGen field concurrently (race-free).
+		capturedGen := s.proofGen
 
 		//nolint:contextcheck,gosec // intentional: goroutine must outlive the request context; G118 is the design intent
 		go func() {
 			if capturedStatus == domain.MultipartyContractStatusAddendumPending {
-				s.publishReSigned(context.Background(), capturedResult)
+				s.publishReSigned(context.Background(), capturedResult, capturedGen)
 			} else {
-				s.publishActivated(context.Background(), capturedResult)
+				s.publishActivated(context.Background(), capturedResult, capturedGen)
 			}
 		}()
 	}
@@ -572,7 +584,7 @@ func (s *MultipartyContractService) activateInTx(
 	return nil
 }
 
-func (s *MultipartyContractService) publishActivated(ctx context.Context, contract *domain.MultipartyContract) {
+func (s *MultipartyContractService) publishActivated(ctx context.Context, contract *domain.MultipartyContract, proofGen ProofGenerator) {
 	// Use the frozen party_count from the committed contract struct (set at SubmitForSignatures
 	// and preserved through activateInTx). A post-commit live re-read via ListActiveByContract
 	// can race with concurrent party mutations and return a different count than was committed.
@@ -589,6 +601,17 @@ func (s *MultipartyContractService) publishActivated(ctx context.Context, contra
 	if pubErr := s.publisher.PublishMultipartyContractActivated(ctx, evt); pubErr != nil {
 		slog.Warn("publish multiparty contract_activated event failed",
 			"contract_id", contract.ID, "err", pubErr)
+	}
+
+	// Best-effort proof generation — runs in the same goroutine that called publishActivated
+	// (which itself runs in a goroutine with context.Background(), per the Sign() call site).
+	// proofGen is captured synchronously at the Sign() call site to avoid a race with
+	// WithProofGenerator.
+	if proofGen != nil {
+		if _, genErr := proofGen.GenerateAndStore(ctx, contract.ID, domain.ContractKindMultiparty); genErr != nil {
+			slog.Warn("multiparty proof generation failed (best-effort)",
+				"contract_id", contract.ID, "err", genErr)
+		}
 	}
 }
 
@@ -616,7 +639,7 @@ func (s *MultipartyContractService) publishAddendumCreated(
 	}
 }
 
-func (s *MultipartyContractService) publishReSigned(ctx context.Context, contract *domain.MultipartyContract) {
+func (s *MultipartyContractService) publishReSigned(ctx context.Context, contract *domain.MultipartyContract, proofGen ProofGenerator) {
 	evt := &domain.MultipartyContractReSignedEvent{
 		EventID:    uuid.New(),
 		OccurredAt: time.Now().UTC(),
@@ -630,6 +653,17 @@ func (s *MultipartyContractService) publishReSigned(ctx context.Context, contrac
 	if pubErr := s.publisher.PublishMultipartyContractReSigned(ctx, evt); pubErr != nil {
 		slog.Warn("publish multiparty contract_re_signed event failed",
 			"contract_id", contract.ID, "err", pubErr)
+	}
+
+	// Best-effort proof re-generation for addendum re-sign path (ADDENDUM_PENDING → ACTIVE).
+	// The existing v1 proof row is superseded with a new PDF at the new contract version.
+	// Runs in the same goroutine that called publishReSigned (which is already a background
+	// goroutine with context.Background() from the Sign() call site).
+	if proofGen != nil {
+		if _, genErr := proofGen.GenerateAndStore(ctx, contract.ID, domain.ContractKindMultiparty); genErr != nil {
+			slog.Warn("multiparty proof re-generation failed after addendum re-sign (best-effort)",
+				"contract_id", contract.ID, "err", genErr)
+		}
 	}
 }
 

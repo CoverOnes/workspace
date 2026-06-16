@@ -103,7 +103,7 @@ func TestCompleteMilestone_TOCTOURace(t *testing.T) {
 				CallerID:   posterID,
 				Name:       "Race milestone",
 				Amount:     decimal.NewFromInt(1000),
-				Currency:   "TWD",
+				Currency:   testCurrencyTWD,
 				Sequence:   1,
 			})
 			require.NoError(t, err, "iter %d: add milestone", i)
