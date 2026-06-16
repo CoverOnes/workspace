@@ -19,7 +19,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/CoverOnes/workspace/internal/client"
 	"github.com/CoverOnes/workspace/internal/domain"
 	"github.com/CoverOnes/workspace/internal/events"
 	"github.com/CoverOnes/workspace/internal/service"
@@ -39,7 +38,7 @@ type proofTestEnv struct {
 	contractSvc *service.ContractService
 	mpSvc       *service.MultipartyContractService
 	proofSvc    *service.ProofService
-	fileClient  *client.FakeFileClient
+	fileClient  *fakeFileClient
 }
 
 // newProofTestEnv builds a fully wired proofTestEnv from the sharedServicePool.
@@ -68,11 +67,11 @@ func newProofTestEnv(t *testing.T) *proofTestEnv {
 
 	// Service layer.
 	pub := events.NewNoopPublisher()
-	contractSvc := service.NewContractService(contractStore, sigStore, txMgr, pub)
+	contractSvc := service.NewContractService(contractStore, sigStore, txMgr, pub, nil)
 	mpSvc := service.NewMultipartyContractService(mpContractStore, mpPartyStore, mpSigStore, addendaStore, mpTxMgr, pub)
 
-	// FakeFileClient — no external HTTP dependency.
-	fakeFC := client.NewFakeFileClient(nil)
+	// fakeFileClient — no external HTTP dependency.
+	fakeFC := newFakeFileClient(nil)
 
 	proofSvc, err := service.NewProofService(&service.ProofServiceConfig{
 		ProofStore:               proofStore,
@@ -246,8 +245,8 @@ func TestProofService_Bilateral_PDFStoredInFakeClient(t *testing.T) {
 	proof, err := env.proofSvc.GenerateAndStore(ctx, c.ID, domain.ContractKindBilateral)
 	require.NoError(t, err)
 
-	// The PDF bytes must be stored in the FakeFileClient.
-	pdfBytes := env.fileClient.Get(proof.FileID)
+	// The PDF bytes must be stored in the fakeFileClient.
+	pdfBytes := env.fileClient.get(proof.FileID)
 	require.NotEmpty(t, pdfBytes, "PDF bytes must be stored in FakeFileClient")
 	assert.Equal(t, []byte("%PDF-"), pdfBytes[:5], "stored bytes must be a valid PDF")
 }
@@ -318,9 +317,9 @@ func TestProofService_GenerateAndStore_Idempotent(t *testing.T) {
 
 	assert.Equal(t, proof1.ID, proof2.ID, "idempotent call must return the same proof ID")
 	assert.Equal(t, proof1.FileID, proof2.FileID, "idempotent call must return the same file ID")
-	// FakeFileClient must only have stored one PDF.
-	assert.Len(t, env.fileClient.StoredIDs(), 1,
-		"FakeFileClient must contain exactly one file (no re-upload on idempotent call)")
+	// fakeFileClient must only have stored one PDF.
+	assert.Len(t, env.fileClient.storedIDs(), 1,
+		"fakeFileClient must contain exactly one file (no re-upload on idempotent call)")
 }
 
 // ---- Store-layer unit tests -------------------------------------------------
@@ -424,9 +423,6 @@ func TestProofService_Multiparty_GenerateAndStore(t *testing.T) {
 	ctx := context.Background()
 
 	contractID, _, vendor1ID, _ := createActiveMultipartyContract(t, env)
-
-	// Wire proofSvc into mpSvc so it runs proof generation inline.
-	env.mpSvc.WithProofGenerator(env.proofSvc)
 
 	// Verify the contract is ACTIVE before generating proof.
 	mpContract, err := env.mpSvc.GetDetail(ctx, contractID, vendor1ID)
@@ -601,7 +597,7 @@ func TestNewProofService_NilDependencies_ReturnError(t *testing.T) {
 		MultipartyContractStore:  postgres.NewMultipartyContractStore(pool),
 		MultipartyPartyStore:     postgres.NewMultipartyPartyStore(pool),
 		MultipartySignatureStore: postgres.NewMultipartySignatureStore(pool),
-		FileClient:               client.NewFakeFileClient(nil),
+		FileClient:               newFakeFileClient(nil),
 	}
 
 	tests := []struct {

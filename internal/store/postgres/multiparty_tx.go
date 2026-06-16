@@ -26,7 +26,8 @@ func NewMultipartyTxManager(pool *pgxpool.Pool) *MultipartyTxManager {
 // pool-backed stores, so service logic does not need to know whether it is inside
 // a transaction.
 // The addenda AddendumStore is the 4th arg — callers that do not use it may ignore it
-// with `_ store.AddendumStore`.
+// with `_ store.AddendumStore`. The outbox OutboxStore (5th arg) is provided so
+// callers can enqueue events atomically with domain writes.
 func (m *MultipartyTxManager) WithMultipartyTx(
 	ctx context.Context,
 	fn func(
@@ -35,6 +36,7 @@ func (m *MultipartyTxManager) WithMultipartyTx(
 		parties store.MultipartyPartyStore,
 		sigs store.MultipartySignatureStore,
 		addenda store.AddendumStore,
+		outbox store.OutboxStore,
 	) error,
 ) error {
 	tx, err := m.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -52,8 +54,9 @@ func (m *MultipartyTxManager) WithMultipartyTx(
 	txParties := &txMultipartyPartyStore{tx: tx}
 	txSigs := &txMultipartySignatureStore{tx: tx}
 	txAddenda := &txAddendumStore{tx: tx}
+	txOutbox := &txOutboxStore{tx: tx}
 
-	if fnErr := fn(ctx, txContracts, txParties, txSigs, txAddenda); fnErr != nil {
+	if fnErr := fn(ctx, txContracts, txParties, txSigs, txAddenda, txOutbox); fnErr != nil {
 		return fnErr
 	}
 

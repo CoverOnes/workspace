@@ -634,57 +634,58 @@ func TestTxManager_Integration(t *testing.T) {
 
 		now := time.Now().UTC().Truncate(time.Millisecond)
 
-		txErr := tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, txSigs store.SignatureStore) error {
-			locked, err := txContracts.GetByIDForUpdate(ctx, c.ID)
-			if err != nil {
-				return err
-			}
+		txErr := tx.WithTx(ctx,
+			func(ctx context.Context, txContracts store.ContractStore, txSigs store.SignatureStore, _ store.OutboxStore) error {
+				locked, err := txContracts.GetByIDForUpdate(ctx, c.ID)
+				if err != nil {
+					return err
+				}
 
-			sig1 := &domain.Signature{
-				ID:                uuid.New(),
-				ContractID:        locked.ID,
-				SignerUserID:      clientID,
-				SignerRole:        domain.SignerRoleClient,
-				ContractVersion:   locked.Version,
-				SignedContentHash: locked.ContentHash,
-				SignedAt:          now,
-				CreatedAt:         now,
-			}
+				sig1 := &domain.Signature{
+					ID:                uuid.New(),
+					ContractID:        locked.ID,
+					SignerUserID:      clientID,
+					SignerRole:        domain.SignerRoleClient,
+					ContractVersion:   locked.Version,
+					SignedContentHash: locked.ContentHash,
+					SignedAt:          now,
+					CreatedAt:         now,
+				}
 
-			if createErr := txSigs.Create(ctx, sig1); createErr != nil {
-				return createErr
-			}
+				if createErr := txSigs.Create(ctx, sig1); createErr != nil {
+					return createErr
+				}
 
-			sig2 := &domain.Signature{
-				ID:                uuid.New(),
-				ContractID:        locked.ID,
-				SignerUserID:      freelancerID,
-				SignerRole:        domain.SignerRoleFreelancer,
-				ContractVersion:   locked.Version,
-				SignedContentHash: locked.ContentHash,
-				SignedAt:          now,
-				CreatedAt:         now,
-			}
+				sig2 := &domain.Signature{
+					ID:                uuid.New(),
+					ContractID:        locked.ID,
+					SignerUserID:      freelancerID,
+					SignerRole:        domain.SignerRoleFreelancer,
+					ContractVersion:   locked.Version,
+					SignedContentHash: locked.ContentHash,
+					SignedAt:          now,
+					CreatedAt:         now,
+				}
 
-			if createErr := txSigs.Create(ctx, sig2); createErr != nil {
-				return createErr
-			}
+				if createErr := txSigs.Create(ctx, sig2); createErr != nil {
+					return createErr
+				}
 
-			count, err := txSigs.CountValidSignatures(ctx, locked.ID, locked.Version, locked.ContentHash)
-			if err != nil {
-				return err
-			}
+				count, err := txSigs.CountValidSignatures(ctx, locked.ID, locked.Version, locked.ContentHash)
+				if err != nil {
+					return err
+				}
 
-			if count >= 2 {
-				activatedAt := now
-				locked.Status = domain.ContractStatusActive
-				locked.ActivatedAt = &activatedAt
+				if count >= 2 {
+					activatedAt := now
+					locked.Status = domain.ContractStatusActive
+					locked.ActivatedAt = &activatedAt
 
-				return txContracts.Update(ctx, locked)
-			}
+					return txContracts.Update(ctx, locked)
+				}
 
-			return nil
-		})
+				return nil
+			})
 		require.NoError(t, txErr)
 
 		// Verify the contract is now ACTIVE.

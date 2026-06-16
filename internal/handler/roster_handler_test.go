@@ -111,8 +111,8 @@ func startRosterTestDB(t *testing.T, ctx context.Context) *rosterTestEnv {
 
 	contractStore := postgres.NewContractStore(pool)
 	sigStore := postgres.NewSignatureStore(pool)
-	contractSvc := service.NewContractService(contractStore, sigStore, postgres.NewTxManager(pool), pub)
-	signatureSvc := service.NewSignatureService(contractStore, sigStore)
+	contractSvc := service.NewContractService(contractStore, sigStore, postgres.NewTxManager(pool), pub, nil)
+	signatureSvc := service.NewSignatureService(contractStore, sigStore, nil)
 	taskSvc := service.NewTaskService(contractStore, postgres.NewTaskStore(pool))
 	worklogSvc := service.NewWorklogService(contractStore, postgres.NewWorklogStore(pool))
 

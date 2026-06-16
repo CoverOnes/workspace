@@ -87,9 +87,32 @@ func (s *stubContractStoreH) Update(_ context.Context, c *domain.Contract) error
 	return nil
 }
 
-type stubSigStoreH struct{}
+type stubSigStoreH struct {
+	sigs map[uuid.UUID]*domain.Signature
+}
 
-func (s *stubSigStoreH) Create(_ context.Context, _ *domain.Signature) error { return nil }
+func (s *stubSigStoreH) Create(_ context.Context, sig *domain.Signature) error {
+	if s.sigs == nil {
+		s.sigs = make(map[uuid.UUID]*domain.Signature)
+	}
+
+	s.sigs[sig.ID] = sig
+
+	return nil
+}
+
+func (s *stubSigStoreH) GetByID(_ context.Context, id uuid.UUID) (*domain.Signature, error) {
+	if s.sigs == nil {
+		return nil, domain.ErrSignatureNotFound
+	}
+
+	sig, ok := s.sigs[id]
+	if !ok {
+		return nil, domain.ErrSignatureNotFound
+	}
+
+	return sig, nil
+}
 
 func (s *stubSigStoreH) ListByContract(_ context.Context, _ uuid.UUID) ([]*domain.Signature, error) {
 	return nil, nil
@@ -99,13 +122,52 @@ func (s *stubSigStoreH) CountValidSignatures(_ context.Context, _ uuid.UUID, _ i
 	return 0, nil
 }
 
+func (s *stubSigStoreH) SetFileID(_ context.Context, id, fileID uuid.UUID) error {
+	if s.sigs == nil {
+		return domain.ErrSignatureNotFound
+	}
+
+	sig, ok := s.sigs[id]
+	if !ok {
+		return domain.ErrSignatureNotFound
+	}
+
+	sig.FileID = &fileID
+
+	return nil
+}
+
 type stubTxH struct {
 	contracts store.ContractStore
 	sigs      store.SignatureStore
 }
 
-func (m *stubTxH) WithTx(ctx context.Context, fn func(ctx context.Context, c store.ContractStore, s store.SignatureStore) error) error {
-	return fn(ctx, m.contracts, m.sigs)
+func (m *stubTxH) WithTx(
+	ctx context.Context,
+	fn func(ctx context.Context, c store.ContractStore, s store.SignatureStore, o store.OutboxStore) error,
+) error {
+	return fn(ctx, m.contracts, m.sigs, &noopOutboxStoreH{})
+}
+
+// noopOutboxStoreH is a test double for store.OutboxStore used in handler tests.
+type noopOutboxStoreH struct{}
+
+func (*noopOutboxStoreH) Enqueue(_ context.Context, _ *store.OutboxEnqueueInput) error { return nil }
+
+func (*noopOutboxStoreH) FetchPending(_ context.Context, _ int) ([]*domain.OutboxEntry, error) {
+	return nil, nil
+}
+func (*noopOutboxStoreH) MarkPublished(_ context.Context, _ uuid.UUID) error { return nil }
+func (*noopOutboxStoreH) RecordFailure(_ context.Context, _ uuid.UUID, _ string, _ time.Time) error {
+	return nil
+}
+
+func (*noopOutboxStoreH) DeleteOldPublished(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
+func (*noopOutboxStoreH) CountStalePending(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
 }
 
 const testServiceToken = "test-service-token-at-least-32-chars!!"
@@ -119,7 +181,7 @@ func buildContractRouter(cs *stubContractStoreH) *gin.Engine {
 	tx := &stubTxH{contracts: cs, sigs: ss}
 	pub := events.NewNoopPublisher()
 
-	svc := service.NewContractService(cs, ss, tx, pub)
+	svc := service.NewContractService(cs, ss, tx, pub, nil)
 	h := handler.NewContractHandler(svc)
 	internalH := handler.NewInternalContractHandler(svc)
 

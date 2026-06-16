@@ -13,13 +13,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/CoverOnes/workspace/internal/client"
 	"github.com/CoverOnes/workspace/internal/config"
+	"github.com/CoverOnes/workspace/internal/domain"
 	"github.com/CoverOnes/workspace/internal/events"
+	"github.com/CoverOnes/workspace/internal/fileclient"
 	"github.com/CoverOnes/workspace/internal/handler"
+	"github.com/CoverOnes/workspace/internal/outbox"
 	"github.com/CoverOnes/workspace/internal/platform/logger"
 	"github.com/CoverOnes/workspace/internal/service"
 	"github.com/CoverOnes/workspace/internal/store/postgres"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -52,9 +55,9 @@ func runHealthCheck() error {
 
 	url := fmt.Sprintf("http://127.0.0.1:%s/healthz", port)
 
-	httpClient := &http.Client{Timeout: 2 * time.Second}
+	client := &http.Client{Timeout: 2 * time.Second}
 
-	resp, err := httpClient.Get(url) //nolint:noctx // healthcheck is a one-shot process; no request context needed
+	resp, err := client.Get(url) //nolint:noctx // healthcheck is a one-shot process; no request context needed
 	if err != nil {
 		return fmt.Errorf("GET %s: %w", url, err)
 	}
@@ -108,33 +111,9 @@ func run() error {
 	}
 
 	// Redis client (optional — nil means noop publisher + in-process rate limiter).
-	var redisClient *redis.Client
-
-	var publisher events.Publisher
-
-	if cfg.RedisURL != "" {
-		opts, parseErr := redis.ParseURL(cfg.RedisURL)
-		if parseErr != nil {
-			return fmt.Errorf("parse redis url: %w", parseErr)
-		}
-
-		redisClient = redis.NewClient(opts)
-
-		pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		defer cancel()
-
-		if pingErr := redisClient.Ping(pingCtx).Err(); pingErr != nil {
-			slog.Warn("redis ping failed; event publishing and rate limiting will use noop/fallback", "err", pingErr)
-			redisClient = nil
-		} else {
-			slog.Info("redis connected")
-		}
-	}
-
-	if redisClient != nil {
-		publisher = events.NewRedisPublisher(redisClient)
-	} else {
-		publisher = events.NewNoopPublisher()
+	redisClient, publisher, err := initRedis(ctx, cfg.RedisURL)
+	if err != nil {
+		return err
 	}
 
 	// Store layer.
@@ -144,6 +123,7 @@ func run() error {
 	worklogStore := postgres.NewWorklogStore(pool)
 	txManager := postgres.NewTxManager(pool)
 	auditLogStore := postgres.NewAuditLogStore(pool)
+	outboxStore := postgres.NewOutboxStore(pool)
 
 	// Multiparty store layer.
 	multipartyContractStore := postgres.NewMultipartyContractStore(pool)
@@ -154,9 +134,22 @@ func run() error {
 	milestoneStore := postgres.NewMilestoneStore(pool)
 	milestoneTxManager := postgres.NewMilestoneTxManager(pool)
 
+	// File S2S client (optional — nil when FILE_BASE_URL is not set or dev mode without token).
+	var fileClient *fileclient.Client
+	if cfg.FileBaseURL != "" && cfg.FileS2SToken != "" {
+		fileClient = fileclient.New(fileclient.Config{
+			BaseURL:   cfg.FileBaseURL,
+			ServiceID: cfg.FileS2SServiceID,
+			Token:     cfg.FileS2SToken,
+		})
+		slog.Info("file S2S client configured", "base_url", cfg.FileBaseURL, "service_id", cfg.FileS2SServiceID)
+	} else {
+		slog.Info("file S2S client not configured; signature attachments and proof generation disabled")
+	}
+
 	// Service layer.
-	contractSvc := service.NewContractService(contractStore, signatureStore, txManager, publisher)
-	signatureSvc := service.NewSignatureService(contractStore, signatureStore)
+	contractSvc := service.NewContractService(contractStore, signatureStore, txManager, publisher, fileClient)
+	signatureSvc := service.NewSignatureService(contractStore, signatureStore, fileClient)
 	taskSvc := service.NewTaskService(contractStore, taskStore)
 	worklogSvc := service.NewWorklogService(contractStore, worklogStore)
 	multipartyContractSvc := service.NewMultipartyContractService(
@@ -170,41 +163,36 @@ func run() error {
 	milestoneSvc := service.NewMilestoneService(multipartyContractStore, milestoneStore, multipartyPartyStore, milestoneTxManager, publisher)
 	auditLogSvc := service.NewAuditLogService(auditLogStore)
 
-	// Contract proof service (optional — disabled when file service is not configured).
-	// Both services are wired after construction to avoid circular dependencies.
-	var proofSvc *service.ProofService
-	if cfg.FileServiceEnabled() {
-		proofStore := postgres.NewContractProofStore(pool)
-		fileClient := client.NewHTTPFileClient(
-			cfg.FileServiceBaseURL,
-			cfg.FileServiceToken,
-			&http.Client{Timeout: 15 * time.Second},
-		)
-
-		var proofErr error
-
-		proofSvc, proofErr = service.NewProofService(&service.ProofServiceConfig{
-			ProofStore:               proofStore,
-			AuditStore:               auditLogStore,
-			ContractStore:            contractStore,
-			SignatureStore:           signatureStore,
-			MultipartyContractStore:  multipartyContractStore,
-			MultipartyPartyStore:     multipartyPartyStore,
-			MultipartySignatureStore: multipartySignatureStore,
-			FileClient:               fileClient,
-		})
-		if proofErr != nil {
-			return fmt.Errorf("construct proof service: %w", proofErr)
-		}
-
-		// Wire proof generation into the contract services (best-effort post-activation hook).
-		contractSvc.WithProofGenerator(proofSvc)
-		multipartyContractSvc.WithProofGenerator(proofSvc)
-
-		slog.Info("contract proof service enabled")
+	// Outbox poller — relay unpublished outbox entries to Redis pub/sub.
+	// When Redis is unavailable the poller runs in no-op mode (noop publisher).
+	var outboxPublisher outbox.Publisher
+	if redisClient != nil {
+		outboxPublisher = outbox.NewRedisPublisher(redisClient)
 	} else {
-		slog.Info("contract proof service disabled (WORKSPACE_FILE_SERVICE_BASE_URL not set)")
+		outboxPublisher = &outbox.NoopPublisher{}
 	}
+
+	outboxPoller := outbox.New(outboxStore, outboxPublisher)
+
+	// Contract proof service (optional — disabled when file service is not configured).
+	// Proof generation is triggered via the transactional outbox (ChannelProofGenerationRequired
+	// channel), not by a best-effort goroutine. The poller handler invokes GenerateAndStore,
+	// which is idempotent and version-aware. At-least-once delivery is safe because
+	// GenerateAndStore handles ErrProofAlreadyExists (idempotent skip) and version supersede.
+	proofSvc, err := initProofService(cfg, pool, &service.ProofServiceConfig{
+		AuditStore:               auditLogStore,
+		ContractStore:            contractStore,
+		SignatureStore:           signatureStore,
+		MultipartyContractStore:  multipartyContractStore,
+		MultipartyPartyStore:     multipartyPartyStore,
+		MultipartySignatureStore: multipartySignatureStore,
+		FileClient:               fileClient,
+	}, outboxPoller)
+	if err != nil {
+		return err
+	}
+
+	go outboxPoller.Start(ctx)
 
 	// Router.
 	r := handler.NewRouter(&handler.RouterConfig{
@@ -256,7 +244,74 @@ func run() error {
 		return fmt.Errorf("server shutdown: %w", shutdownErr)
 	}
 
+	outboxPoller.Stop()
 	slog.Info("server stopped")
 
 	return nil
+}
+
+// initRedis connects to Redis when redisURL is non-empty, pings, and returns the client
+// (nil on unavailability) plus an appropriate events.Publisher.
+// Extracted to keep run()'s cyclomatic complexity within the project budget.
+func initRedis(ctx context.Context, redisURL string) (*redis.Client, events.Publisher, error) {
+	if redisURL == "" {
+		return nil, events.NewNoopPublisher(), nil
+	}
+
+	opts, parseErr := redis.ParseURL(redisURL)
+	if parseErr != nil {
+		return nil, nil, fmt.Errorf("parse redis url: %w", parseErr)
+	}
+
+	client := redis.NewClient(opts)
+
+	pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	if pingErr := client.Ping(pingCtx).Err(); pingErr != nil {
+		slog.Warn("redis ping failed; event publishing and rate limiting will use noop/fallback", "err", pingErr)
+		return nil, events.NewNoopPublisher(), nil
+	}
+
+	slog.Info("redis connected")
+
+	return client, events.NewRedisPublisher(client), nil
+}
+
+// initProofService constructs the ProofService (when the file service is configured) and
+// registers its outbox handler with the poller. Returns nil without error when the file
+// service is not enabled. Extracted to keep run()'s cyclomatic complexity in budget.
+//
+// partial is a ProofServiceConfig without ProofStore (which requires pool).
+// pool is used to create postgres.NewContractProofStore.
+func initProofService(
+	cfg *config.Config,
+	pool *pgxpool.Pool,
+	partial *service.ProofServiceConfig,
+	poller *outbox.Poller,
+) (*service.ProofService, error) {
+	if !cfg.FileServiceEnabled() {
+		slog.Info("contract proof service disabled (FILE_BASE_URL not set)")
+		return nil, nil
+	}
+
+	partial.ProofStore = postgres.NewContractProofStore(pool)
+
+	proofSvc, proofErr := service.NewProofService(partial)
+	if proofErr != nil {
+		return nil, fmt.Errorf("construct proof service: %w", proofErr)
+	}
+
+	// Register the proof generation handler with the outbox poller so that
+	// proof_generation_required entries are processed in-process rather than
+	// published to Redis (this channel has no external subscriber).
+	// A longer timeout (30 s) is used for this handler vs the default 5 s Redis path
+	// because PDF rendering + file upload can take several seconds under load.
+	poller.Handle(service.ChannelProofGenerationRequired, func(hCtx context.Context, entry *domain.OutboxEntry) error {
+		return service.HandleProofOutboxEntry(hCtx, proofSvc, entry)
+	})
+
+	slog.Info("contract proof service enabled")
+
+	return proofSvc, nil
 }

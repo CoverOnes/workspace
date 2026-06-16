@@ -33,10 +33,16 @@ type ContractFilter struct {
 // SignatureStore defines persistence operations for contract signatures.
 type SignatureStore interface {
 	Create(ctx context.Context, s *domain.Signature) error
+	// GetByID fetches a signature by its primary key.
+	// Returns ErrSignatureNotFound when no row exists.
+	GetByID(ctx context.Context, id uuid.UUID) (*domain.Signature, error)
 	ListByContract(ctx context.Context, contractID uuid.UUID) ([]*domain.Signature, error)
 	// CountValidSignatures returns the count of distinct valid signatures for the
 	// current (contractID, version, contentHash) combination.
 	CountValidSignatures(ctx context.Context, contractID uuid.UUID, version int, contentHash string) (int, error)
+	// SetFileID persists the file_id for an existing signature row.
+	// Used after a successful S2S register call to record the attachment.
+	SetFileID(ctx context.Context, id, fileID uuid.UUID) error
 }
 
 // TaskStore defines persistence operations for tasks.
@@ -58,8 +64,13 @@ type WorklogStore interface {
 
 // TxManager runs a function inside a single Postgres transaction providing
 // transaction-scoped stores for atomic operations (e.g., dual-sign completion).
+// The outbox OutboxStore is included so callers can enqueue events atomically
+// with domain writes (transactional outbox pattern).
 type TxManager interface {
-	WithTx(ctx context.Context, fn func(ctx context.Context, contracts ContractStore, signatures SignatureStore) error) error
+	WithTx(
+		ctx context.Context,
+		fn func(ctx context.Context, contracts ContractStore, signatures SignatureStore, outbox OutboxStore) error,
+	) error
 }
 
 // MultipartyContractStore defines persistence operations for multi-party contracts.
@@ -124,7 +135,8 @@ type MultipartySignatureStore interface {
 // MultipartyTxManager runs a function inside a single Postgres transaction providing
 // transaction-scoped stores for the N-party quorum check (TOCTOU-safe).
 // The addenda AddendumStore is the 4th arg — callers that do not use it may ignore it
-// with `_ store.AddendumStore`.
+// with `_ store.AddendumStore`. The outbox OutboxStore (5th arg) is provided so
+// callers can enqueue events atomically with domain writes.
 type MultipartyTxManager interface {
 	WithMultipartyTx(
 		ctx context.Context,
@@ -134,6 +146,7 @@ type MultipartyTxManager interface {
 			parties MultipartyPartyStore,
 			sigs MultipartySignatureStore,
 			addenda AddendumStore,
+			outbox OutboxStore,
 		) error,
 	) error
 }
@@ -142,11 +155,12 @@ type MultipartyTxManager interface {
 // provides a transaction-scoped MultipartyContractStore (for GetByIDForUpdate) and
 // MilestoneStore (for MarkCompleted). Used by CompleteMilestone to prevent a
 // concurrent CancelContract from racing between the ACTIVE-status guard and the
-// milestone write.
+// milestone write. The outbox OutboxStore is included so callers can enqueue
+// events atomically with the milestone write.
 type MilestoneTxManager interface {
 	WithMilestoneTx(
 		ctx context.Context,
-		fn func(ctx context.Context, contracts MultipartyContractStore, milestones MilestoneStore) error,
+		fn func(ctx context.Context, contracts MultipartyContractStore, milestones MilestoneStore, outbox OutboxStore) error,
 	) error
 }
 
@@ -167,6 +181,39 @@ type MilestoneStore interface {
 	// Returns decimal.Zero when no milestones exist (no error).
 	// Used by the S2S escrow-cap endpoint consumed by the payment service.
 	SumAmountsByContract(ctx context.Context, contractID uuid.UUID) (decimal.Decimal, error)
+}
+
+// OutboxEnqueueInput carries the fields needed to insert an outbox row.
+// It is used by all three tx managers so that the domain write and the
+// outbox INSERT happen atomically in the same transaction.
+type OutboxEnqueueInput struct {
+	AggregateType string
+	AggregateID   uuid.UUID
+	EventID       uuid.UUID
+	Channel       string
+	Payload       []byte
+}
+
+// OutboxStore defines persistence operations for the event_outbox table.
+// Enqueue is used inside transactions (atomically with domain writes).
+// The poller uses the pool-backed implementation for the polling queries.
+type OutboxStore interface {
+	// Enqueue inserts a new outbox row. Must be called inside an active transaction.
+	Enqueue(ctx context.Context, in *OutboxEnqueueInput) error
+	// FetchPending fetches up to limit rows WHERE published_at IS NULL AND
+	// next_attempt_at <= now() ORDER BY created_at LIMIT limit FOR UPDATE SKIP LOCKED.
+	// Multi-replica safe: SKIP LOCKED prevents double-processing.
+	FetchPending(ctx context.Context, limit int) ([]*domain.OutboxEntry, error)
+	// MarkPublished sets published_at = now() for the given row.
+	MarkPublished(ctx context.Context, id uuid.UUID) error
+	// RecordFailure increments attempts, sets last_error and next_attempt_at (exponential backoff).
+	RecordFailure(ctx context.Context, id uuid.UUID, lastErr string, nextAttemptAt time.Time) error
+	// DeleteOldPublished deletes rows WHERE published_at < cutoff.
+	// Unpublished rows are never deleted.
+	DeleteOldPublished(ctx context.Context, cutoff time.Time) (int64, error)
+	// CountStalePending counts rows WHERE published_at IS NULL AND created_at < cutoff.
+	// Used by the alerting check (stale unpublished > 1h threshold).
+	CountStalePending(ctx context.Context, cutoff time.Time) (int64, error)
 }
 
 // AuditAppendInput carries the caller-supplied fields for a new audit log entry.

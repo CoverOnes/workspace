@@ -208,6 +208,7 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	api.POST("/contracts/:id/submit", middleware.RequireTier(2), contractH.Submit)
 	api.POST("/contracts/:id/sign", middleware.RequireTier(2), signatureH.Sign)
 	api.GET("/contracts/:id/signatures", middleware.RequireTier(1), signatureH.ListSignatures)
+	api.GET("/contracts/:id/signatures/:sigId/attachment/download-url", middleware.RequireTier(1), signatureH.GetAttachmentDownloadURL)
 	api.POST("/contracts/:id/complete", middleware.RequireTier(2), contractH.Complete)
 	api.POST("/contracts/:id/cancel", middleware.RequireTier(2), contractH.Cancel)
 

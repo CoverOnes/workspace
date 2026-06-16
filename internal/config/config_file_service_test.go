@@ -1,7 +1,7 @@
 package config_test
 
 // Tests for the file service configuration validation (validateFileService).
-// These verify that WORKSPACE_FILE_SERVICE_BASE_URL and WORKSPACE_FILE_SERVICE_TOKEN
+// These verify that FILE_BASE_URL and WORKSPACE_FILE_S2S_TOKEN
 // are correctly validated across development and non-development environments.
 
 import (
@@ -28,8 +28,8 @@ func setValidDevFileEnv(t *testing.T) {
 	t.Setenv("WORKSPACE_ENV", "development")
 	t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", "")
 	t.Setenv("WORKSPACE_GATEWAY_HMAC_SECRET", "")
-	t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", "")
-	t.Setenv("WORKSPACE_FILE_SERVICE_TOKEN", "")
+	t.Setenv("FILE_BASE_URL", "")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", "")
 }
 
 // setValidProdFileEnv sets up a valid production environment (needs HMAC + service token).
@@ -41,8 +41,8 @@ func setValidProdFileEnv(t *testing.T) {
 	t.Setenv("WORKSPACE_ENV", "production")
 	t.Setenv("WORKSPACE_CONTRACT_SERVICE_TOKEN", validServiceToken)
 	t.Setenv("WORKSPACE_GATEWAY_HMAC_SECRET", testHMACSecret)
-	t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", "")
-	t.Setenv("WORKSPACE_FILE_SERVICE_TOKEN", "")
+	t.Setenv("FILE_BASE_URL", "")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", "")
 }
 
 // --- Happy-path tests ---
@@ -69,22 +69,22 @@ func TestFileService_BothUnset_Prod_NoError(t *testing.T) {
 func TestFileService_BothSet_Valid(t *testing.T) {
 	// Both URL and token set with valid values: proof generation enabled.
 	setValidDevFileEnv(t)
-	t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", validFileURL)
-	t.Setenv("WORKSPACE_FILE_SERVICE_TOKEN", validFileToken)
+	t.Setenv("FILE_BASE_URL", validFileURL)
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", validFileToken)
 
 	cfg, err := config.Load()
 
 	require.NoError(t, err)
 	assert.True(t, cfg.FileServiceEnabled(), "FileServiceEnabled must be true when both are set")
-	assert.Equal(t, validFileURL, cfg.FileServiceBaseURL)
-	assert.Equal(t, validFileToken, cfg.FileServiceToken)
+	assert.Equal(t, validFileURL, cfg.FileBaseURL)
+	assert.Equal(t, validFileToken, cfg.FileS2SToken)
 }
 
 func TestFileService_HTTPBaseURL_Allowed(t *testing.T) {
 	// http:// (not https) is allowed — e.g. for internal k8s service mesh without TLS.
 	setValidDevFileEnv(t)
-	t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", "http://file-svc.internal")
-	t.Setenv("WORKSPACE_FILE_SERVICE_TOKEN", validFileToken)
+	t.Setenv("FILE_BASE_URL", "http://file-svc.internal")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", validFileToken)
 
 	_, err := config.Load()
 
@@ -96,68 +96,68 @@ func TestFileService_HTTPBaseURL_Allowed(t *testing.T) {
 func TestFileService_InvalidURL_NotHTTP(t *testing.T) {
 	// URL set but scheme is not http or https.
 	setValidDevFileEnv(t)
-	t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", "ftp://file-svc.internal")
-	t.Setenv("WORKSPACE_FILE_SERVICE_TOKEN", validFileToken)
+	t.Setenv("FILE_BASE_URL", "ftp://file-svc.internal")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", validFileToken)
 
 	_, err := config.Load()
 
 	require.Error(t, err, "non-http/https URL must be rejected")
-	assert.Contains(t, err.Error(), "WORKSPACE_FILE_SERVICE_BASE_URL")
+	assert.Contains(t, err.Error(), "FILE_BASE_URL")
 }
 
 func TestFileService_MalformedURL(t *testing.T) {
 	// URL set but completely invalid.
 	setValidDevFileEnv(t)
-	t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", "://not-a-url")
-	t.Setenv("WORKSPACE_FILE_SERVICE_TOKEN", validFileToken)
+	t.Setenv("FILE_BASE_URL", "://not-a-url")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", validFileToken)
 
 	_, err := config.Load()
 
 	require.Error(t, err, "malformed URL must be rejected")
-	assert.Contains(t, err.Error(), "WORKSPACE_FILE_SERVICE_BASE_URL")
+	assert.Contains(t, err.Error(), "FILE_BASE_URL")
 }
 
 func TestFileService_ShortToken_Rejected(t *testing.T) {
 	// Token shorter than 32 chars must always be rejected (entropy floor).
 	setValidDevFileEnv(t)
-	t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", validFileURL)
-	t.Setenv("WORKSPACE_FILE_SERVICE_TOKEN", "tooshort")
+	t.Setenv("FILE_BASE_URL", validFileURL)
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", "tooshort")
 
 	_, err := config.Load()
 
 	require.Error(t, err, "token shorter than 32 chars must be rejected")
-	assert.Contains(t, err.Error(), "WORKSPACE_FILE_SERVICE_TOKEN")
+	assert.Contains(t, err.Error(), "WORKSPACE_FILE_S2S_TOKEN")
 }
 
 func TestFileService_ShortToken_AlsoRejectedWithoutURL(t *testing.T) {
 	// Token set alone (no URL) but shorter than 32 chars — still rejected.
 	setValidDevFileEnv(t)
-	t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", "")
-	t.Setenv("WORKSPACE_FILE_SERVICE_TOKEN", "short")
+	t.Setenv("FILE_BASE_URL", "")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", "short")
 
 	_, err := config.Load()
 
 	require.Error(t, err, "short token must be rejected even without URL")
-	assert.Contains(t, err.Error(), "WORKSPACE_FILE_SERVICE_TOKEN")
+	assert.Contains(t, err.Error(), "WORKSPACE_FILE_S2S_TOKEN")
 }
 
 func TestFileService_URLSetWithoutToken_NonDev_Rejected(t *testing.T) {
 	// In non-dev: if URL is set, token is REQUIRED.
 	setValidProdFileEnv(t)
-	t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", validFileURL)
+	t.Setenv("FILE_BASE_URL", validFileURL)
 	// Token intentionally NOT set.
 
 	_, err := config.Load()
 
 	require.Error(t, err, "URL without token in non-dev must be rejected")
-	assert.Contains(t, err.Error(), "WORKSPACE_FILE_SERVICE_TOKEN")
+	assert.Contains(t, err.Error(), "WORKSPACE_FILE_S2S_TOKEN")
 }
 
 func TestFileService_URLSetWithoutToken_Dev_Allowed(t *testing.T) {
 	// In dev: URL without token is allowed (proof generation runs but without auth).
 	// However the file client will fail at runtime — this is a dev convenience.
 	setValidDevFileEnv(t)
-	t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", validFileURL)
+	t.Setenv("FILE_BASE_URL", validFileURL)
 	// Token intentionally NOT set.
 
 	_, err := config.Load()
@@ -182,8 +182,8 @@ func TestFileService_FileServiceEnabled_BothRequired(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			setValidDevFileEnv(t)
-			t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", tc.url)
-			t.Setenv("WORKSPACE_FILE_SERVICE_TOKEN", tc.token)
+			t.Setenv("FILE_BASE_URL", tc.url)
+			t.Setenv("WORKSPACE_FILE_S2S_TOKEN", tc.token)
 
 			// We expect the "only_token" case to fail (short token ""), so Load() may error.
 			// We only check FileServiceEnabled() on valid configs.
@@ -206,25 +206,25 @@ func TestFileService_FileServiceEnabled_BothRequired(t *testing.T) {
 func TestFileService_WhitespaceOnlyToken_Rejected(t *testing.T) {
 	// 32 spaces must fail: whitespace padding does not satisfy the entropy floor.
 	setValidDevFileEnv(t)
-	t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", validFileURL)
-	t.Setenv("WORKSPACE_FILE_SERVICE_TOKEN", "                                ") // 32 spaces
+	t.Setenv("FILE_BASE_URL", validFileURL)
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", "                                ") // 32 spaces
 
 	_, err := config.Load()
 
 	require.Error(t, err, "32-space token must be rejected")
-	assert.Contains(t, err.Error(), "WORKSPACE_FILE_SERVICE_TOKEN")
+	assert.Contains(t, err.Error(), "WORKSPACE_FILE_S2S_TOKEN")
 }
 
 func TestFileService_TabOnlyToken_Rejected(t *testing.T) {
 	// Token made of whitespace tabs only must fail.
 	setValidDevFileEnv(t)
-	t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", validFileURL)
-	t.Setenv("WORKSPACE_FILE_SERVICE_TOKEN", "\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t")
+	t.Setenv("FILE_BASE_URL", validFileURL)
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", "\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t")
 
 	_, err := config.Load()
 
 	require.Error(t, err, "whitespace-tab-only token must be rejected")
-	assert.Contains(t, err.Error(), "WORKSPACE_FILE_SERVICE_TOKEN")
+	assert.Contains(t, err.Error(), "WORKSPACE_FILE_S2S_TOKEN")
 }
 
 // --- SSRF validation tests (item 3) ---
@@ -232,49 +232,49 @@ func TestFileService_TabOnlyToken_Rejected(t *testing.T) {
 func TestFileService_Loopback_URL_Rejected(t *testing.T) {
 	// 127.0.0.1 must always be rejected.
 	setValidDevFileEnv(t)
-	t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", "http://127.0.0.1:9000")
-	t.Setenv("WORKSPACE_FILE_SERVICE_TOKEN", validFileToken)
+	t.Setenv("FILE_BASE_URL", "http://127.0.0.1:9000")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", validFileToken)
 
 	_, err := config.Load()
 
 	require.Error(t, err, "loopback URL must be rejected")
-	assert.Contains(t, err.Error(), "WORKSPACE_FILE_SERVICE_BASE_URL")
+	assert.Contains(t, err.Error(), "FILE_BASE_URL")
 }
 
 func TestFileService_IPv6Loopback_URL_Rejected(t *testing.T) {
 	// ::1 loopback must be rejected.
 	setValidDevFileEnv(t)
-	t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", "http://[::1]:9000")
-	t.Setenv("WORKSPACE_FILE_SERVICE_TOKEN", validFileToken)
+	t.Setenv("FILE_BASE_URL", "http://[::1]:9000")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", validFileToken)
 
 	_, err := config.Load()
 
 	require.Error(t, err, "IPv6 loopback URL must be rejected")
-	assert.Contains(t, err.Error(), "WORKSPACE_FILE_SERVICE_BASE_URL")
+	assert.Contains(t, err.Error(), "FILE_BASE_URL")
 }
 
 func TestFileService_MetadataIP_Rejected(t *testing.T) {
 	// 169.254.169.254 (AWS/GCP/Azure instance metadata) must always be rejected.
 	setValidDevFileEnv(t)
-	t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", "http://169.254.169.254/latest/meta-data")
-	t.Setenv("WORKSPACE_FILE_SERVICE_TOKEN", validFileToken)
+	t.Setenv("FILE_BASE_URL", "http://169.254.169.254/latest/meta-data")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", validFileToken)
 
 	_, err := config.Load()
 
 	require.Error(t, err, "metadata IP 169.254.169.254 must be rejected")
-	assert.Contains(t, err.Error(), "WORKSPACE_FILE_SERVICE_BASE_URL")
+	assert.Contains(t, err.Error(), "FILE_BASE_URL")
 }
 
 func TestFileService_MetadataGoogleInternal_Rejected(t *testing.T) {
 	// metadata.google.internal must always be rejected.
 	setValidDevFileEnv(t)
-	t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", "http://metadata.google.internal/computeMetadata/v1/")
-	t.Setenv("WORKSPACE_FILE_SERVICE_TOKEN", validFileToken)
+	t.Setenv("FILE_BASE_URL", "http://metadata.google.internal/computeMetadata/v1/")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", validFileToken)
 
 	_, err := config.Load()
 
 	require.Error(t, err, "metadata.google.internal must be rejected")
-	assert.Contains(t, err.Error(), "WORKSPACE_FILE_SERVICE_BASE_URL")
+	assert.Contains(t, err.Error(), "FILE_BASE_URL")
 }
 
 func TestFileService_RFC1918_Prod_Rejected(t *testing.T) {
@@ -291,13 +291,13 @@ func TestFileService_RFC1918_Prod_Rejected(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			setValidProdFileEnv(t)
-			t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", tc.url)
-			t.Setenv("WORKSPACE_FILE_SERVICE_TOKEN", validFileToken)
+			t.Setenv("FILE_BASE_URL", tc.url)
+			t.Setenv("WORKSPACE_FILE_S2S_TOKEN", validFileToken)
 
 			_, err := config.Load()
 
 			require.Error(t, err, "RFC1918 URL %s must be rejected in production", tc.url)
-			assert.Contains(t, err.Error(), "WORKSPACE_FILE_SERVICE_BASE_URL")
+			assert.Contains(t, err.Error(), "FILE_BASE_URL")
 		})
 	}
 }
@@ -305,8 +305,8 @@ func TestFileService_RFC1918_Prod_Rejected(t *testing.T) {
 func TestFileService_RFC1918_Dev_Allowed(t *testing.T) {
 	// RFC1918 addresses ARE allowed in dev (e.g. local MinIO container).
 	setValidDevFileEnv(t)
-	t.Setenv("WORKSPACE_FILE_SERVICE_BASE_URL", "http://192.168.1.100:9000")
-	t.Setenv("WORKSPACE_FILE_SERVICE_TOKEN", validFileToken)
+	t.Setenv("FILE_BASE_URL", "http://192.168.1.100:9000")
+	t.Setenv("WORKSPACE_FILE_S2S_TOKEN", validFileToken)
 
 	_, err := config.Load()
 

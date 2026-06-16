@@ -112,7 +112,6 @@ func TestCreateWorklog(t *testing.T) {
 		},
 	}
 
-	//nolint:dupl // table-driven test body; similar structure to task tests is intentional, not a copy-paste error
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			cs := newFakeContractStore()

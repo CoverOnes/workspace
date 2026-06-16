@@ -13,35 +13,47 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// channelContractActivated is the Redis pub/sub channel for the 1:1 dual-sign contract.
+// Kept in sync with events.channelContractActivated; duplicated here so the service
+// package can reference it without importing the events package for the channel name alone.
+const (
+	channelContractActivated = "workspace.contract_activated"
+
+	// aggregateTypeContract is the outbox aggregate_type for bilateral contracts.
+	aggregateTypeContract = "contract"
+)
+
 // ContractService handles contract business logic.
 type ContractService struct {
 	contracts store.ContractStore
 	sigs      store.SignatureStore
 	tx        store.TxManager
-	publisher events.Publisher
-	proofGen  ProofGenerator // optional; nil = skip proof generation
+	publisher events.Publisher // retained for constructor API stability; outbox is now the publish path
+	files     fileRegistrar    // may be nil when file service is not configured
+}
+
+// fileRegistrar is the subset of fileclient.Client needed by ContractService.
+// Using the interface (not the concrete type) keeps ContractService testable without HTTP.
+type fileRegistrar interface {
+	Register(ctx context.Context, ownerUserID, fileID, signatureID uuid.UUID) error
 }
 
 // NewContractService returns a ContractService.
+// files may be nil when the file service is not configured (dev environments).
 func NewContractService(
 	contracts store.ContractStore,
 	sigs store.SignatureStore,
 	tx store.TxManager,
 	publisher events.Publisher,
+	files fileRegistrar,
 ) *ContractService {
 	return &ContractService{
 		contracts: contracts,
 		sigs:      sigs,
 		tx:        tx,
 		publisher: publisher,
+		files:     files,
 	}
-}
-
-// WithProofGenerator sets the optional ProofGenerator on the ContractService.
-// When non-nil, a proof PDF is generated best-effort after a contract activates.
-// Call this after NewContractService to wire the proof pipeline without circular imports.
-func (s *ContractService) WithProofGenerator(pg ProofGenerator) {
-	s.proofGen = pg
 }
 
 // CreateContractInput carries validated input for creating a contract.
@@ -191,7 +203,7 @@ type PatchContractInput struct {
 func (s *ContractService) PatchContract(ctx context.Context, in PatchContractInput) (*domain.Contract, error) {
 	var result *domain.Contract
 
-	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, _ store.SignatureStore) error {
+	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, _ store.SignatureStore, _ store.OutboxStore) error {
 		c, err := txContracts.GetByIDForUpdate(ctx, in.ID)
 		if err != nil {
 			return err
@@ -292,7 +304,7 @@ func applyPatchFields(c *domain.Contract, in PatchContractInput) (bool, error) {
 func (s *ContractService) SubmitContract(ctx context.Context, id, callerID uuid.UUID) (*domain.Contract, error) {
 	var result *domain.Contract
 
-	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, _ store.SignatureStore) error {
+	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, _ store.SignatureStore, _ store.OutboxStore) error {
 		c, err := txContracts.GetByIDForUpdate(ctx, id)
 		if err != nil {
 			return err
@@ -335,6 +347,10 @@ type SignContractInput struct {
 	SignedContentHash string
 	SignerIP          *string
 	UserAgent         *string
+	// FileID is the optional UUID of a document already present in the file service.
+	// When non-nil, the signature service will call fileclient.Register after the
+	// signature row is created and persist file_id on it.
+	FileID *uuid.UUID
 }
 
 // SignContract records a party's signature. Inside one tx: when both parties have
@@ -343,126 +359,114 @@ type SignContractInput struct {
 func (s *ContractService) SignContract(ctx context.Context, in SignContractInput) (*domain.Contract, error) {
 	var result *domain.Contract
 
-	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, txSigs store.SignatureStore) error {
-		// FOR UPDATE lock to prevent TOCTOU races (mirrors AcceptBid pattern).
-		c, err := txContracts.GetByIDForUpdate(ctx, in.ContractID)
-		if err != nil {
-			return err
-		}
+	var createdSigID uuid.UUID // captured for post-tx file registration
 
-		role, err := deriveSignerRole(c, in.CallerID)
-		if err != nil {
-			return err
-		}
-
-		if c.Status != domain.ContractStatusPendingSignature {
-			return fmt.Errorf("%w: contract must be in PENDING_SIGNATURE state to sign", domain.ErrInvalidTransition)
-		}
-
-		// Client-submitted hash must match server's authoritative content_hash.
-		if in.SignedContentHash != c.ContentHash {
-			return domain.ErrHashMismatch
-		}
-
-		now := time.Now().UTC()
-		sig := &domain.Signature{
-			ID:                uuid.New(),
-			ContractID:        c.ID,
-			SignerUserID:      in.CallerID,
-			SignerRole:        role,
-			ContractVersion:   c.Version,
-			SignedContentHash: in.SignedContentHash,
-			SignerIP:          in.SignerIP,
-			UserAgent:         in.UserAgent,
-			SignedAt:          now,
-			CreatedAt:         now,
-		}
-
-		if createErr := txSigs.Create(ctx, sig); createErr != nil {
-			return createErr
-		}
-
-		// Evaluate dual-sign completion: count distinct signer_roles for current version+hash.
-		count, err := txSigs.CountValidSignatures(ctx, c.ID, c.Version, c.ContentHash)
-		if err != nil {
-			return fmt.Errorf("count signatures: %w", err)
-		}
-
-		// Both parties (CLIENT + FREELANCER) have now signed.
-		// State machine: PENDING_SIGNATURE -> SIGNED -> ACTIVE (two-step, both in same tx).
-		if count >= 2 {
-			// Step 1: transition to SIGNED (validates the PENDING_SIGNATURE -> SIGNED edge).
-			if !domain.ValidContractTransition(c.Status, domain.ContractStatusSigned) {
-				return fmt.Errorf("%w: cannot transition to SIGNED", domain.ErrInvalidTransition)
+	txErr := s.tx.WithTx(ctx,
+		func(ctx context.Context, txContracts store.ContractStore, txSigs store.SignatureStore, txOutbox store.OutboxStore) error {
+			// FOR UPDATE lock to prevent TOCTOU races (mirrors AcceptBid pattern).
+			c, err := txContracts.GetByIDForUpdate(ctx, in.ContractID)
+			if err != nil {
+				return err
 			}
 
-			c.Status = domain.ContractStatusSigned
-
-			// Step 2: auto-promote SIGNED -> ACTIVE in the same tx.
-			if !domain.ValidContractTransition(c.Status, domain.ContractStatusActive) {
-				return fmt.Errorf("%w: cannot transition to ACTIVE", domain.ErrInvalidTransition)
+			role, err := deriveSignerRole(c, in.CallerID)
+			if err != nil {
+				return err
 			}
 
-			activatedAt := now
-			c.Status = domain.ContractStatusActive
-			c.ActivatedAt = &activatedAt
-
-			if updateErr := txContracts.Update(ctx, c); updateErr != nil {
-				return fmt.Errorf("activate contract: %w", updateErr)
+			if c.Status != domain.ContractStatusPendingSignature {
+				return fmt.Errorf("%w: contract must be in PENDING_SIGNATURE state to sign", domain.ErrInvalidTransition)
 			}
-		}
 
-		result = c
+			// Client-submitted hash must match server's authoritative content_hash.
+			if in.SignedContentHash != c.ContentHash {
+				return domain.ErrHashMismatch
+			}
 
-		return nil
-	})
+			now := time.Now().UTC()
+			sig := &domain.Signature{
+				ID:                uuid.New(),
+				ContractID:        c.ID,
+				SignerUserID:      in.CallerID,
+				SignerRole:        role,
+				ContractVersion:   c.Version,
+				SignedContentHash: in.SignedContentHash,
+				SignerIP:          in.SignerIP,
+				UserAgent:         in.UserAgent,
+				SignedAt:          now,
+				CreatedAt:         now,
+			}
+
+			if createErr := txSigs.Create(ctx, sig); createErr != nil {
+				return createErr
+			}
+
+			createdSigID = sig.ID // captured for post-tx file attachment registration
+
+			// Evaluate dual-sign completion: count distinct signer_roles for current version+hash.
+			count, err := txSigs.CountValidSignatures(ctx, c.ID, c.Version, c.ContentHash)
+			if err != nil {
+				return fmt.Errorf("count signatures: %w", err)
+			}
+
+			// Both parties (CLIENT + FREELANCER) have now signed.
+			// State machine: PENDING_SIGNATURE -> SIGNED -> ACTIVE (two-step, both in same tx).
+			// Extracted to activateBilateralContract to stay within cyclomatic complexity budget.
+			if count >= 2 {
+				if err := activateBilateralContract(ctx, txContracts, txOutbox, c, now); err != nil {
+					return err
+				}
+			}
+
+			result = c
+
+			return nil
+		})
 
 	if txErr != nil {
 		return nil, txErr
 	}
 
-	// Best-effort: publish event after tx commit. Log failure but don't error.
-	if result != nil && result.Status == domain.ContractStatusActive {
-		evt := &domain.ContractActivatedEvent{
-			EventID:    uuid.New(),
-			OccurredAt: time.Now().UTC(),
-			Version:    1,
-		}
-		evt.Data.ContractID = result.ID
-		evt.Data.ListingID = result.ListingID
-		evt.Data.AcceptedBidID = result.AcceptedBidID
-		evt.Data.ClientUserID = result.ClientUserID
-		evt.Data.FreelancerUserID = result.FreelancerUserID
-
-		if pubErr := s.publisher.PublishContractActivated(ctx, evt); pubErr != nil {
-			slog.Warn("publish contract_activated event failed", "contract_id", result.ID, "err", pubErr)
-		}
-
-		s.triggerBilateralProof(result.ID) //nolint:contextcheck // intentional: best-effort goroutine must outlive request context
-	}
+	//nolint:contextcheck // intentional: registerAttachmentBestEffort uses context.Background()
+	// internally for both Register and SetFileID calls so that a canceled request context
+	// does not leave the file service with a registered attachment but nil file_id on the row.
+	s.registerAttachmentBestEffort(in.CallerID, in.FileID, createdSigID)
 
 	return result, nil
 }
 
-// triggerBilateralProof launches a best-effort goroutine to generate a proof PDF for
-// the given bilateral contract. The goroutine uses context.Background() so it outlives
-// the HTTP request context.
-func (s *ContractService) triggerBilateralProof(contractID uuid.UUID) {
-	// Capture proofGen synchronously (in the caller's goroutine) so the background
-	// goroutine never reads the mutable s.proofGen field concurrently with a
-	// WithProofGenerator setter (race-free).
-	proofGen := s.proofGen
-	if proofGen == nil {
+// registerAttachmentBestEffort calls the file service to associate a document with a
+// signature after the signature transaction has committed. It is best-effort: failures
+// are logged but do not affect the already-committed signature row.
+//
+// Both Register and SetFileID use context.Background() intentionally: the caller's
+// request context may be canceled before or during the up-to-10s Register call (TCP
+// drop, client timeout). Using bgCtx for both calls ensures that a successful Register
+// is always followed by SetFileID — preventing the inconsistency where the file service
+// has the attachment but the signature row still has nil file_id (which causes permanent
+// 404 from GetAttachmentDownloadURL).
+func (s *ContractService) registerAttachmentBestEffort(
+	ownerID uuid.UUID,
+	fileID *uuid.UUID,
+	sigID uuid.UUID,
+) {
+	if fileID == nil || s.files == nil || sigID == uuid.Nil {
 		return
 	}
 
-	go func() {
-		bgCtx := context.Background()
-		if _, genErr := proofGen.GenerateAndStore(bgCtx, contractID, domain.ContractKindBilateral); genErr != nil {
-			slog.Warn("bilateral proof generation failed (best-effort)",
-				"contract_id", contractID, "err", genErr)
-		}
-	}()
+	bgCtx := context.Background()
+
+	if regErr := s.files.Register(bgCtx, ownerID, *fileID, sigID); regErr != nil {
+		slog.Warn("fileclient register attachment failed; file_id not persisted",
+			"signature_id", sigID, "file_id", *fileID, "err", regErr)
+
+		return
+	}
+
+	if setErr := s.sigs.SetFileID(bgCtx, sigID, *fileID); setErr != nil {
+		slog.Warn("set signature file_id failed after successful register",
+			"signature_id", sigID, "file_id", *fileID, "err", setErr)
+	}
 }
 
 // CompleteContract transitions ACTIVE -> COMPLETED (client only).
@@ -470,7 +474,7 @@ func (s *ContractService) triggerBilateralProof(contractID uuid.UUID) {
 func (s *ContractService) CompleteContract(ctx context.Context, id, callerID uuid.UUID) (*domain.Contract, error) {
 	var result *domain.Contract
 
-	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, _ store.SignatureStore) error {
+	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, _ store.SignatureStore, _ store.OutboxStore) error {
 		c, err := txContracts.GetByIDForUpdate(ctx, id)
 		if err != nil {
 			return err
@@ -509,7 +513,7 @@ func (s *ContractService) CompleteContract(ctx context.Context, id, callerID uui
 func (s *ContractService) CancelContract(ctx context.Context, id, callerID uuid.UUID) (*domain.Contract, error) {
 	var result *domain.Contract
 
-	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, _ store.SignatureStore) error {
+	txErr := s.tx.WithTx(ctx, func(ctx context.Context, txContracts store.ContractStore, _ store.SignatureStore, _ store.OutboxStore) error {
 		c, err := txContracts.GetByIDForUpdate(ctx, id)
 		if err != nil {
 			return err
@@ -539,4 +543,91 @@ func (s *ContractService) CancelContract(ctx context.Context, id, callerID uuid.
 	}
 
 	return result, nil
+}
+
+// activateBilateralContract performs the two-step PENDING_SIGNATURE -> SIGNED -> ACTIVE
+// transition and enqueues both the contract_activated and proof_generation_required outbox
+// events atomically. Extracted to keep SignContract's cyclomatic complexity in budget.
+//
+//   - txContracts: in-transaction ContractStore (must be called inside WithTx)
+//   - txOutbox:    in-transaction OutboxStore
+//   - c:           the contract record being activated (mutated in-place)
+//   - now:         frozen UTC timestamp used for ActivatedAt
+func activateBilateralContract(
+	ctx context.Context,
+	txContracts store.ContractStore,
+	txOutbox store.OutboxStore,
+	c *domain.Contract,
+	now time.Time,
+) error {
+	// Step 1: transition to SIGNED (validates the PENDING_SIGNATURE -> SIGNED edge).
+	if !domain.ValidContractTransition(c.Status, domain.ContractStatusSigned) {
+		return fmt.Errorf("%w: cannot transition to SIGNED", domain.ErrInvalidTransition)
+	}
+
+	c.Status = domain.ContractStatusSigned
+
+	// Step 2: auto-promote SIGNED -> ACTIVE in the same tx.
+	if !domain.ValidContractTransition(c.Status, domain.ContractStatusActive) {
+		return fmt.Errorf("%w: cannot transition to ACTIVE", domain.ErrInvalidTransition)
+	}
+
+	activatedAt := now
+	c.Status = domain.ContractStatusActive
+	c.ActivatedAt = &activatedAt
+
+	if updateErr := txContracts.Update(ctx, c); updateErr != nil {
+		return fmt.Errorf("activate contract: %w", updateErr)
+	}
+
+	// Enqueue contract_activated event atomically with the state transition.
+	evt := &domain.ContractActivatedEvent{
+		EventID:    uuid.New(),
+		OccurredAt: now,
+		Version:    1,
+	}
+	evt.Data.ContractID = c.ID
+	evt.Data.ListingID = c.ListingID
+	evt.Data.AcceptedBidID = c.AcceptedBidID
+	evt.Data.ClientUserID = c.ClientUserID
+	evt.Data.FreelancerUserID = c.FreelancerUserID
+
+	payload, marshalErr := marshalEvent(evt)
+	if marshalErr != nil {
+		return fmt.Errorf("marshal contract_activated event: %w", marshalErr)
+	}
+
+	if enqErr := txOutbox.Enqueue(ctx, &store.OutboxEnqueueInput{
+		AggregateType: aggregateTypeContract,
+		AggregateID:   c.ID,
+		EventID:       evt.EventID,
+		Channel:       channelContractActivated,
+		Payload:       payload,
+	}); enqErr != nil {
+		return fmt.Errorf("enqueue contract_activated event: %w", enqErr)
+	}
+
+	// Enqueue proof generation atomically with activation.
+	// The outbox poller dispatches this in-process via a registered local handler
+	// (no external Redis subscriber). At-least-once delivery is safe because
+	// GenerateAndStore is version-aware and idempotent.
+	proofPayload, proofMarshalErr := marshalEvent(ProofGenerationPayload{
+		ContractID: c.ID,
+		Kind:       string(domain.ContractKindBilateral),
+	})
+	if proofMarshalErr != nil {
+		return fmt.Errorf("marshal proof_generation_required payload: %w", proofMarshalErr)
+	}
+
+	if enqErr := txOutbox.Enqueue(ctx, &store.OutboxEnqueueInput{
+		AggregateType: aggregateTypeContract,
+		AggregateID:   c.ID,
+		EventID:       uuid.New(),
+		Channel:       ChannelProofGenerationRequired,
+		Payload:       proofPayload,
+	}); enqErr != nil {
+		return fmt.Errorf("enqueue proof_generation_required: %w", enqErr)
+	}
+
+	return nil
 }

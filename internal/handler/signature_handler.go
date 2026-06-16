@@ -35,6 +35,9 @@ func NewSignatureHandler(contractSvc *service.ContractService, signatureSvc *ser
 // SignRequest is the POST /v1/contracts/:id/sign request body.
 type SignRequest struct {
 	SignedContentHash string `json:"signedContentHash"`
+	// FileID is an optional UUID of a document already uploaded to the file service.
+	// When present the workspace service registers it as a signature attachment.
+	FileID *uuid.UUID `json:"fileId,omitempty"`
 }
 
 // Sign handles POST /v1/contracts/:id/sign.
@@ -82,6 +85,7 @@ func (h *SignatureHandler) Sign(c *gin.Context) {
 		SignedContentHash: req.SignedContentHash,
 		SignerIP:          &ip,
 		UserAgent:         sanitizedUA,
+		FileID:            req.FileID,
 	})
 	if err != nil {
 		httpx.Err(c, err)
@@ -116,6 +120,41 @@ func (h *SignatureHandler) ListSignatures(c *gin.Context) {
 	}
 
 	httpx.OK(c, sigs)
+}
+
+// GetAttachmentDownloadURL handles GET /v1/contracts/:id/signatures/:sigId/attachment/download-url.
+// Party gate is enforced inside SignatureService.GetAttachmentDownloadURL (IDOR-safe 404).
+// Non-party callers and callers requesting a signature with no attachment both receive 404.
+func (h *SignatureHandler) GetAttachmentDownloadURL(c *gin.Context) {
+	identity, ok := middleware.IdentityFromCtx(c)
+	if !ok {
+		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+		return
+	}
+
+	contractID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid contract id")
+		return
+	}
+
+	sigID, err := uuid.Parse(c.Param("sigId"))
+	if err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid signature id")
+		return
+	}
+
+	result, err := h.signatureSvc.GetAttachmentDownloadURL(c.Request.Context(), service.DownloadURLInput{
+		ContractID:  contractID,
+		SignatureID: sigID,
+		CallerID:    identity.UserID,
+	})
+	if err != nil {
+		httpx.Err(c, err)
+		return
+	}
+
+	httpx.OK(c, result)
 }
 
 // sanitizeUserAgentHeader sanitizes the User-Agent header for safe storage and logging:

@@ -3,13 +3,23 @@ package service
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"time"
 
 	"github.com/CoverOnes/workspace/internal/domain"
 	"github.com/CoverOnes/workspace/internal/events"
 	"github.com/CoverOnes/workspace/internal/store"
 	"github.com/google/uuid"
+)
+
+// Outbox channel and aggregate type constants for multiparty contract events.
+// Channel names must stay in sync with events.channel* constants in the events package.
+const (
+	channelMultipartyActivated       = "workspace.contract_activated"
+	channelMultipartyAddendumCreated = "workspace.contract_addendum_created"
+	channelMultipartyReSigned        = "workspace.contract_re_signed"
+
+	// aggregateTypeMultipartyContract is the outbox aggregate_type for multiparty contracts.
+	aggregateTypeMultipartyContract = "multiparty_contract"
 )
 
 // MultipartyContractService implements the business logic for multi-party N-vendor
@@ -27,7 +37,6 @@ type MultipartyContractService struct {
 	addenda   store.AddendumStore
 	tx        store.MultipartyTxManager
 	publisher events.Publisher
-	proofGen  ProofGenerator // optional; nil = skip proof generation
 }
 
 // NewMultipartyContractService returns a MultipartyContractService.
@@ -47,12 +56,6 @@ func NewMultipartyContractService(
 		tx:        tx,
 		publisher: publisher,
 	}
-}
-
-// WithProofGenerator sets the optional ProofGenerator on the MultipartyContractService.
-// When non-nil, a proof PDF is generated best-effort after a multiparty contract activates.
-func (s *MultipartyContractService) WithProofGenerator(pg ProofGenerator) {
-	s.proofGen = pg
 }
 
 // CreateOrAddPartyInput carries S2S-validated input for idempotent contract creation
@@ -153,7 +156,6 @@ func (s *MultipartyContractService) addPartyViaAddendum(
 	var (
 		resultContract *domain.MultipartyContract
 		resultParty    *domain.MultipartyContractParty
-		addendum       *domain.ContractAddendum
 	)
 
 	txErr := s.tx.WithMultipartyTx(ctx, func(
@@ -162,6 +164,7 @@ func (s *MultipartyContractService) addPartyViaAddendum(
 		txParties store.MultipartyPartyStore,
 		_ store.MultipartySignatureStore,
 		txAddenda store.AddendumStore,
+		txOutbox store.OutboxStore,
 	) error {
 		// Re-fetch under FOR UPDATE lock.
 		c, err := txContracts.GetByIDForUpdate(txCtx, contract.ID)
@@ -248,27 +251,55 @@ func (s *MultipartyContractService) addPartyViaAddendum(
 
 		resultContract = c
 		resultParty = newParty
-		addendum = a
 
-		return nil
+		return enqueueAddendumCreatedEvent(txCtx, txOutbox, c, a, in.VendorUserID, now)
 	})
 
 	if txErr != nil {
 		return nil, nil, txErr
 	}
 
-	// Post-tx publish (best-effort, detached goroutine with independent context).
-	// context.Background() is intentional: the request context is canceled when the
-	// HTTP handler returns; the publish goroutine must outlive the request.
-	capturedContract := resultContract
-	capturedAddendum := addendum
-	capturedVendor := in.VendorUserID
-	//nolint:contextcheck,gosec // intentional: goroutine must outlive the request context; G118 is the design intent
-	go func() {
-		s.publishAddendumCreated(context.Background(), capturedContract, capturedAddendum, capturedVendor)
-	}()
-
 	return resultContract, resultParty, nil
+}
+
+// enqueueAddendumCreatedEvent enqueues a MultipartyContractAddendumCreatedEvent into the
+// outbox. Extracted to keep addPartyViaAddendum below the cyclomatic-complexity ceiling.
+func enqueueAddendumCreatedEvent(
+	ctx context.Context,
+	ob store.OutboxStore,
+	c *domain.MultipartyContract,
+	a *domain.ContractAddendum,
+	newVendorUserID uuid.UUID,
+	now time.Time,
+) error {
+	evt := &domain.MultipartyContractAddendumCreatedEvent{
+		EventID:    uuid.New(),
+		OccurredAt: now,
+		Version:    1,
+	}
+	evt.Data.ContractID = c.ID
+	evt.Data.TenderID = c.TenderID
+	evt.Data.FromVersion = a.FromVersion
+	evt.Data.ToVersion = a.ToVersion
+	evt.Data.NewVendorUserID = newVendorUserID
+	evt.Data.PartyCount = c.PartyCount
+
+	payload, marshalErr := marshalEvent(evt)
+	if marshalErr != nil {
+		return fmt.Errorf("marshal addendum_created event: %w", marshalErr)
+	}
+
+	if enqErr := ob.Enqueue(ctx, &store.OutboxEnqueueInput{
+		AggregateType: "multiparty_contract",
+		AggregateID:   c.ID,
+		EventID:       evt.EventID,
+		Channel:       channelMultipartyAddendumCreated,
+		Payload:       payload,
+	}); enqErr != nil {
+		return fmt.Errorf("enqueue addendum_created event: %w", enqErr)
+	}
+
+	return nil
 }
 
 // getOrCreateContract fetches the live contract for a tender, or creates a new DRAFT.
@@ -336,6 +367,7 @@ func (s *MultipartyContractService) SubmitForSignatures(
 		txParties store.MultipartyPartyStore,
 		_ store.MultipartySignatureStore,
 		_ store.AddendumStore,
+		_ store.OutboxStore,
 	) error {
 		return s.submitForSignaturesTx(ctx, txContracts, txParties, contractID, callerUserID, &result)
 	})
@@ -448,34 +480,13 @@ func (s *MultipartyContractService) Sign(ctx context.Context, in SignInput) (*do
 		txParties store.MultipartyPartyStore,
 		txSigs store.MultipartySignatureStore,
 		_ store.AddendumStore,
+		txOutbox store.OutboxStore,
 	) error {
-		return s.signTx(ctx, txContracts, txParties, txSigs, in, &result, &preSignStatus)
+		return s.signTx(ctx, txContracts, txParties, txSigs, txOutbox, in, &result, &preSignStatus)
 	})
 
 	if txErr != nil {
 		return nil, txErr
-	}
-
-	// Best-effort event publish after tx commit.
-	// context.Background() is intentional: the request context is canceled when the
-	// HTTP handler returns; the publish goroutine must outlive the request.
-	if result != nil && result.Status == domain.MultipartyContractStatusActive {
-		capturedResult := result
-		capturedStatus := preSignStatus
-		// Capture proofGen synchronously (before spawning the goroutine) so the field
-		// read is ordered before any later WithProofGenerator setter call in the same
-		// goroutine; the background goroutine then uses only this captured value and
-		// never reads the mutable s.proofGen field concurrently (race-free).
-		capturedGen := s.proofGen
-
-		//nolint:contextcheck,gosec // intentional: goroutine must outlive the request context; G118 is the design intent
-		go func() {
-			if capturedStatus == domain.MultipartyContractStatusAddendumPending {
-				s.publishReSigned(context.Background(), capturedResult, capturedGen)
-			} else {
-				s.publishActivated(context.Background(), capturedResult, capturedGen)
-			}
-		}()
 	}
 
 	return result, nil
@@ -486,6 +497,7 @@ func (s *MultipartyContractService) signTx(
 	txContracts store.MultipartyContractStore,
 	txParties store.MultipartyPartyStore,
 	txSigs store.MultipartySignatureStore,
+	txOutbox store.OutboxStore,
 	in SignInput,
 	result **domain.MultipartyContract,
 	preSignStatus *domain.MultipartyContractStatus,
@@ -556,7 +568,7 @@ func (s *MultipartyContractService) signTx(
 	}
 
 	if c.PartyCount > 0 && sigCount == c.PartyCount {
-		if err := s.activateInTx(ctx, txContracts, c); err != nil {
+		if err := s.activateInTx(ctx, txContracts, txOutbox, c, *preSignStatus); err != nil {
 			return err
 		}
 	}
@@ -569,7 +581,9 @@ func (s *MultipartyContractService) signTx(
 func (s *MultipartyContractService) activateInTx(
 	ctx context.Context,
 	txContracts store.MultipartyContractStore,
+	txOutbox store.OutboxStore,
 	c *domain.MultipartyContract,
+	preSignStatus domain.MultipartyContractStatus,
 ) error {
 	if !domain.ValidMultipartyContractTransition(c.Status, domain.MultipartyContractStatusActive) {
 		return fmt.Errorf("%w: cannot transition multiparty contract to ACTIVE", domain.ErrInvalidTransition)
@@ -581,90 +595,103 @@ func (s *MultipartyContractService) activateInTx(
 		return fmt.Errorf("activate multiparty contract: %w", updateErr)
 	}
 
+	// Enqueue the correct activation event atomically with the state transition.
+	// preSignStatus determines which event: re-sign (after addendum) vs initial activation.
+	now := time.Now().UTC()
+
+	if preSignStatus == domain.MultipartyContractStatusAddendumPending {
+		evt := &domain.MultipartyContractReSignedEvent{
+			EventID:    uuid.New(),
+			OccurredAt: now,
+			Version:    1,
+		}
+		evt.Data.ContractID = c.ID
+		evt.Data.TenderID = c.TenderID
+		evt.Data.NewVersion = c.Version
+		evt.Data.PartyCount = c.PartyCount
+
+		payload, marshalErr := marshalEvent(evt)
+		if marshalErr != nil {
+			return fmt.Errorf("marshal contract_re_signed event: %w", marshalErr)
+		}
+
+		if enqErr := txOutbox.Enqueue(ctx, &store.OutboxEnqueueInput{
+			AggregateType: aggregateTypeMultipartyContract,
+			AggregateID:   c.ID,
+			EventID:       evt.EventID,
+			Channel:       channelMultipartyReSigned,
+			Payload:       payload,
+		}); enqErr != nil {
+			return fmt.Errorf("enqueue contract_re_signed event: %w", enqErr)
+		}
+
+		// Enqueue proof generation atomically with re-sign activation.
+		// At-least-once delivery is safe: GenerateAndStore supersedes an older version in place.
+		if proofErr := enqueueProofGeneration(ctx, txOutbox, c.ID, domain.ContractKindMultiparty); proofErr != nil {
+			return proofErr
+		}
+	} else {
+		evt := &domain.MultipartyContractActivatedEvent{
+			EventID:    uuid.New(),
+			OccurredAt: now,
+			Version:    1,
+		}
+		evt.Data.ContractID = c.ID
+		evt.Data.TenderID = c.TenderID
+		evt.Data.PartyCount = c.PartyCount
+
+		payload, marshalErr := marshalEvent(evt)
+		if marshalErr != nil {
+			return fmt.Errorf("marshal contract_activated event: %w", marshalErr)
+		}
+
+		if enqErr := txOutbox.Enqueue(ctx, &store.OutboxEnqueueInput{
+			AggregateType: aggregateTypeMultipartyContract,
+			AggregateID:   c.ID,
+			EventID:       evt.EventID,
+			Channel:       channelMultipartyActivated,
+			Payload:       payload,
+		}); enqErr != nil {
+			return fmt.Errorf("enqueue contract_activated event: %w", enqErr)
+		}
+
+		// Enqueue proof generation atomically with initial activation.
+		// At-least-once delivery is safe: GenerateAndStore is idempotent (same version = skip).
+		if proofErr := enqueueProofGeneration(ctx, txOutbox, c.ID, domain.ContractKindMultiparty); proofErr != nil {
+			return proofErr
+		}
+	}
+
 	return nil
 }
 
-func (s *MultipartyContractService) publishActivated(ctx context.Context, contract *domain.MultipartyContract, proofGen ProofGenerator) {
-	// Use the frozen party_count from the committed contract struct (set at SubmitForSignatures
-	// and preserved through activateInTx). A post-commit live re-read via ListActiveByContract
-	// can race with concurrent party mutations and return a different count than was committed.
-	// publishReSigned already uses contract.PartyCount for the same reason.
-	evt := &domain.MultipartyContractActivatedEvent{
-		EventID:    uuid.New(),
-		OccurredAt: time.Now().UTC(),
-		Version:    1,
-	}
-	evt.Data.ContractID = contract.ID
-	evt.Data.TenderID = contract.TenderID
-	evt.Data.PartyCount = contract.PartyCount
-
-	if pubErr := s.publisher.PublishMultipartyContractActivated(ctx, evt); pubErr != nil {
-		slog.Warn("publish multiparty contract_activated event failed",
-			"contract_id", contract.ID, "err", pubErr)
-	}
-
-	// Best-effort proof generation — runs in the same goroutine that called publishActivated
-	// (which itself runs in a goroutine with context.Background(), per the Sign() call site).
-	// proofGen is captured synchronously at the Sign() call site to avoid a race with
-	// WithProofGenerator.
-	if proofGen != nil {
-		if _, genErr := proofGen.GenerateAndStore(ctx, contract.ID, domain.ContractKindMultiparty); genErr != nil {
-			slog.Warn("multiparty proof generation failed (best-effort)",
-				"contract_id", contract.ID, "err", genErr)
-		}
-	}
-}
-
-func (s *MultipartyContractService) publishAddendumCreated(
+// enqueueProofGeneration enqueues a proof_generation_required entry for the given contract.
+// Extracted to keep activateInTx within the cyclomatic-complexity ceiling.
+func enqueueProofGeneration(
 	ctx context.Context,
-	contract *domain.MultipartyContract,
-	addendum *domain.ContractAddendum,
-	newVendorUserID uuid.UUID,
-) {
-	evt := &domain.MultipartyContractAddendumCreatedEvent{
-		EventID:    uuid.New(),
-		OccurredAt: time.Now().UTC(),
-		Version:    1,
-	}
-	evt.Data.ContractID = contract.ID
-	evt.Data.TenderID = contract.TenderID
-	evt.Data.FromVersion = addendum.FromVersion
-	evt.Data.ToVersion = addendum.ToVersion
-	evt.Data.NewVendorUserID = newVendorUserID
-	evt.Data.PartyCount = contract.PartyCount
-
-	if pubErr := s.publisher.PublishMultipartyContractAddendumCreated(ctx, evt); pubErr != nil {
-		slog.Warn("publish multiparty contract_addendum_created event failed",
-			"contract_id", contract.ID, "err", pubErr)
-	}
-}
-
-func (s *MultipartyContractService) publishReSigned(ctx context.Context, contract *domain.MultipartyContract, proofGen ProofGenerator) {
-	evt := &domain.MultipartyContractReSignedEvent{
-		EventID:    uuid.New(),
-		OccurredAt: time.Now().UTC(),
-		Version:    1,
-	}
-	evt.Data.ContractID = contract.ID
-	evt.Data.TenderID = contract.TenderID
-	evt.Data.NewVersion = contract.Version
-	evt.Data.PartyCount = contract.PartyCount
-
-	if pubErr := s.publisher.PublishMultipartyContractReSigned(ctx, evt); pubErr != nil {
-		slog.Warn("publish multiparty contract_re_signed event failed",
-			"contract_id", contract.ID, "err", pubErr)
+	ob store.OutboxStore,
+	contractID uuid.UUID,
+	kind domain.ContractKind,
+) error {
+	proofPayload, marshalErr := marshalEvent(ProofGenerationPayload{
+		ContractID: contractID,
+		Kind:       string(kind),
+	})
+	if marshalErr != nil {
+		return fmt.Errorf("marshal proof_generation_required payload: %w", marshalErr)
 	}
 
-	// Best-effort proof re-generation for addendum re-sign path (ADDENDUM_PENDING → ACTIVE).
-	// The existing v1 proof row is superseded with a new PDF at the new contract version.
-	// Runs in the same goroutine that called publishReSigned (which is already a background
-	// goroutine with context.Background() from the Sign() call site).
-	if proofGen != nil {
-		if _, genErr := proofGen.GenerateAndStore(ctx, contract.ID, domain.ContractKindMultiparty); genErr != nil {
-			slog.Warn("multiparty proof re-generation failed after addendum re-sign (best-effort)",
-				"contract_id", contract.ID, "err", genErr)
-		}
+	if enqErr := ob.Enqueue(ctx, &store.OutboxEnqueueInput{
+		AggregateType: aggregateTypeMultipartyContract,
+		AggregateID:   contractID,
+		EventID:       uuid.New(),
+		Channel:       ChannelProofGenerationRequired,
+		Payload:       proofPayload,
+	}); enqErr != nil {
+		return fmt.Errorf("enqueue proof_generation_required: %w", enqErr)
 	}
+
+	return nil
 }
 
 // PartyView is the read model for a party in the contract roster.
@@ -811,6 +838,7 @@ func (s *MultipartyContractService) UpdatePartyShare(
 		txParties store.MultipartyPartyStore,
 		_ store.MultipartySignatureStore,
 		_ store.AddendumStore,
+		_ store.OutboxStore,
 	) error {
 		// FOR UPDATE lock: prevents a concurrent SubmitForSignatures from freezing
 		// the digest between our status check and the share write.

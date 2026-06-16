@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"regexp"
 	"time"
 
@@ -13,6 +12,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 )
+
+// channelMilestoneCompleted is the Redis pub/sub channel for the contract_completed event.
+// Must stay in sync with events.channelContractCompleted.
+const channelMilestoneCompleted = "workspace.contract_completed"
 
 // MilestoneService implements business logic for multiparty contract milestones.
 // Milestone management is restricted to the contract's poster (tender owner).
@@ -183,6 +186,7 @@ func (s *MilestoneService) CompleteMilestone(ctx context.Context, in CompleteMil
 		txCtx context.Context,
 		txContracts store.MultipartyContractStore,
 		txMilestones store.MilestoneStore,
+		txOutbox store.OutboxStore,
 	) error {
 		// FOR UPDATE lock: serializes CompleteMilestone with concurrent CancelContract.
 		// Re-fetch the contract under lock so the status check and the milestone write
@@ -213,11 +217,34 @@ func (s *MilestoneService) CompleteMilestone(ctx context.Context, in CompleteMil
 		}
 
 		completed = m
-		// Capture the LOCKED row (post-guard) for publishCompleted so TenderID and
-		// ContractID reflect the committed state. Only ContractID and TenderID are used
-		// today; capturing the locked row removes future-staleness risk if more fields
-		// are added to publishCompleted.
 		lockedContract = c
+
+		// Enqueue the contract_completed event atomically with the milestone write.
+		evt := &domain.MultipartyContractCompletedEvent{
+			EventID:    uuid.New(),
+			OccurredAt: completedAt,
+			Version:    1,
+		}
+		evt.Data.ContractID = c.ID
+		evt.Data.TenderID = c.TenderID
+		evt.Data.MilestoneID = m.ID
+		evt.Data.Amount = m.Amount
+		evt.Data.Currency = m.Currency
+
+		payload, marshalErr := marshalEvent(evt)
+		if marshalErr != nil {
+			return fmt.Errorf("marshal contract_completed event: %w", marshalErr)
+		}
+
+		if enqErr := txOutbox.Enqueue(txCtx, &store.OutboxEnqueueInput{
+			AggregateType: "milestone",
+			AggregateID:   m.ID,
+			EventID:       evt.EventID,
+			Channel:       channelMilestoneCompleted,
+			Payload:       payload,
+		}); enqErr != nil {
+			return fmt.Errorf("enqueue contract_completed event: %w", enqErr)
+		}
 
 		return nil
 	})
@@ -226,15 +253,7 @@ func (s *MilestoneService) CompleteMilestone(ctx context.Context, in CompleteMil
 		return nil, txErr
 	}
 
-	// Best-effort publish OUTSIDE the transaction (post-commit).
-	// context.Background() is intentional: the request context is canceled when the
-	// HTTP handler returns; the publish must outlive the request.
-	capturedContract := lockedContract
-	capturedMilestone := completed
-	//nolint:contextcheck,gosec // G118: intentional — goroutine must outlive the request context; context.Background() is the design intent
-	go func() {
-		s.publishCompleted(context.Background(), capturedContract, capturedMilestone)
-	}()
+	_ = lockedContract // retained to avoid future-staleness risk if callers need it later
 
 	return completed, nil
 }
@@ -300,30 +319,6 @@ func (s *MilestoneService) GetMilestoneAmountsSum(ctx context.Context, contractI
 	}
 
 	return sum, nil
-}
-
-// publishCompleted publishes the workspace.contract_completed event.
-// Best-effort: logs a warning on failure, does not propagate the error.
-func (s *MilestoneService) publishCompleted(ctx context.Context, contract *domain.MultipartyContract, m *domain.Milestone) {
-	evt := &domain.MultipartyContractCompletedEvent{
-		EventID:    uuid.New(),
-		OccurredAt: time.Now().UTC(),
-		Version:    1,
-	}
-	evt.Data.ContractID = contract.ID
-	evt.Data.TenderID = contract.TenderID
-	evt.Data.MilestoneID = m.ID
-	evt.Data.Amount = m.Amount
-	evt.Data.Currency = m.Currency
-
-	if pubErr := s.publisher.PublishMultipartyContractCompleted(ctx, evt); pubErr != nil {
-		slog.Warn(
-			"publish contract_completed event failed",
-			"contract_id", contract.ID,
-			"milestone_id", m.ID,
-			"err", pubErr,
-		)
-	}
 }
 
 // assertContractOwner returns ErrNotContractOwner if the caller is not the contract poster.

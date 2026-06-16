@@ -10,20 +10,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/CoverOnes/workspace/internal/client"
 	"github.com/CoverOnes/workspace/internal/domain"
+	"github.com/CoverOnes/workspace/internal/fileclient"
 	"github.com/CoverOnes/workspace/internal/store"
 	"github.com/google/uuid"
 )
 
-// ProofGenerator is a small interface that ContractService and MultipartyContractService
-// use to trigger best-effort proof generation without importing the full ProofService.
-// Inject as an optional dependency (nil = skip proof generation).
-type ProofGenerator interface {
-	// GenerateAndStore generates a tamper-evidence signed-contract proof PDF, stores it
-	// via the file service, and records a contract_proofs row. Version-aware idempotent:
-	// same version → return existing; older version → supersede with new PDF.
-	GenerateAndStore(ctx context.Context, contractID uuid.UUID, kind domain.ContractKind) (*domain.ContractProof, error)
+// proofFileClient is the narrow interface ProofService uses to interact with the
+// file service. Using fileclient types directly (no mirroring) so *fileclient.Client
+// satisfies this interface without an adapter.
+// proofFileClient is unexported; callers assign concrete types via ProofServiceConfig.FileClient.
+type proofFileClient interface {
+	// StoreSystemFile stores a system-generated file and returns its assigned IDs.
+	StoreSystemFile(ctx context.Context, in fileclient.StoreSystemFileInput) (*fileclient.StoreSystemFileResult, error)
+	// PresignDownload returns a short-lived / TTL-limited presigned download URL for a stored file.
+	PresignDownload(ctx context.Context, fileID uuid.UUID) (url string, ttlSeconds int, err error)
 }
 
 // ProofServiceConfig holds all dependencies for constructing a ProofService.
@@ -42,8 +43,9 @@ type ProofServiceConfig struct {
 	MultipartyPartyStore store.MultipartyPartyStore
 	// MultipartySignatureStore reads multiparty signatures for the proof document.
 	MultipartySignatureStore store.MultipartySignatureStore
-	// FileClient stores the generated PDF and produces presigned download URLs.
-	FileClient client.FileClient
+	// FileClient stores the generated PDF and produces short-lived / TTL-limited
+	// presigned download URLs. Must implement proofFileClient.
+	FileClient proofFileClient
 }
 
 // ProofService orchestrates proof generation, storage, and download URL issuance
@@ -56,7 +58,7 @@ type ProofService struct {
 	mpContracts store.MultipartyContractStore
 	mpParties   store.MultipartyPartyStore
 	mpSigs      store.MultipartySignatureStore
-	fileClient  client.FileClient
+	fileClient  proofFileClient
 }
 
 // NewProofService returns a ProofService. Returns an error if any required dependency
@@ -237,7 +239,7 @@ func (s *ProofService) supersede(
 func (s *ProofService) renderUpload(
 	ctx context.Context,
 	doc *domain.ProofDocument,
-) (string, *client.StoreSystemFileResult, error) {
+) (string, *fileclient.StoreSystemFileResult, error) {
 	pdfBytes, err := RenderProofPDF(doc)
 	if err != nil {
 		return "", nil, fmt.Errorf("render proof PDF: %w", err)
@@ -252,7 +254,7 @@ func (s *ProofService) renderUpload(
 	objectKeyHint := fmt.Sprintf("contract-proof/%s/%s/v%d.pdf",
 		doc.ContractID, doc.ContractKind, doc.Version)
 
-	storeResult, err := s.fileClient.StoreSystemFile(ctx, client.StoreSystemFileInput{
+	storeResult, err := s.fileClient.StoreSystemFile(ctx, fileclient.StoreSystemFileInput{
 		ContentType:   "application/pdf",
 		Filename:      fmt.Sprintf("contract-proof-%s.pdf", doc.ContractID),
 		Data:          pdfBytes,
@@ -265,7 +267,7 @@ func (s *ProofService) renderUpload(
 	return sha256Hex, storeResult, nil
 }
 
-// GetDownloadURL returns a single-use presigned download URL for a contract proof.
+// GetDownloadURL returns a short-lived / TTL-limited presigned download URL for a contract proof.
 // Authz: the caller MUST be a party to the contract; non-parties receive domain.ErrForbidden.
 //
 // Parameters:

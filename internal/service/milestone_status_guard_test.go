@@ -12,7 +12,6 @@ package service_test
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/CoverOnes/workspace/internal/domain"
 	"github.com/CoverOnes/workspace/internal/service"
@@ -134,9 +133,6 @@ func TestCompleteMilestone_RequiresActiveContract(t *testing.T) {
 			require.NoError(t, env.contractStore.Update(ctx, contract),
 				"force-set contract status to %s for test", tc.status)
 
-			// Capture event count before the attempt.
-			eventsBefore := len(env.pub.completed)
-
 			_, err = env.milestoneSvc.CompleteMilestone(ctx, service.CompleteMilestoneInput{
 				ContractID:  contract.ID,
 				MilestoneID: m.ID,
@@ -146,10 +142,12 @@ func TestCompleteMilestone_RequiresActiveContract(t *testing.T) {
 			assert.ErrorIs(t, err, domain.ErrInvalidTransition,
 				"CompleteMilestone on %s contract must return ErrInvalidTransition", tc.status)
 
-			// Critical: no workspace.contract_completed event must have been emitted.
-			// This is the disbursement event consumed by the payment service.
-			assert.Equal(t, eventsBefore, len(env.pub.completed),
-				"CompleteMilestone on %s contract must NOT emit a disbursement event", tc.status)
+			// Critical: no workspace.contract_completed event must be enqueued in the
+			// outbox when CompleteMilestone fails (tx rollback must prevent enqueue).
+			// The outbox uses m.ID (milestone ID) as aggregate_id for this event.
+			assert.Equal(t, 0,
+				countOutboxEntries(ctx, t, m.ID.String(), "workspace.contract_completed"),
+				"CompleteMilestone on %s contract must NOT enqueue a disbursement event", tc.status)
 		})
 	}
 
@@ -168,13 +166,11 @@ func TestCompleteMilestone_RequiresActiveContract(t *testing.T) {
 		require.NoError(t, err, "CompleteMilestone on ACTIVE contract must succeed")
 		assert.Equal(t, domain.MilestoneStatusCompleted, completed.Status)
 
-		// publishCompleted runs in a best-effort detached goroutine. Poll with a
-		// generous timeout so we don't flake on loaded CI.
-		require.Eventually(t, func() bool { return env.pub.count() == 1 },
-			2*time.Second, 5*time.Millisecond,
-			"CompleteMilestone on ACTIVE contract must emit exactly one disbursement event within 2 s")
-
-		assert.Equal(t, 1, env.pub.count(),
-			"CompleteMilestone on ACTIVE contract must emit exactly one disbursement event")
+		// CompleteMilestone enqueues atomically in the same tx; the outbox row is
+		// present immediately after the call — no polling needed.
+		// The outbox uses m.ID (milestone ID) as aggregate_id for this event.
+		assert.Equal(t, 1,
+			countOutboxEntries(ctx, t, m.ID.String(), "workspace.contract_completed"),
+			"CompleteMilestone on ACTIVE contract must enqueue exactly one disbursement event")
 	})
 }
