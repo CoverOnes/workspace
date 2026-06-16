@@ -171,6 +171,28 @@ var privateNets = func() []*net.IPNet {
 	return nets
 }()
 
+// maxRedirects caps the redirect chain the file-service client will follow.
+const maxRedirects = 5
+
+// checkRedirectStripToken prevents the S2S token from leaking to a different host via
+// an HTTP redirect: Go does not strip custom headers (only Authorization/Cookie) on a
+// cross-origin redirect, so if the file service issues a 3xx to a different host the
+// X-Service-Token header is removed before the redirected request is sent. It also caps
+// the redirect chain to defend against redirect loops.
+func checkRedirectStripToken(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("fileclient: stopped after %d redirects", maxRedirects)
+	}
+
+	// Compare against the original request's host: the token is only ever sent to the
+	// configured file-service origin, never to a host it redirects us to.
+	if len(via) > 0 && req.URL.Host != via[0].URL.Host {
+		req.Header.Del("X-Service-Token")
+	}
+
+	return nil
+}
+
 // New returns a Client configured from cfg.
 // Callers should validate cfg with config.Config.validate() before calling New.
 // The returned Client's HTTP transport includes a DNS-rebinding guard that validates
@@ -187,8 +209,9 @@ func New(cfg Config) *Client {
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
 		httpClient = &http.Client{
-			Timeout:   defaultHTTPTimeout,
-			Transport: newSSRFGuardTransport(cfg.BlockPrivateIPs),
+			Timeout:       defaultHTTPTimeout,
+			Transport:     newSSRFGuardTransport(cfg.BlockPrivateIPs),
+			CheckRedirect: checkRedirectStripToken,
 		}
 	}
 
