@@ -181,7 +181,7 @@ func buildContractRouter(cs *stubContractStoreH) *gin.Engine {
 	tx := &stubTxH{contracts: cs, sigs: ss}
 	pub := events.NewNoopPublisher()
 
-	svc := service.NewContractService(cs, ss, tx, pub, nil)
+	svc := service.NewContractService(cs, ss, tx, pub, nil, false)
 	h := handler.NewContractHandler(svc)
 	internalH := handler.NewInternalContractHandler(svc)
 
@@ -216,7 +216,7 @@ func makeHandlerContract(clientID, freelancerID uuid.UUID, status domain.Contrac
 	cid := uuid.New()
 	hash := domain.CanonicalContractDigest(
 		cid.String(), clientID.String(), freelancerID.String(),
-		"Test Contract", "Terms body", amount.StringFixed(2), "TWD", 1,
+		"Test Contract", "Terms body", amount.StringFixed(2), testCurrencyTWD, 1,
 	)
 
 	return &domain.Contract{
@@ -228,7 +228,7 @@ func makeHandlerContract(clientID, freelancerID uuid.UUID, status domain.Contrac
 		Title:            "Test Contract",
 		Terms:            "Terms body",
 		Amount:           amount,
-		Currency:         "TWD",
+		Currency:         testCurrencyTWD,
 		ContentHash:      hash,
 		Version:          1,
 		Status:           status,
@@ -247,12 +247,12 @@ func TestPublicContractCreate_Removed(t *testing.T) {
 	r := buildContractRouter(cs)
 
 	body, _ := json.Marshal(map[string]any{
-		"listingId":        uuid.New().String(),
-		"acceptedBidId":    uuid.New().String(),
-		"freelancerUserId": uuid.New().String(), // attacker-controlled
-		"title":            "Malicious Contract",
-		"amount":           "0.01", // attacker-controlled amount
-		"currency":         "TWD",
+		testKeyListingID:        uuid.New().String(),
+		"acceptedBidId":         uuid.New().String(),
+		testKeyFreelancerUserID: uuid.New().String(), // attacker-controlled
+		testKeyTitle:            "Malicious Contract",
+		testKeyAmount:           "0.01", // attacker-controlled amount
+		testKeyCurrency:         testCurrencyTWD,
 	})
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/contracts", bytes.NewReader(body))
@@ -287,26 +287,26 @@ func TestInternalContractCreate(t *testing.T) {
 			name:  "valid service token and payload creates contract",
 			token: testServiceToken,
 			body: map[string]any{
-				"listingId":        uuid.New().String(),
-				"awardBidId":       uuid.New().String(),
-				"clientUserId":     ownerID.String(),
-				"freelancerUserId": freelancerID.String(),
-				"amount":           "5000.00",
-				"currency":         "TWD",
+				testKeyListingID:        uuid.New().String(),
+				testKeyAwardBidID:       uuid.New().String(),
+				testKeyClientUserID:     ownerID.String(),
+				testKeyFreelancerUserID: freelancerID.String(),
+				testKeyAmount:           "5000.00",
+				testKeyCurrency:         testCurrencyTWD,
 			},
 			wantStatus: http.StatusCreated,
 		},
 		{
 			name:       "missing service token returns 401",
 			token:      "",
-			body:       map[string]any{"listingId": uuid.New().String()},
+			body:       map[string]any{testKeyListingID: uuid.New().String()},
 			wantStatus: http.StatusUnauthorized,
 			wantCode:   "UNAUTHORIZED",
 		},
 		{
 			name:       "wrong service token returns 403",
 			token:      "wrong-token",
-			body:       map[string]any{"listingId": uuid.New().String()},
+			body:       map[string]any{testKeyListingID: uuid.New().String()},
 			wantStatus: http.StatusForbidden,
 			wantCode:   "FORBIDDEN",
 		},
@@ -314,43 +314,43 @@ func TestInternalContractCreate(t *testing.T) {
 			name:  "invalid clientUserId UUID returns 400",
 			token: testServiceToken,
 			body: map[string]any{
-				"listingId":        uuid.New().String(),
-				"awardBidId":       uuid.New().String(),
-				"clientUserId":     "not-a-uuid",
-				"freelancerUserId": freelancerID.String(),
-				"amount":           "5000.00",
-				"currency":         "TWD",
+				testKeyListingID:        uuid.New().String(),
+				testKeyAwardBidID:       uuid.New().String(),
+				testKeyClientUserID:     "not-a-uuid",
+				testKeyFreelancerUserID: freelancerID.String(),
+				testKeyAmount:           "5000.00",
+				testKeyCurrency:         testCurrencyTWD,
 			},
 			wantStatus: http.StatusBadRequest,
-			wantCode:   "VALIDATION_ERROR",
+			wantCode:   testErrCodeValidation,
 		},
 		{
 			name:  "non-decimal amount returns 400",
 			token: testServiceToken,
 			body: map[string]any{
-				"listingId":        uuid.New().String(),
-				"awardBidId":       uuid.New().String(),
-				"clientUserId":     ownerID.String(),
-				"freelancerUserId": freelancerID.String(),
-				"amount":           "not-a-number",
-				"currency":         "TWD",
+				testKeyListingID:        uuid.New().String(),
+				testKeyAwardBidID:       uuid.New().String(),
+				testKeyClientUserID:     ownerID.String(),
+				testKeyFreelancerUserID: freelancerID.String(),
+				testKeyAmount:           "not-a-number",
+				testKeyCurrency:         testCurrencyTWD,
 			},
 			wantStatus: http.StatusBadRequest,
-			wantCode:   "VALIDATION_ERROR",
+			wantCode:   testErrCodeValidation,
 		},
 		{
 			name:  "client == freelancer returns 400 (same-party contract rejected)",
 			token: testServiceToken,
 			body: map[string]any{
-				"listingId":        uuid.New().String(),
-				"awardBidId":       uuid.New().String(),
-				"clientUserId":     ownerID.String(),
-				"freelancerUserId": ownerID.String(), // same person
-				"amount":           "1000.00",
-				"currency":         "TWD",
+				testKeyListingID:        uuid.New().String(),
+				testKeyAwardBidID:       uuid.New().String(),
+				testKeyClientUserID:     ownerID.String(),
+				testKeyFreelancerUserID: ownerID.String(), // same person
+				testKeyAmount:           "1000.00",
+				testKeyCurrency:         testCurrencyTWD,
 			},
 			wantStatus: http.StatusBadRequest,
-			wantCode:   "VALIDATION_ERROR",
+			wantCode:   testErrCodeValidation,
 		},
 	}
 
@@ -420,14 +420,14 @@ func TestContractHandler_GetByID_IDOR(t *testing.T) {
 			callerID:   thirdPartyID,
 			contractID: contract.ID.String(),
 			wantStatus: http.StatusNotFound,
-			wantCode:   "NOT_FOUND",
+			wantCode:   testErrCodeNotFound,
 		},
 		{
 			name:       "invalid id returns 400",
 			callerID:   clientID,
 			contractID: "not-a-uuid",
 			wantStatus: http.StatusBadRequest,
-			wantCode:   "VALIDATION_ERROR",
+			wantCode:   testErrCodeValidation,
 		},
 	}
 

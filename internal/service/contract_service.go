@@ -16,15 +16,21 @@ import (
 // channelContractActivated is the Redis pub/sub channel for the 1:1 dual-sign contract.
 // Kept in sync with events.channelContractActivated; duplicated here so the service
 // package can reference it without importing the events package for the channel name alone.
-const channelContractActivated = "workspace.contract_activated"
+const (
+	channelContractActivated = "workspace.contract_activated"
+
+	// aggregateTypeContract is the outbox aggregate_type for bilateral contracts.
+	aggregateTypeContract = "contract"
+)
 
 // ContractService handles contract business logic.
 type ContractService struct {
-	contracts store.ContractStore
-	sigs      store.SignatureStore
-	tx        store.TxManager
-	publisher events.Publisher // retained for constructor API stability; outbox is now the publish path
-	files     fileRegistrar    // may be nil when file service is not configured
+	contracts    store.ContractStore
+	sigs         store.SignatureStore
+	tx           store.TxManager
+	publisher    events.Publisher // retained for constructor API stability; outbox is now the publish path
+	files        fileRegistrar    // may be nil when file service is not configured
+	proofEnabled bool             // true when the file service is configured; gates proof enqueue
 }
 
 // fileRegistrar is the subset of fileclient.Client needed by ContractService.
@@ -35,19 +41,24 @@ type fileRegistrar interface {
 
 // NewContractService returns a ContractService.
 // files may be nil when the file service is not configured (dev environments).
+// proofEnabled should be cfg.FileServiceEnabled(): when false the activation path skips
+// the proof_generation_required outbox enqueue, preventing silent phantom entries that
+// would be dispatched to a NoopPublisher and never actually generate a proof.
 func NewContractService(
 	contracts store.ContractStore,
 	sigs store.SignatureStore,
 	tx store.TxManager,
 	publisher events.Publisher,
 	files fileRegistrar,
+	proofEnabled bool,
 ) *ContractService {
 	return &ContractService{
-		contracts: contracts,
-		sigs:      sigs,
-		tx:        tx,
-		publisher: publisher,
-		files:     files,
+		contracts:    contracts,
+		sigs:         sigs,
+		tx:           tx,
+		publisher:    publisher,
+		files:        files,
+		proofEnabled: proofEnabled,
 	}
 }
 
@@ -406,52 +417,10 @@ func (s *ContractService) SignContract(ctx context.Context, in SignContractInput
 
 			// Both parties (CLIENT + FREELANCER) have now signed.
 			// State machine: PENDING_SIGNATURE -> SIGNED -> ACTIVE (two-step, both in same tx).
+			// Extracted to activateBilateralContract to stay within cyclomatic complexity budget.
 			if count >= 2 {
-				// Step 1: transition to SIGNED (validates the PENDING_SIGNATURE -> SIGNED edge).
-				if !domain.ValidContractTransition(c.Status, domain.ContractStatusSigned) {
-					return fmt.Errorf("%w: cannot transition to SIGNED", domain.ErrInvalidTransition)
-				}
-
-				c.Status = domain.ContractStatusSigned
-
-				// Step 2: auto-promote SIGNED -> ACTIVE in the same tx.
-				if !domain.ValidContractTransition(c.Status, domain.ContractStatusActive) {
-					return fmt.Errorf("%w: cannot transition to ACTIVE", domain.ErrInvalidTransition)
-				}
-
-				activatedAt := now
-				c.Status = domain.ContractStatusActive
-				c.ActivatedAt = &activatedAt
-
-				if updateErr := txContracts.Update(ctx, c); updateErr != nil {
-					return fmt.Errorf("activate contract: %w", updateErr)
-				}
-
-				// Enqueue event atomically with the state transition (transactional outbox).
-				evt := &domain.ContractActivatedEvent{
-					EventID:    uuid.New(),
-					OccurredAt: now,
-					Version:    1,
-				}
-				evt.Data.ContractID = c.ID
-				evt.Data.ListingID = c.ListingID
-				evt.Data.AcceptedBidID = c.AcceptedBidID
-				evt.Data.ClientUserID = c.ClientUserID
-				evt.Data.FreelancerUserID = c.FreelancerUserID
-
-				payload, marshalErr := marshalEvent(evt)
-				if marshalErr != nil {
-					return fmt.Errorf("marshal contract_activated event: %w", marshalErr)
-				}
-
-				if enqErr := txOutbox.Enqueue(ctx, &store.OutboxEnqueueInput{
-					AggregateType: "contract",
-					AggregateID:   c.ID,
-					EventID:       evt.EventID,
-					Channel:       channelContractActivated,
-					Payload:       payload,
-				}); enqErr != nil {
-					return fmt.Errorf("enqueue contract_activated event: %w", enqErr)
+				if err := activateBilateralContract(ctx, txContracts, txOutbox, c, now, s.proofEnabled); err != nil {
+					return err
 				}
 			}
 
@@ -580,4 +549,97 @@ func (s *ContractService) CancelContract(ctx context.Context, id, callerID uuid.
 	}
 
 	return result, nil
+}
+
+// activateBilateralContract performs the two-step PENDING_SIGNATURE -> SIGNED -> ACTIVE
+// transition and enqueues both the contract_activated and proof_generation_required outbox
+// events atomically. Extracted to keep SignContract's cyclomatic complexity in budget.
+//
+//   - txContracts:  in-transaction ContractStore (must be called inside WithTx)
+//   - txOutbox:     in-transaction OutboxStore
+//   - c:            the contract record being activated (mutated in-place)
+//   - now:          frozen UTC timestamp used for ActivatedAt
+//   - proofEnabled: when false, the proof_generation_required entry is skipped.
+//     Must be set from cfg.FileServiceEnabled() so phantom outbox entries are not
+//     created when no handler is registered (would be silently consumed by NoopPublisher).
+func activateBilateralContract(
+	ctx context.Context,
+	txContracts store.ContractStore,
+	txOutbox store.OutboxStore,
+	c *domain.Contract,
+	now time.Time,
+	proofEnabled bool,
+) error {
+	// Step 1: transition to SIGNED (validates the PENDING_SIGNATURE -> SIGNED edge).
+	if !domain.ValidContractTransition(c.Status, domain.ContractStatusSigned) {
+		return fmt.Errorf("%w: cannot transition to SIGNED", domain.ErrInvalidTransition)
+	}
+
+	c.Status = domain.ContractStatusSigned
+
+	// Step 2: auto-promote SIGNED -> ACTIVE in the same tx.
+	if !domain.ValidContractTransition(c.Status, domain.ContractStatusActive) {
+		return fmt.Errorf("%w: cannot transition to ACTIVE", domain.ErrInvalidTransition)
+	}
+
+	activatedAt := now
+	c.Status = domain.ContractStatusActive
+	c.ActivatedAt = &activatedAt
+
+	if updateErr := txContracts.Update(ctx, c); updateErr != nil {
+		return fmt.Errorf("activate contract: %w", updateErr)
+	}
+
+	// Enqueue contract_activated event atomically with the state transition.
+	evt := &domain.ContractActivatedEvent{
+		EventID:    uuid.New(),
+		OccurredAt: now,
+		Version:    1,
+	}
+	evt.Data.ContractID = c.ID
+	evt.Data.ListingID = c.ListingID
+	evt.Data.AcceptedBidID = c.AcceptedBidID
+	evt.Data.ClientUserID = c.ClientUserID
+	evt.Data.FreelancerUserID = c.FreelancerUserID
+
+	payload, marshalErr := marshalEvent(evt)
+	if marshalErr != nil {
+		return fmt.Errorf("marshal contract_activated event: %w", marshalErr)
+	}
+
+	if enqErr := txOutbox.Enqueue(ctx, &store.OutboxEnqueueInput{
+		AggregateType: aggregateTypeContract,
+		AggregateID:   c.ID,
+		EventID:       evt.EventID,
+		Channel:       channelContractActivated,
+		Payload:       payload,
+	}); enqErr != nil {
+		return fmt.Errorf("enqueue contract_activated event: %w", enqErr)
+	}
+
+	// Enqueue proof generation atomically with activation — only when the file service
+	// is configured. Without a registered handler the entry would be relayed to the
+	// NoopPublisher and silently consumed, meaning proof would never be generated even
+	// after the file service is enabled later. Skipping here prevents phantom entries.
+	if proofEnabled {
+		proofPayload, proofMarshalErr := marshalEvent(ProofGenerationPayload{
+			ContractID: c.ID,
+			Kind:       string(domain.ContractKindBilateral),
+		})
+		if proofMarshalErr != nil {
+			return fmt.Errorf("marshal proof_generation_required payload: %w", proofMarshalErr)
+		}
+
+		if enqErr := txOutbox.Enqueue(ctx, &store.OutboxEnqueueInput{
+			AggregateType: aggregateTypeContract,
+			AggregateID:   c.ID,
+			EventID:       uuid.New(),
+			Channel:       ChannelProofGenerationRequired,
+			Payload:       proofPayload,
+		}); enqErr != nil {
+			return fmt.Errorf("enqueue proof_generation_required: %w", enqErr)
+		}
+	}
+
+	return nil
 }

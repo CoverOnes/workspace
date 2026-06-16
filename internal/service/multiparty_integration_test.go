@@ -57,7 +57,7 @@ func startMultipartyTestDB(t *testing.T, _ context.Context) *multipartyTestEnv {
 	addendaStore := postgres.NewAddendumStore(pool)
 	pub := events.NewNoopPublisher()
 
-	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, addendaStore, mpTx, pub)
+	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, addendaStore, mpTx, pub, false)
 
 	return &multipartyTestEnv{
 		mpSvc:         mpSvc,

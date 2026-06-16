@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"time"
@@ -159,6 +160,32 @@ ORDER BY seq ASC
 	}
 
 	return entries, nil
+}
+
+// TailHash returns the hash of the most-recent audit log entry for contractID,
+// or "" when no entries exist (genesis state).
+// This is a pool-backed read (no advisory lock needed for a point-in-time snapshot).
+func (s *AuditLogStore) TailHash(ctx context.Context, contractID uuid.UUID) (string, error) {
+	const q = `
+SELECT hash
+FROM contract_audit_logs
+WHERE contract_id = $1
+ORDER BY seq DESC
+LIMIT 1
+`
+
+	var h string
+
+	err := s.pool.QueryRow(ctx, q, contractID).Scan(&h)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) { //nolint:errorlint // pgx.ErrNoRows is not wrapped; direct comparison is idiomatic
+			return "", nil // no entries — genesis; empty string is valid and expected
+		}
+
+		return "", fmt.Errorf("tail hash for contract %s: %w", contractID, err)
+	}
+
+	return h, nil
 }
 
 // tailHash returns the hash of the highest-seq entry for contractID, or "" if none.

@@ -13,6 +13,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testHeaderUserID is the header name used by the identity middleware.
+// The production constant (headerUserID) is unexported in package middleware,
+// so this external test package must define its own copy.
+const testHeaderUserID = "X-User-Id"
+
 func TestRequireValidIdentity(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -30,20 +35,20 @@ func TestRequireValidIdentity(t *testing.T) {
 		},
 		{
 			name:       "invalid UUID returns 401",
-			headers:    map[string]string{"X-User-Id": "not-a-uuid"},
+			headers:    map[string]string{testHeaderUserID: "not-a-uuid"},
 			wantStatus: http.StatusUnauthorized,
 			wantCode:   "UNAUTHORIZED",
 		},
 		{
 			name:       "valid UUID passes through",
-			headers:    map[string]string{"X-User-Id": uuid.New().String()},
+			headers:    map[string]string{testHeaderUserID: uuid.New().String()},
 			wantStatus: http.StatusOK,
 		},
 		{
 			name: "valid UUID with tier passes through",
 			headers: map[string]string{
-				"X-User-Id":  uuid.New().String(),
-				"X-Kyc-Tier": "2",
+				testHeaderUserID: uuid.New().String(),
+				"X-Kyc-Tier":     "2",
 			},
 			wantStatus: http.StatusOK,
 		},
@@ -133,7 +138,7 @@ func TestRequireTier(t *testing.T) {
 			})
 
 			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/test", http.NoBody)
-			req.Header.Set("X-User-Id", uuid.New().String())
+			req.Header.Set(testHeaderUserID, uuid.New().String())
 
 			if tc.tier != "" {
 				req.Header.Set("X-Kyc-Tier", tc.tier)
@@ -163,7 +168,7 @@ func TestIdentityFromCtx(t *testing.T) {
 
 		userID := uuid.New()
 		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/test", http.NoBody)
-		req.Header.Set("X-User-Id", userID.String())
+		req.Header.Set(testHeaderUserID, userID.String())
 		req.Header.Set("X-Kyc-Tier", "2")
 		req.Header.Set("X-Account-Type", "PROFESSIONAL")
 

@@ -76,9 +76,10 @@ func TestSignatureAttachment_Integration_RegisterAndPresign(t *testing.T) {
 	defer stub.close()
 
 	fc := fileclient.New(fileclient.Config{
-		BaseURL:   stub.server.URL,
-		ServiceID: "workspace",
-		Token:     "test-token-that-is-long-enough-32c",
+		BaseURL:    stub.server.URL,
+		ServiceID:  "workspace",
+		Token:      "test-token-that-is-long-enough-32c",
+		HTTPClient: stub.server.Client(), // bypass SSRF guard for loopback test server
 	})
 
 	ctx := context.Background()
@@ -88,7 +89,7 @@ func TestSignatureAttachment_Integration_RegisterAndPresign(t *testing.T) {
 	txMgr := postgres.NewTxManager(sharedServicePool)
 	pub := &fakePublisher{}
 
-	contractSvc := service.NewContractService(contractStore, sigStore, txMgr, pub, fc)
+	contractSvc := service.NewContractService(contractStore, sigStore, txMgr, pub, fc, false)
 	sigSvc := service.NewSignatureService(contractStore, sigStore, fc)
 
 	// Truncate tables for test isolation.

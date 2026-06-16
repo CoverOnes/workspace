@@ -26,7 +26,7 @@ func buildSignatureRouter(cs *stubContractStoreH) *gin.Engine {
 	tx := &stubTxH{contracts: cs, sigs: ss}
 	pub := events.NewNoopPublisher()
 
-	contractSvc := service.NewContractService(cs, ss, tx, pub, nil)
+	contractSvc := service.NewContractService(cs, ss, tx, pub, nil, false)
 	signatureSvc := service.NewSignatureService(cs, ss, nil)
 	signatureH := handler.NewSignatureHandler(contractSvc, signatureSvc)
 
@@ -58,7 +58,7 @@ func TestSignatureHandler_Sign_HashMismatch(t *testing.T) {
 	// Use a valid-format hash (64-char lowercase hex) that does NOT match the contract's
 	// content hash. The handler validates format first, then the service checks equality.
 	body, _ := json.Marshal(map[string]any{
-		"signedContentHash": "0000000000000000000000000000000000000000000000000000000000000000",
+		testKeySignedContentHash: "0000000000000000000000000000000000000000000000000000000000000000",
 	})
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost,
@@ -100,7 +100,7 @@ func TestSignatureHandler_Sign_InvalidHashFormat(t *testing.T) {
 		t.Run(hash, func(t *testing.T) {
 			t.Parallel()
 
-			body, _ := json.Marshal(map[string]any{"signedContentHash": hash})
+			body, _ := json.Marshal(map[string]any{testKeySignedContentHash: hash})
 			req := httptest.NewRequestWithContext(context.Background(), http.MethodPost,
 				"/v1/contracts/"+contract.ID.String()+"/sign", bytes.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
@@ -126,7 +126,7 @@ func TestSignatureHandler_Sign_RequiresTier2(t *testing.T) {
 	r := buildSignatureRouter(cs)
 
 	body, _ := json.Marshal(map[string]any{
-		"signedContentHash": contract.ContentHash,
+		testKeySignedContentHash: contract.ContentHash,
 	})
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost,
@@ -159,7 +159,7 @@ func TestSignatureHandler_Sign_NonPartyGets404(t *testing.T) {
 	r := buildSignatureRouter(cs)
 
 	body, _ := json.Marshal(map[string]any{
-		"signedContentHash": contract.ContentHash,
+		testKeySignedContentHash: contract.ContentHash,
 	})
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost,

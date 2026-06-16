@@ -13,6 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testKeyStatus is the payload map key used in audit log test fixtures.
+const testKeyStatus = "status"
+
 // truncateAuditTables clears contract_audit_logs between sub-tests.
 func truncateAuditTables(t *testing.T, ctx context.Context) {
 	t.Helper()
@@ -41,9 +44,9 @@ func TestAuditLogStore_Integration(t *testing.T) {
 			eventType string
 			payload   map[string]any
 		}{
-			{"CONTRACT_CREATED", map[string]any{"status": "DRAFT"}},
-			{"CONTRACT_SUBMITTED", map[string]any{"status": "PENDING_SIGNATURE"}},
-			{"CONTRACT_ACTIVATED", map[string]any{"status": "ACTIVE"}},
+			{"CONTRACT_CREATED", map[string]any{testKeyStatus: "DRAFT"}},
+			{"CONTRACT_SUBMITTED", map[string]any{testKeyStatus: "PENDING_SIGNATURE"}},
+			{"CONTRACT_ACTIVATED", map[string]any{testKeyStatus: "ACTIVE"}},
 		}
 
 		for _, ev := range events {

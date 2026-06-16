@@ -3,6 +3,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/CoverOnes/workspace/internal/domain"
@@ -237,4 +238,33 @@ type ContractAuditLogStore interface {
 	Append(ctx context.Context, in *AuditAppendInput) (*domain.ContractAuditLog, error)
 	// ListByContract returns all audit log entries for a contract ordered by seq ASC.
 	ListByContract(ctx context.Context, contractID uuid.UUID) ([]*domain.ContractAuditLog, error)
+	// TailHash returns the hash of the most-recent audit log entry for contractID,
+	// or "" when no entries exist (genesis / no audit log yet).
+	// This is a non-locking point-in-time snapshot read — suitable for proof generation
+	// where locking the chain is not required.
+	TailHash(ctx context.Context, contractID uuid.UUID) (string, error)
 }
+
+// ContractProofStore defines persistence operations for contract proof records.
+// Proofs are durable legal artifacts — no soft-delete or TTL operations are exposed.
+type ContractProofStore interface {
+	// Create inserts a new proof row.
+	// Returns ErrProofAlreadyExists (mapped from UNIQUE violation) when a proof already
+	// exists for (contract_id, contract_kind) — enabling idempotent generation.
+	Create(ctx context.Context, p *domain.ContractProof) error
+	// GetByContract fetches the proof for (contractID, kind).
+	// Returns ErrProofNotFound when no proof has been generated yet.
+	GetByContract(ctx context.Context, contractID uuid.UUID, kind domain.ContractKind) (*domain.ContractProof, error)
+	// Supersede replaces an existing proof row for (contractID, kind) in place with new
+	// content (new file_id, object_key, sha256, audit_chain_head, contract_version, generated_at).
+	// Used when an addendum re-sign produces a new ACTIVE version that supersedes v1.
+	// Returns ErrProofNotFound when no existing row exists to supersede.
+	Supersede(ctx context.Context, p *domain.ContractProof) error
+}
+
+// ErrProofNotFound is returned by ContractProofStore.GetByContract when no proof exists.
+var ErrProofNotFound = errors.New("contract proof not found")
+
+// ErrProofAlreadyExists is returned by ContractProofStore.Create when a proof for
+// (contract_id, contract_kind) already exists (idempotency guard).
+var ErrProofAlreadyExists = errors.New("contract proof already exists")

@@ -3,6 +3,7 @@ package handler
 import (
 	"net/http"
 
+	"github.com/CoverOnes/workspace/internal/domain"
 	"github.com/CoverOnes/workspace/internal/platform/httpx"
 	"github.com/CoverOnes/workspace/internal/platform/middleware"
 	"github.com/CoverOnes/workspace/internal/service"
@@ -14,12 +15,21 @@ import (
 // Read endpoints (GET) are authenticated via RequireValidIdentity;
 // the create-or-add-party endpoint is S2S only (RequireServiceToken).
 type MultipartyHandler struct {
-	svc *service.MultipartyContractService
+	svc      *service.MultipartyContractService
+	proofSvc *service.ProofService // optional; nil = proof endpoints return 404
 }
 
 // NewMultipartyHandler returns a MultipartyHandler.
 func NewMultipartyHandler(svc *service.MultipartyContractService) *MultipartyHandler {
 	return &MultipartyHandler{svc: svc}
+}
+
+// NewMultipartyHandlerWithProof returns a MultipartyHandler with proof download support.
+//
+//   - svc: the multiparty contract service.
+//   - proofSvc: the proof service (may be nil if file service is not configured).
+func NewMultipartyHandlerWithProof(svc *service.MultipartyContractService, proofSvc *service.ProofService) *MultipartyHandler {
+	return &MultipartyHandler{svc: svc, proofSvc: proofSvc}
 }
 
 // CreateOrAddPartyRequest is the POST /internal/v1/multiparty-contracts request body.
@@ -242,6 +252,36 @@ func (h *MultipartyHandler) UpdatePartyShare(c *gin.Context) {
 	}
 
 	httpx.OK(c, updated)
+}
+
+// GetProof handles GET /v1/multiparty-contracts/:id/proof.
+// Returns a short-lived / TTL-limited presigned download URL for the signed-contract proof PDF.
+// Only ACTIVE parties of the contract may download; non-parties receive 403.
+func (h *MultipartyHandler) GetProof(c *gin.Context) {
+	identity, ok := middleware.IdentityFromCtx(c)
+	if !ok {
+		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+		return
+	}
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid contract id")
+		return
+	}
+
+	if h.proofSvc == nil {
+		httpx.ErrCode(c, http.StatusNotFound, "NOT_FOUND", "proof service not available")
+		return
+	}
+
+	downloadURL, ttl, err := h.proofSvc.GetDownloadURL(c.Request.Context(), id, domain.ContractKindMultiparty, identity.UserID)
+	if err != nil {
+		httpx.Err(c, err)
+		return
+	}
+
+	httpx.OK(c, gin.H{"url": downloadURL, "ttlSeconds": ttl})
 }
 
 // GetDetail handles GET /v1/multiparty-contracts/:id.

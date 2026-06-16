@@ -56,7 +56,7 @@ func buildM2Router(contractStore *postgres.ContractStore) *gin.Engine {
 	txMgr := postgres.NewTxManager(contractStore.Pool())
 	pub := events.NewNoopPublisher()
 
-	svc := service.NewContractService(contractStore, sigStore, txMgr, pub, nil)
+	svc := service.NewContractService(contractStore, sigStore, txMgr, pub, nil, false)
 	sigSvc := service.NewSignatureService(contractStore, sigStore, nil)
 	contractH := handler.NewContractHandler(svc)
 	signatureH := handler.NewSignatureHandler(svc, sigSvc)
@@ -94,14 +94,14 @@ func s2sCreateContract(
 	t.Helper()
 
 	body, _ := json.Marshal(map[string]any{
-		"listingId":        uuid.New().String(),
-		"awardBidId":       uuid.New().String(),
-		"clientUserId":     clientID.String(),
-		"freelancerUserId": freelancerID.String(),
-		"amount":           amount,
-		"currency":         "TWD",
-		"title":            "Integration Contract",
-		"terms":            "Deliver the work as specified.",
+		testKeyListingID:        uuid.New().String(),
+		testKeyAwardBidID:       uuid.New().String(),
+		testKeyClientUserID:     clientID.String(),
+		testKeyFreelancerUserID: freelancerID.String(),
+		testKeyAmount:           amount,
+		testKeyCurrency:         testCurrencyTWD,
+		testKeyTitle:            "Integration Contract",
+		testKeyTerms:            "Deliver the work as specified.",
 	})
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/internal/v1/contracts", bytes.NewReader(body))
@@ -167,12 +167,12 @@ func TestM2_MaliciousClientCannotSelfCreateContract(t *testing.T) {
 
 	// Attacker tries to bind an arbitrary freelancer and a fraudulent amount.
 	body, _ := json.Marshal(map[string]any{
-		"listingId":        uuid.New().String(),
-		"acceptedBidId":    uuid.New().String(),
-		"freelancerUserId": victimFreelancerID.String(), // attacker-controlled
-		"title":            "Malicious Contract",
-		"amount":           "0.01", // fraudulently low amount
-		"currency":         "TWD",
+		testKeyListingID:        uuid.New().String(),
+		"acceptedBidId":         uuid.New().String(),
+		testKeyFreelancerUserID: victimFreelancerID.String(), // attacker-controlled
+		testKeyTitle:            "Malicious Contract",
+		testKeyAmount:           "0.01", // fraudulently low amount
+		testKeyCurrency:         testCurrencyTWD,
 	})
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/contracts", bytes.NewReader(body))
@@ -207,12 +207,12 @@ func TestM2_InternalEndpointRequiresServiceToken(t *testing.T) {
 	}
 
 	body, _ := json.Marshal(map[string]any{
-		"listingId":        uuid.New().String(),
-		"awardBidId":       uuid.New().String(),
-		"clientUserId":     uuid.New().String(),
-		"freelancerUserId": uuid.New().String(),
-		"amount":           "1000.00",
-		"currency":         "TWD",
+		testKeyListingID:        uuid.New().String(),
+		testKeyAwardBidID:       uuid.New().String(),
+		testKeyClientUserID:     uuid.New().String(),
+		testKeyFreelancerUserID: uuid.New().String(),
+		testKeyAmount:           "1000.00",
+		testKeyCurrency:         testCurrencyTWD,
 	})
 
 	for _, tc := range tests {
@@ -253,13 +253,13 @@ func TestM2_LegitAcceptToContractFlowIntegration(t *testing.T) {
 
 	// Simulate marketplace calling workspace after AcceptBid with award data.
 	body, _ := json.Marshal(map[string]any{
-		"listingId":        listingID.String(),
-		"awardBidId":       bidID.String(),
-		"clientUserId":     listingOwnerID.String(),
-		"freelancerUserId": bidWinnerID.String(),
-		"amount":           authoritativeAmount.StringFixed(2),
-		"currency":         "TWD",
-		"title":            "Design Work Contract",
+		testKeyListingID:        listingID.String(),
+		testKeyAwardBidID:       bidID.String(),
+		testKeyClientUserID:     listingOwnerID.String(),
+		testKeyFreelancerUserID: bidWinnerID.String(),
+		testKeyAmount:           authoritativeAmount.StringFixed(2),
+		testKeyCurrency:         testCurrencyTWD,
+		testKeyTitle:            "Design Work Contract",
 	})
 
 	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/internal/v1/contracts", bytes.NewReader(body))
@@ -291,7 +291,7 @@ func TestM2_LegitAcceptToContractFlowIntegration(t *testing.T) {
 	assert.Equal(t, bidID, stored.AcceptedBidID)
 	assert.True(t, authoritativeAmount.Equal(stored.Amount), "amount must be marketplace-authoritative %s, got %s",
 		authoritativeAmount.StringFixed(2), stored.Amount.StringFixed(2))
-	assert.Equal(t, "TWD", stored.Currency)
+	assert.Equal(t, testCurrencyTWD, stored.Currency)
 	assert.Equal(t, domain.ContractStatusDraft, stored.Status)
 	assert.Equal(t, 1, stored.Version)
 	assert.NotEmpty(t, stored.ContentHash)
@@ -308,12 +308,12 @@ func TestM2_DuplicateAwardIdempotent(t *testing.T) {
 	r := buildM2Router(cs)
 
 	body, _ := json.Marshal(map[string]any{
-		"listingId":        uuid.New().String(),
-		"awardBidId":       uuid.New().String(),
-		"clientUserId":     uuid.New().String(),
-		"freelancerUserId": uuid.New().String(),
-		"amount":           "999.00",
-		"currency":         "TWD",
+		testKeyListingID:        uuid.New().String(),
+		testKeyAwardBidID:       uuid.New().String(),
+		testKeyClientUserID:     uuid.New().String(),
+		testKeyFreelancerUserID: uuid.New().String(),
+		testKeyAmount:           "999.00",
+		testKeyCurrency:         testCurrencyTWD,
 	})
 
 	newReq := func() *http.Request {

@@ -64,7 +64,7 @@ func startP4Env(t *testing.T, _ context.Context) *p4Env {
 	addendaStore := postgres.NewAddendumStore(pool)
 	pub := events.NewNoopPublisher()
 
-	svc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, addendaStore, mpTx, pub)
+	svc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, addendaStore, mpTx, pub, false)
 
 	return &p4Env{svc: svc, addenda: addendaStore}
 }

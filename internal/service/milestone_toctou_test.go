@@ -78,7 +78,7 @@ func TestCompleteMilestone_TOCTOURace(t *testing.T) {
 			milestoneTx := postgres.NewMilestoneTxManager(pool)
 			pub := &recordingPublisher{}
 
-			mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, addendaStore, mpTx, pub)
+			mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, addendaStore, mpTx, pub, false)
 			milestoneSvc := service.NewMilestoneService(mpContracts, msStore, mpParties, milestoneTx, pub)
 
 			// Set up an ACTIVE single-party contract with one PENDING milestone.
@@ -103,7 +103,7 @@ func TestCompleteMilestone_TOCTOURace(t *testing.T) {
 				CallerID:   posterID,
 				Name:       "Race milestone",
 				Amount:     decimal.NewFromInt(1000),
-				Currency:   "TWD",
+				Currency:   testCurrencyTWD,
 				Sequence:   1,
 			})
 			require.NoError(t, err, "iter %d: add milestone", i)

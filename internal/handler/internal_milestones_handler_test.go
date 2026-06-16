@@ -110,12 +110,12 @@ func startMilestoneAmountsTestDB(t *testing.T, ctx context.Context) *milestoneAm
 
 	milestoneTx := postgres.NewMilestoneTxManager(pool)
 
-	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, addendaStore, mpTx, pub)
+	mpSvc := service.NewMultipartyContractService(mpContracts, mpParties, mpSigs, addendaStore, mpTx, pub, false)
 	milestoneSvc := service.NewMilestoneService(mpContracts, msStore, mpParties, milestoneTx, pub)
 
 	contractStore := postgres.NewContractStore(pool)
 	sigStore := postgres.NewSignatureStore(pool)
-	contractSvc := service.NewContractService(contractStore, sigStore, postgres.NewTxManager(pool), pub, nil)
+	contractSvc := service.NewContractService(contractStore, sigStore, postgres.NewTxManager(pool), pub, nil, false)
 	signatureSvc := service.NewSignatureService(contractStore, sigStore, nil)
 	taskSvc := service.NewTaskService(contractStore, postgres.NewTaskStore(pool))
 	worklogSvc := service.NewWorklogService(contractStore, postgres.NewWorklogStore(pool))
@@ -157,7 +157,7 @@ func activateContractForMilestones(
 	poster := uuid.New()
 	vendorA := uuid.New()
 	vendorB := uuid.New()
-	currency := "TWD"
+	currency := testCurrencyTWD
 
 	contract, _, err := env.mpSvc.CreateOrAddParty(ctx, &service.CreateOrAddPartyInput{
 		TenderID:     tenderID,
@@ -215,7 +215,7 @@ func TestMilestoneAmounts_GetAmountsSum(t *testing.T) {
 		CallerID:   act.posterID,
 		Name:       "Milestone 1",
 		Amount:     decimal.NewFromInt(1000),
-		Currency:   "TWD",
+		Currency:   testCurrencyTWD,
 		Sequence:   1,
 	})
 	require.NoError(t, err)
@@ -225,7 +225,7 @@ func TestMilestoneAmounts_GetAmountsSum(t *testing.T) {
 		CallerID:   act.posterID,
 		Name:       "Milestone 2",
 		Amount:     decimal.RequireFromString("500.50"),
-		Currency:   "TWD",
+		Currency:   testCurrencyTWD,
 		Sequence:   2,
 	})
 	require.NoError(t, err)

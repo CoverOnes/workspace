@@ -94,8 +94,8 @@ type Config struct {
 	GatewayCIDR string `mapstructure:"gateway_cidr"`
 
 	// FileBaseURL is the base URL of the CoverOnes file service used for S2S
-	// attachment registration and presign requests.
-	// Required in non-development environments when signature attachments are used.
+	// attachment registration, presign requests, and proof PDF storage.
+	// Required in non-development environments when the file service is used.
 	// Env: FILE_BASE_URL
 	FileBaseURL string `mapstructure:"file_base_url"`
 
@@ -231,7 +231,7 @@ func (c *Config) validate() error {
 
 	errs = append(errs, c.validateGatewayCIDR()...)
 
-	errs = append(errs, c.validateFileS2SToken()...)
+	errs = append(errs, c.validateFileService()...)
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
@@ -361,43 +361,218 @@ func (c *Config) validateGatewayCIDR() []string {
 	return nil
 }
 
-// validateFileS2SToken validates WORKSPACE_FILE_S2S_TOKEN.
-// In non-development environments it is required when FileBaseURL is set,
-// and must be at least 32 characters to enforce adequate entropy.
-func (c *Config) validateFileS2SToken() []string {
-	const minFileTokenLen = 32
+// minFileTokenLen is the minimum length for the file service S2S token.
+// Mirrors validateServiceToken (§24 token entropy floor).
+const minFileTokenLen = 32
 
-	if c.FileBaseURL == "" {
-		// No file service configured — token not required.
-		return nil
+// ssrfBlockedHosts lists hostname patterns that must be rejected unconditionally to
+// prevent SSRF attacks via the file service base URL. Checked before RFC1918 blocks.
+var ssrfBlockedHosts = []string{
+	"169.254.169.254",          // AWS/GCP/Azure instance metadata endpoint
+	"metadata.google.internal", // GCP metadata endpoint alternate hostname
+}
+
+// ssrfPrivateNets are RFC1918 + ULA IPv6 ranges rejected in production/staging.
+// In dev they are allowed to support local MinIO / file-service containers.
+var ssrfPrivateNets = func() []*net.IPNet {
+	cidrs := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"fc00::/7", // IPv6 ULA
 	}
 
-	// Validate FileBaseURL is a well-formed absolute URL with a scheme (e.g. https://...).
+	nets := make([]*net.IPNet, 0, len(cidrs))
+
+	for _, cidr := range cidrs {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err == nil {
+			nets = append(nets, ipNet)
+		}
+	}
+
+	return nets
+}()
+
+// isNumericHostEncoding reports whether host is a non-standard numeric IP encoding
+// (decimal 2130706433, hex 0x7f000001, octal/dotted-numeric 0177.0.0.1) that
+// net.ParseIP rejected.  Such forms are never a legitimate file service hostname, and
+// the OS resolver decodes them inconsistently across platforms (BSD/macOS inet_aton
+// accepts them, Linux glibc getaddrinfo does not) — so we detect them deterministically
+// and fail closed rather than rely on the resolver.  A real hostname has at least one
+// label containing a non-hex character and is therefore not flagged.
+func isNumericHostEncoding(host string) bool {
+	if host == "" {
+		return false
+	}
+
+	for _, label := range strings.Split(host, ".") {
+		if label == "" {
+			return false // empty label → malformed, treat as hostname (rejected elsewhere)
+		}
+
+		l := strings.ToLower(label)
+
+		if rest, ok := strings.CutPrefix(l, "0x"); ok {
+			if rest == "" || strings.IndexFunc(rest, isNotHexDigit) >= 0 {
+				return false
+			}
+
+			continue
+		}
+
+		if strings.IndexFunc(l, isNotDecimalDigit) >= 0 {
+			return false // a label with a non-digit → real hostname
+		}
+	}
+
+	return true
+}
+
+func isNotHexDigit(r rune) bool {
+	return (r < '0' || r > '9') && (r < 'a' || r > 'f')
+}
+
+func isNotDecimalDigit(r rune) bool {
+	return r < '0' || r > '9'
+}
+
+// isBlockedIP reports whether ip is blocked (loopback, link-local, or — when
+// blockPrivate is true — RFC1918/ULA).  Also returns a human-readable reason.
+// Used by both the boot-time config validator and the runtime dial guard so that
+// the same block rules are applied in both places without duplication.
+func isBlockedIP(ip net.IP, blockPrivate bool) (blocked bool, reason string) {
+	if ip.IsLoopback() {
+		return true, "loopback address"
+	}
+
+	if ip.IsUnspecified() {
+		// 0.0.0.0 / :: — the OS routes a connect() to the unspecified address to
+		// localhost, so it must be treated the same as loopback for SSRF defense.
+		return true, "unspecified address"
+	}
+
+	if ip.IsLinkLocalUnicast() {
+		return true, "link-local address"
+	}
+
+	if blockPrivate {
+		for _, privateNet := range ssrfPrivateNets {
+			if privateNet.Contains(ip) {
+				return true, "private/RFC1918 address in production"
+			}
+		}
+	}
+
+	return false, ""
+}
+
+// validateFileServiceURL validates the parsed URL for SSRF risk.
+// Returns an error string if the URL is unsafe, or "" if safe.
+// Unconditionally rejects loopback, link-local, and known metadata endpoints.
+// In production/staging, also rejects RFC1918 and ULA IPv6 ranges.
+//
+// Bypass defenses:
+//   - Trailing-dot FQDN (e.g. "localhost.", "169.254.169.254.") — stripped before checks.
+//   - Decimal/hex-encoded IPs (e.g. 2130706433, 0x7f000001) — rejected by isNumericHostEncoding.
+func validateFileServiceURL(rawURL string, isProd bool) string {
+	u, parseErr := url.Parse(rawURL)
+	if parseErr != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return "FILE_BASE_URL must be a valid http or https URL"
+	}
+
+	// Strip trailing dot from FQDN notation (e.g. "localhost." → "localhost",
+	// "169.254.169.254." → "169.254.169.254") BEFORE any string or IP comparisons.
+	host := strings.TrimSuffix(u.Hostname(), ".")
+
+	// Unconditionally block "localhost" by name — net.ParseIP("localhost") returns nil
+	// so we must check the string explicitly before the IP path.
+	if strings.EqualFold(host, "localhost") {
+		return "FILE_BASE_URL must not point to a loopback address"
+	}
+
+	// Block known metadata hostnames unconditionally (checked before IP resolution).
+	for _, blocked := range ssrfBlockedHosts {
+		if strings.EqualFold(host, blocked) {
+			return "FILE_BASE_URL must not point to a metadata/SSRF-risk host"
+		}
+	}
+
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// Not a canonical IP literal. Reject non-standard numeric encodings deterministically
+		// (decimal/hex/octal) — these are never a valid file service host and the OS resolver
+		// decodes them inconsistently across platforms. A real hostname (e.g. "file-svc.internal")
+		// is allowed at boot; the runtime dial guard validates its resolved IP for ongoing
+		// DNS-rebinding protection.
+		if isNumericHostEncoding(host) {
+			return "FILE_BASE_URL must not use a numeric-encoded host"
+		}
+
+		return ""
+	}
+
+	if blocked, reason := isBlockedIP(ip, isProd); blocked {
+		return "FILE_BASE_URL must not point to a " + reason
+	}
+
+	return ""
+}
+
+// validateFileService validates FILE_BASE_URL and WORKSPACE_FILE_S2S_TOKEN.
+//
+// Rules:
+//   - If FileBaseURL is not set, file service is disabled — no validation needed.
+//   - FileBaseURL, when set, must parse as http or https and must not point to
+//     loopback, link-local, metadata, or (in prod/staging) RFC1918 addresses (SSRF guard).
+//   - FileBaseURL must be a well-formed absolute URL; a relative URL or bare hostname
+//     would fail silently at runtime rather than at boot.
+//   - In non-dev: WORKSPACE_FILE_S2S_TOKEN is REQUIRED when FileBaseURL is set,
+//     and must be at least 32 characters to enforce adequate entropy.
+//   - In dev: token may be omitted (file service not exercised); if set, must be ≥32 chars.
+func (c *Config) validateFileService() []string {
+	var errs []string
+
+	// Entropy floor: whenever the token is provided it MUST meet the minimum length,
+	// even if FILE_BASE_URL is not set. This catches the common operator mistake of
+	// configuring a weak token before wiring up the URL.
+	if c.FileS2SToken != "" && len(strings.TrimSpace(c.FileS2SToken)) < minFileTokenLen {
+		errs = append(errs, fmt.Sprintf("WORKSPACE_FILE_S2S_TOKEN must be at least %d non-whitespace characters", minFileTokenLen))
+	}
+
+	if c.FileBaseURL == "" {
+		// No file service URL configured — remaining URL/token-required checks are skipped.
+		return errs
+	}
+
+	// Validate FileBaseURL is a well-formed absolute URL with a scheme.
 	// A misconfigured value like "file-service" (no scheme) would fail silently at runtime
 	// on the first S2S call rather than at boot, giving a poor operator experience.
 	if _, parseErr := url.ParseRequestURI(c.FileBaseURL); parseErr != nil {
-		return []string{
-			fmt.Sprintf("FILE_BASE_URL must be a valid absolute URL (e.g. https://file-service): %v", parseErr),
+		errs = append(errs, fmt.Sprintf("FILE_BASE_URL must be a valid absolute URL (e.g. https://file-service): %v", parseErr))
+	} else {
+		// Only run SSRF check if the URL parsed successfully.
+		if msg := validateFileServiceURL(c.FileBaseURL, !c.IsDev()); msg != "" {
+			errs = append(errs, msg)
 		}
 	}
 
-	switch {
-	case c.IsDev() && c.FileS2SToken == "":
-		return nil // allowed in dev when file service is not exercised
-	case c.FileS2SToken == "":
-		return []string{
-			"WORKSPACE_FILE_S2S_TOKEN is required when FILE_BASE_URL is set in non-development environments",
-		}
-	case len(c.FileS2SToken) < minFileTokenLen:
-		return []string{
-			fmt.Sprintf("WORKSPACE_FILE_S2S_TOKEN must be at least %d characters", minFileTokenLen),
-		}
-	default:
-		return nil
+	// Token required when URL is set in non-dev (token may be omitted in dev only).
+	if c.FileS2SToken == "" && !c.IsDev() {
+		errs = append(errs, "WORKSPACE_FILE_S2S_TOKEN is required when FILE_BASE_URL is set in non-development environments")
 	}
+
+	return errs
 }
 
 // IsDev reports whether the service is running in development mode.
 func (c *Config) IsDev() bool {
 	return strings.EqualFold(c.Env, "development")
+}
+
+// FileServiceEnabled reports whether both FileBaseURL and FileS2SToken are configured,
+// meaning the file service S2S client can be used for proof generation, attachment
+// registration, and presigned downloads.
+func (c *Config) FileServiceEnabled() bool {
+	return c.FileBaseURL != "" && c.FileS2SToken != ""
 }

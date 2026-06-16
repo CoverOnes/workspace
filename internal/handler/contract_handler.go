@@ -24,12 +24,21 @@ const maxBodyBytes = 1 << 20 // 1 MB
 
 // ContractHandler handles contract CRUD and lifecycle endpoints.
 type ContractHandler struct {
-	svc *service.ContractService
+	svc      *service.ContractService
+	proofSvc *service.ProofService // optional; nil = proof endpoints return 404
 }
 
 // NewContractHandler returns a ContractHandler.
 func NewContractHandler(svc *service.ContractService) *ContractHandler {
 	return &ContractHandler{svc: svc}
+}
+
+// NewContractHandlerWithProof returns a ContractHandler with proof download support.
+//
+//   - svc: the bilateral contract service.
+//   - proofSvc: the proof service (may be nil if file service is not configured).
+func NewContractHandlerWithProof(svc *service.ContractService, proofSvc *service.ProofService) *ContractHandler {
+	return &ContractHandler{svc: svc, proofSvc: proofSvc}
 }
 
 // List handles GET /v1/contracts.
@@ -199,6 +208,36 @@ func (h *ContractHandler) Complete(c *gin.Context) {
 	}
 
 	httpx.OK(c, contract)
+}
+
+// GetProof handles GET /v1/contracts/:id/proof.
+// Returns a short-lived / TTL-limited presigned download URL for the signed-contract proof PDF.
+// Only parties (client or freelancer) may download; non-parties receive 403.
+func (h *ContractHandler) GetProof(c *gin.Context) {
+	identity, ok := middleware.IdentityFromCtx(c)
+	if !ok {
+		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+		return
+	}
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid contract id")
+		return
+	}
+
+	if h.proofSvc == nil {
+		httpx.ErrCode(c, http.StatusNotFound, "NOT_FOUND", "proof service not available")
+		return
+	}
+
+	downloadURL, ttl, err := h.proofSvc.GetDownloadURL(c.Request.Context(), id, domain.ContractKindBilateral, identity.UserID)
+	if err != nil {
+		httpx.Err(c, err)
+		return
+	}
+
+	httpx.OK(c, gin.H{"url": downloadURL, "ttlSeconds": ttl})
 }
 
 // Cancel handles POST /v1/contracts/:id/cancel.

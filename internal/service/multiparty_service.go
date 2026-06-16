@@ -11,12 +11,15 @@ import (
 	"github.com/google/uuid"
 )
 
-// Outbox channel constants for multiparty contract events.
-// Must stay in sync with events.channel* constants in the events package.
+// Outbox channel and aggregate type constants for multiparty contract events.
+// Channel names must stay in sync with events.channel* constants in the events package.
 const (
 	channelMultipartyActivated       = "workspace.contract_activated"
 	channelMultipartyAddendumCreated = "workspace.contract_addendum_created"
 	channelMultipartyReSigned        = "workspace.contract_re_signed"
+
+	// aggregateTypeMultipartyContract is the outbox aggregate_type for multiparty contracts.
+	aggregateTypeMultipartyContract = "multiparty_contract"
 )
 
 // MultipartyContractService implements the business logic for multi-party N-vendor
@@ -28,15 +31,18 @@ const (
 // The owner acts as initiator / governance (owner-only governance per Phase 0 locked decisions).
 // This is documented here as the canonical decision record.
 type MultipartyContractService struct {
-	contracts store.MultipartyContractStore
-	parties   store.MultipartyPartyStore
-	sigs      store.MultipartySignatureStore
-	addenda   store.AddendumStore
-	tx        store.MultipartyTxManager
-	publisher events.Publisher
+	contracts    store.MultipartyContractStore
+	parties      store.MultipartyPartyStore
+	sigs         store.MultipartySignatureStore
+	addenda      store.AddendumStore
+	tx           store.MultipartyTxManager
+	publisher    events.Publisher
+	proofEnabled bool // true when the file service is configured; gates proof enqueue in activateInTx
 }
 
 // NewMultipartyContractService returns a MultipartyContractService.
+// proofEnabled should be cfg.FileServiceEnabled(): when false the activation path skips
+// the proof_generation_required outbox enqueue, preventing silent phantom entries.
 func NewMultipartyContractService(
 	contracts store.MultipartyContractStore,
 	parties store.MultipartyPartyStore,
@@ -44,14 +50,16 @@ func NewMultipartyContractService(
 	addenda store.AddendumStore,
 	tx store.MultipartyTxManager,
 	publisher events.Publisher,
+	proofEnabled bool,
 ) *MultipartyContractService {
 	return &MultipartyContractService{
-		contracts: contracts,
-		parties:   parties,
-		sigs:      sigs,
-		addenda:   addenda,
-		tx:        tx,
-		publisher: publisher,
+		contracts:    contracts,
+		parties:      parties,
+		sigs:         sigs,
+		addenda:      addenda,
+		tx:           tx,
+		publisher:    publisher,
+		proofEnabled: proofEnabled,
 	}
 }
 
@@ -613,13 +621,22 @@ func (s *MultipartyContractService) activateInTx(
 		}
 
 		if enqErr := txOutbox.Enqueue(ctx, &store.OutboxEnqueueInput{
-			AggregateType: "multiparty_contract",
+			AggregateType: aggregateTypeMultipartyContract,
 			AggregateID:   c.ID,
 			EventID:       evt.EventID,
 			Channel:       channelMultipartyReSigned,
 			Payload:       payload,
 		}); enqErr != nil {
 			return fmt.Errorf("enqueue contract_re_signed event: %w", enqErr)
+		}
+
+		// Enqueue proof generation atomically with re-sign activation — only when the file
+		// service is configured (s.proofEnabled). Without a handler registered the entry
+		// would be silently consumed by NoopPublisher, never generating the proof.
+		if s.proofEnabled {
+			if proofErr := enqueueProofGeneration(ctx, txOutbox, c.ID, domain.ContractKindMultiparty); proofErr != nil {
+				return proofErr
+			}
 		}
 	} else {
 		evt := &domain.MultipartyContractActivatedEvent{
@@ -637,7 +654,7 @@ func (s *MultipartyContractService) activateInTx(
 		}
 
 		if enqErr := txOutbox.Enqueue(ctx, &store.OutboxEnqueueInput{
-			AggregateType: "multiparty_contract",
+			AggregateType: aggregateTypeMultipartyContract,
 			AggregateID:   c.ID,
 			EventID:       evt.EventID,
 			Channel:       channelMultipartyActivated,
@@ -645,6 +662,44 @@ func (s *MultipartyContractService) activateInTx(
 		}); enqErr != nil {
 			return fmt.Errorf("enqueue contract_activated event: %w", enqErr)
 		}
+
+		// Enqueue proof generation atomically with initial activation — only when the file
+		// service is configured (s.proofEnabled). Without a handler registered the entry
+		// would be silently consumed by NoopPublisher, never generating the proof.
+		if s.proofEnabled {
+			if proofErr := enqueueProofGeneration(ctx, txOutbox, c.ID, domain.ContractKindMultiparty); proofErr != nil {
+				return proofErr
+			}
+		}
+	}
+
+	return nil
+}
+
+// enqueueProofGeneration enqueues a proof_generation_required entry for the given contract.
+// Extracted to keep activateInTx within the cyclomatic-complexity ceiling.
+func enqueueProofGeneration(
+	ctx context.Context,
+	ob store.OutboxStore,
+	contractID uuid.UUID,
+	kind domain.ContractKind,
+) error {
+	proofPayload, marshalErr := marshalEvent(ProofGenerationPayload{
+		ContractID: contractID,
+		Kind:       string(kind),
+	})
+	if marshalErr != nil {
+		return fmt.Errorf("marshal proof_generation_required payload: %w", marshalErr)
+	}
+
+	if enqErr := ob.Enqueue(ctx, &store.OutboxEnqueueInput{
+		AggregateType: aggregateTypeMultipartyContract,
+		AggregateID:   contractID,
+		EventID:       uuid.New(),
+		Channel:       ChannelProofGenerationRequired,
+		Payload:       proofPayload,
+	}); enqErr != nil {
+		return fmt.Errorf("enqueue proof_generation_required: %w", enqErr)
 	}
 
 	return nil
